@@ -1,0 +1,187 @@
+"""
+POLY_SCHEMES 方案 cost 估算（当前仅用乘法深度占位，后续需更新完整 cost 模型）。
+
+方案数组：长度 24 = 12 层 × (softmax, gelu)，元素 0/1/2=多项式档位，3=原始函数（cost=0）。
+
+深度公式（GeLU Chebyshev / HE PS-tree）：
+  取自 gelu_poly 方案配置 depth_he（含 GELU 还原 +1）
+  Softmax:        7 + gs_sigma*2 + ceil(log2(exp_div)) * gs_sum_sq*2
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+from gelu_poly import GELU_LEVEL_KEYS, gelu_config_for_layer, gelu_level_allowed
+from softmax_poly import (
+    LAYER_EXP_DIV_BY_TASK,
+    LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK,
+    LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK,
+    SOFTMAX_LEVEL_KEYS,
+)
+
+NUM_LAYERS = 12
+SCHEME_ORIGINAL = 3
+
+# TODO: 后续更新 — 完整 cost 应包含非乘法项、数据通路、并行度等；当前仅深度求和。
+SOFTMAX_DEPTH_BASE = 7
+
+
+def log2_ceil(n: float) -> int:
+    """log2(n) 向上取整；n 须 > 0。"""
+    if n <= 0:
+        raise ValueError(f"log2_ceil 要求 n > 0，当前 n={n}")
+    return math.ceil(math.log2(n))
+
+
+def scheme_index(layer_idx: int, kind: str) -> int:
+    if kind == "softmax":
+        return layer_idx * 2
+    if kind == "gelu":
+        return layer_idx * 2 + 1
+    raise ValueError(f"未知 kind：{kind}")
+
+
+def validate_scheme(scheme: list[int], task_name: str = "") -> None:
+    expected = NUM_LAYERS * 2
+    if len(scheme) != expected:
+        raise ValueError(
+            f"{task_name} 方案长度应为 {expected}，当前为 {len(scheme)}"
+        )
+    for idx, level in enumerate(scheme):
+        if level not in (0, 1, 2, SCHEME_ORIGINAL):
+            raise ValueError(
+                f"{task_name} 方案下标 {idx} 非法：{level}（仅允许 0/1/2/3）"
+            )
+
+
+def gelu_poly_depth(layer_idx: int, level: int) -> int:
+    """单层 GeLU Chebyshev 方案 HE 乘法深度；禁止档位抛错。"""
+    cfg = gelu_config_for_layer(layer_idx, level)
+    return int(cfg["depth_he"])
+
+
+def softmax_poly_depth(task_name: str, layer_idx: int, level: int) -> int:
+    """单层 thor_softmax 乘法深度；level∈{0,1,2}。"""
+    level_key = SOFTMAX_LEVEL_KEYS[level]
+    gs_sigma = LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK[task_name][level_key][
+        layer_idx
+    ]
+    gs_sum_sq = LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK[task_name][level_key][
+        layer_idx
+    ]
+    exp_div = LAYER_EXP_DIV_BY_TASK[task_name][layer_idx]
+    return (
+        SOFTMAX_DEPTH_BASE
+        + gs_sigma * 2
+        + log2_ceil(exp_div) * gs_sum_sq * 2
+    )
+
+
+@dataclass
+class LayerCostItem:
+    layer_idx: int
+    kind: str
+    level: int
+    depth: int
+
+
+@dataclass
+class SchemeCostResult:
+    task_name: str
+    total_depth: int
+    softmax_depth: int
+    gelu_depth: int
+    layers: list[LayerCostItem]
+
+    def summary(self) -> str:
+        return (
+            f"total={self.total_depth} "
+            f"(softmax={self.softmax_depth}, gelu={self.gelu_depth})"
+        )
+
+
+def compute_scheme_cost(
+    task_name: str,
+    scheme: list[int],
+    *,
+    detailed: bool = False,
+) -> int | SchemeCostResult:
+    """
+    输入 POLY_SCHEMES 方案，返回当前 cost（深度之和）。
+
+    detailed=True 时返回 SchemeCostResult，含逐层明细。
+    """
+    validate_scheme(scheme, task_name)
+    if task_name not in LAYER_EXP_DIV_BY_TASK:
+        raise KeyError(f"未知任务：{task_name}")
+
+    items: list[LayerCostItem] = []
+    softmax_total = 0
+    gelu_total = 0
+
+    for layer_idx in range(NUM_LAYERS):
+        for kind in ("softmax", "gelu"):
+            level = scheme[scheme_index(layer_idx, kind)]
+            if level == SCHEME_ORIGINAL:
+                depth = 0
+            elif kind == "softmax":
+                depth = softmax_poly_depth(task_name, layer_idx, level)
+                softmax_total += depth
+            else:
+                depth = gelu_poly_depth(layer_idx, level)
+                gelu_total += depth
+
+            items.append(LayerCostItem(layer_idx, kind, level, depth))
+
+    result = SchemeCostResult(
+        task_name=task_name,
+        total_depth=softmax_total + gelu_total,
+        softmax_depth=softmax_total,
+        gelu_depth=gelu_total,
+        layers=items,
+    )
+    return result if detailed else result.total_depth
+
+
+def print_scheme_cost(task_name: str, scheme: list[int]) -> SchemeCostResult:
+    """打印方案 cost 明细。"""
+    result = compute_scheme_cost(task_name, scheme, detailed=True)
+    assert isinstance(result, SchemeCostResult)
+
+    print(f"\n任务 {task_name.upper()}  方案 cost（深度占位，后续需更新）")
+    print(f"  合计：{result.summary()}")
+    print(f"  {'层':>4} {'类型':<8} {'档位':>4} {'深度':>6}")
+    print("  " + "-" * 28)
+    for item in result.layers:
+        if item.depth == 0 and item.level == SCHEME_ORIGINAL:
+            level_str = "orig"
+        else:
+            keys = (
+                SOFTMAX_LEVEL_KEYS
+                if item.kind == "softmax"
+                else GELU_LEVEL_KEYS
+            )
+            level_str = keys[item.level]
+        print(
+            f"  {item.layer_idx:4d} {item.kind:<8} {level_str:>4} {item.depth:6d}"
+        )
+    return result
+
+# TODO(临时): 后续更新 — 完整 cost 应为最佳bootstrapping分配方案中的bts次数；当前仅深度求和。
+if __name__ == "__main__":
+    TASK_NAMES = ["mrpc", "rte", "sst2"]
+    # 本地示例方案（长度 24 = 12 层 × softmax/gelu；0/1/2=多项式档位，3=原始）
+
+    POLY_SCHEMES: dict[str, list[int]] = {
+        "mrpc": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+        "rte": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+        "sst2": [2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],
+    }
+
+    print("POLY_SCHEMES cost（当前=乘法深度之和，后续需更新完整 cost 模型）")
+    print("=" * 56)
+    for task in TASK_NAMES:
+        if task not in POLY_SCHEMES:
+            continue
+        print_scheme_cost(task, POLY_SCHEMES[task])
