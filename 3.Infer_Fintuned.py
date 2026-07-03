@@ -1,21 +1,26 @@
 """
 微调模型推理 - MRPC / RTE / SST2
-使用钩子统计12层×4个非线性函数的输入范围
+使用钩子统计 12 层 × 4 个非线性函数的输入范围。
+  Softmax / GeLU：输入张量元素 min/max
+  LayerNorm1/2：与 nolinear/layernorm.py 相同口径，统计有效 token 上 Var(x) 的
+                真实 min/max（按 hidden 向量逐行算总体方差，不做 0.9/1.1 缩放）
 输出：每个任务的准确率 + 合并的 48×6 CSV
 """
+import importlib.util
+import math
 import os
 import csv
 import torch
-import evaluate
+from sklearn.metrics import accuracy_score
 import functools
 import torch.nn.functional as F
 from datetime import datetime
 from datasets import load_from_disk
+from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    Trainer,
-    DataCollatorWithPadding
+    DataCollatorWithPadding,
 )
 
 # ===================== 【核心配置区】 =====================
@@ -35,10 +40,23 @@ NONLINEAR_NAMES = ["Softmax", "LayerNorm1", "GeLU", "LayerNorm2"]
 EVALUATE_TEST_SET = False
 # ======================================================================
 
-metric = evaluate.load("accuracy")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ 使用设备：{device}")
 os.makedirs(INFER_OUTPUT_ROOT, exist_ok=True)
+
+
+def _load_layernorm_utils():
+    """加载 nolinear/layernorm.py 中的方差统计工具（与 variance 评估一致）。"""
+    ln_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nolinear", "layernorm.py")
+    spec = importlib.util.spec_from_file_location("layernorm_eval", ln_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {ln_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_LN = _load_layernorm_utils()
 
 
 # ===================== 钩子工具函数 =====================
@@ -62,7 +80,7 @@ def update_stats(stats, key, tensor):
 
 
 def make_input_hook(stats, key):
-    """为 LayerNorm 等标准 Module 创建 forward hook"""
+    """为 GeLU 等 Module 创建 forward hook（统计输入元素 min/max）。"""
     def hook_fn(module, inp, out):
         update_stats(stats, key, inp[0])
     return hook_fn
@@ -70,12 +88,8 @@ def make_input_hook(stats, key):
 
 def register_hooks(model, stats):
     """
-    对 BERT 12 层注册钩子，统计 4 个非线性函数的输入范围。
-
-    针对 Softmax：
-    - 新版 transformers 可能使用 SDPA（F.softmax 不会被调用）
-    - 解决方案：直接 hook BertSelfAttention，在 forward 中
-      拦截 attention_scores（softmax 的输入）
+    对 BERT 12 层注册钩子，统计 Softmax / GeLU 的输入元素 min/max。
+    LayerNorm 方差统计见 register_layernorm_variance_hooks。
     """
     hooks = []
 
@@ -144,22 +158,13 @@ def register_hooks(model, stats):
             _orig_forward, stats, softmax_key, attn_self
         )
 
-        # -------- 2. LayerNorm1（attention.output.LayerNorm）--------
-        ln1_key = f"Layer{i}_LayerNorm1"
-        h = layer.attention.output.LayerNorm.register_forward_hook(
-            make_input_hook(stats, ln1_key)
-        )
-        hooks.append(h)
-
-        # -------- 3. GeLU（intermediate.intermediate_act_fn）--------
+        # -------- 2. GeLU（intermediate.intermediate_act_fn）--------
         gelu_key = f"Layer{i}_GeLU"
         act_fn = layer.intermediate.intermediate_act_fn
         if isinstance(act_fn, torch.nn.Module):
-            # 新版 transformers: GELUActivation 是 nn.Module
             h = act_fn.register_forward_hook(make_input_hook(stats, gelu_key))
             hooks.append(h)
         else:
-            # 旧版: 函数式 gelu，用猴子补丁
             intermediate_module = layer.intermediate
             _orig_inter_forward = intermediate_module.forward
 
@@ -182,14 +187,59 @@ def register_hooks(model, stats):
                 _orig_inter_forward, stats, gelu_key
             )
 
-        # -------- 4. LayerNorm2（output.LayerNorm）--------
-        ln2_key = f"Layer{i}_LayerNorm2"
-        h = layer.output.LayerNorm.register_forward_hook(
-            make_input_hook(stats, ln2_key)
-        )
-        hooks.append(h)
-
     return hooks
+
+
+def register_layernorm_variance_hooks(model):
+    """LayerNorm 输入方差收集（有效 token，与 layernorm.py 一致）。"""
+    collector = _LN.GpuLayerNormCollector([True] * NUM_LAYERS, device)
+    ln_hooks = _LN.register_layernorm_hooks(model, collector)
+    return collector, ln_hooks
+
+
+def finalize_layernorm_variance_stats(collector, stats) -> None:
+    """将 collector 中各层 ln1/ln2 输入的真实 Var(x) min/max 写入 stats。"""
+    kind_to_name = {"ln1": "LayerNorm1", "ln2": "LayerNorm2"}
+    for layer_idx in range(NUM_LAYERS):
+        for kind, name in kind_to_name.items():
+            key = f"Layer{layer_idx}_{name}"
+            inputs = collector.stacked(layer_idx, kind)
+            if inputs.shape[0] == 0:
+                stats[key]["min"] = float("nan")
+                stats[key]["max"] = float("nan")
+                continue
+            st = _LN.variance_stats_gpu(inputs)
+            stats[key]["min"] = st["var_min"]
+            stats[key]["max"] = st["var_max"]
+            collector.release(layer_idx, kind)
+
+
+@torch.no_grad()
+def evaluate_split(model, tokenized_split, data_collator):
+    """在指定 split 上前向，返回 accuracy；期间 LayerNorm collector 持续收集。"""
+    loader = DataLoader(
+        tokenized_split,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=data_collator,
+    )
+    pred_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
+
+    for batch in loader:
+        labels = batch["labels"]
+        batch = {k: v.to(device) for k, v in batch.items()}
+        attn_mask = batch.get("attention_mask")
+        if attn_mask is not None:
+            _LN.attach_attention_mask_to_layernorms(model, attn_mask)
+        outputs = model(**batch)
+        _LN.clear_attention_mask_on_layernorms(model)
+        pred_chunks.append(outputs.logits.argmax(dim=-1).cpu())
+        label_chunks.append(labels)
+
+    preds = torch.cat(pred_chunks, dim=0).numpy()
+    labels_np = torch.cat(label_chunks, dim=0).numpy()
+    return float(accuracy_score(labels_np, preds))
 
 
 def remove_hooks(hooks):
@@ -239,11 +289,14 @@ def infer_single_task(task_name):
     model = model.to(device)
     model.eval()
 
-    # 2. 注册钩子
+    # 2. 注册钩子（Softmax/GeLU 元素范围 + LayerNorm 方差收集）
     stats = create_empty_stats()
     hooks = register_hooks(model, stats)
-    print(f"✅ 已注册 {NUM_LAYERS}层 × {len(NONLINEAR_NAMES)}函数 = "
-          f"{NUM_LAYERS * len(NONLINEAR_NAMES)} 个监控点")
+    ln_collector, ln_hooks = register_layernorm_variance_hooks(model)
+    print(
+        f"✅ 已注册 {NUM_LAYERS}层 × {len(NONLINEAR_NAMES)}函数；"
+        f"LayerNorm 按 Var(x) 区间统计（与 layernorm.py 一致）"
+    )
 
     # 3. 加载并预处理数据集
     data_path = os.path.join(LOCAL_DATA_ROOT, task_name)
@@ -251,61 +304,72 @@ def infer_single_task(task_name):
     dataset = load_from_disk(data_path)
 
     preprocess_fn = get_preprocess_fn(task_name, tokenizer)
-    tokenized_dataset = dataset.map(preprocess_fn, batched=True)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-    # 4. 评估函数
-    def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
-        predictions = predictions.argmax(axis=1)
-        return metric.compute(predictions=predictions, references=labels)
-
-    # 5. Trainer
-    trainer = Trainer(
-        model=model,
-        # tokenizer=tokenizer,
-        processing_class=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer,
+        padding="max_length",
+        max_length=MAX_SEQ_LENGTH,
     )
 
-    # 6. 验证集评估
+    def tokenize_split(split):
+        drop_cols = [c for c in split.column_names if c != "label"]
+        return split.map(
+            preprocess_fn,
+            batched=True,
+            remove_columns=drop_cols,
+        )
+
+    tokenized_validation = tokenize_split(dataset["validation"])
+
+    # 4. 验证集评估（同时收集 LayerNorm 输入）
     print(f"📊 验证集评估中...")
-    val_results = trainer.evaluate(tokenized_dataset["validation"])
-    val_acc = val_results['eval_accuracy']
+    val_acc = evaluate_split(model, tokenized_validation, data_collator)
     print(f"✅ 验证集准确率：{val_acc:.4f}")
 
-    # 7. 测试集评估（可选）
+    # 5. 测试集评估（可选）
     test_acc = None
-    if EVALUATE_TEST_SET and "test" in tokenized_dataset:
+    if EVALUATE_TEST_SET and "test" in dataset:
         print(f"📊 测试集评估中...")
         try:
-            test_results = trainer.evaluate(tokenized_dataset["test"])
-            test_acc = test_results.get('eval_accuracy', None)
-            if test_acc is not None:
-                print(f"✅ 测试集准确率：{test_acc:.4f}")
+            tokenized_test = tokenize_split(dataset["test"])
+            test_acc = evaluate_split(model, tokenized_test, data_collator)
+            print(f"✅ 测试集准确率：{test_acc:.4f}")
         except Exception as e:
             print(f"⚠️  测试集评估失败：{e}")
     else:
         print(f"ℹ️  跳过测试集（GLUE 测试集标签未公开）")
 
-    # 8. 统计预览
-    print(f"\n📈 非线性函数输入范围预览（{task_name}）：")
-    print(f"   {'函数':<25} {'最小值':<20} {'最大值':<20}")
+    finalize_layernorm_variance_stats(ln_collector, stats)
+
+    # 6. 统计预览
+    print(f"\n📈 非线性统计预览（{task_name}；LN 为 Var(x) 真实 min/max）：")
+    print(f"   {'函数':<25} {'min':<20} {'max':<20}")
     print(f"   {'-'*65}")
     for layer_idx in [0, 5, 11]:
         for name in NONLINEAR_NAMES:
             key = f"Layer{layer_idx}_{name}"
             s = stats[key]
-            min_str = f"{s['min']:.6f}" if s['min'] != float('inf') else "N/A"
-            max_str = f"{s['max']:.6f}" if s['max'] != float('-inf') else "N/A"
+            if name.startswith("LayerNorm"):
+                min_str = (
+                    f"{s['min']:.6g}"
+                    if isinstance(s["min"], float) and not math.isnan(s["min"])
+                    else "N/A"
+                )
+                max_str = (
+                    f"{s['max']:.6g}"
+                    if isinstance(s["max"], float) and not math.isnan(s["max"])
+                    else "N/A"
+                )
+            else:
+                min_str = f"{s['min']:.6f}" if s["min"] != float("inf") else "N/A"
+                max_str = f"{s['max']:.6f}" if s["max"] != float("-inf") else "N/A"
             print(f"   {key:<25} {min_str:<20} {max_str:<20}")
 
-    # 9. 清理钩子
+    # 7. 清理钩子
     remove_hooks(hooks)
+    _LN.restore_layernorm_hooks(ln_hooks)
     print(f"✅ 已移除所有钩子")
 
-    # 10. 保存准确率
+    # 8. 保存准确率
     output_file = os.path.join(INFER_OUTPUT_ROOT, f"{task_name}_res.txt")
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"# 微调模型推理结果 - {task_name.upper()}\n")
@@ -318,17 +382,19 @@ def infer_single_task(task_name):
             f.write(f"测试集准确率 (test_accuracy): N/A (GLUE测试集标签未公开)\n")
     print(f"💾 准确率结果已保存：{output_file}")
 
-    # 11. 单任务 CSV（可选保留）
+    # 9. 单任务 CSV
     csv_path = os.path.join(INFER_OUTPUT_ROOT, f"{task_name}_nonlinear_range.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Layer", "NonLinear", "min", "max"])
+        writer.writerow(["Layer", "NonLinear", "min", "max", "stat_kind"])
         for layer_idx in range(NUM_LAYERS):
             for name in NONLINEAR_NAMES:
                 key = f"Layer{layer_idx}_{name}"
+                kind = "variance" if name.startswith("LayerNorm") else "element"
                 writer.writerow([
                     layer_idx, name,
-                    stats[key]["min"], stats[key]["max"]
+                    stats[key]["min"], stats[key]["max"],
+                    kind,
                 ])
     print(f"💾 单任务统计已保存：{csv_path}")
 
@@ -343,12 +409,10 @@ def infer_single_task(task_name):
 
 def save_merged_csv(all_stats, csv_path):
     """
-    保存合并表格：48 行 × (2 + 3×2) 列
-    行：12层 × 4函数
-    列：Layer, NonLinear, mrpc_min, mrpc_max, rte_min, rte_max, sst2_min, sst2_max
+    保存合并表格：48 行 × (3 + 3×2) 列
+    LayerNorm 行 min/max 为 Var(x) 真实 min/max；其余为元素 min/max。
     """
-    # ---- 构建表头 ----
-    header = ["Layer", "NonLinear"]
+    header = ["Layer", "NonLinear", "stat_kind"]
     for task_name in TASK_NAMES:
         header.extend([f"{task_name}_min", f"{task_name}_max"])
 
@@ -357,7 +421,8 @@ def save_merged_csv(all_stats, csv_path):
     for layer_idx in range(NUM_LAYERS):
         for name in NONLINEAR_NAMES:
             key = f"Layer{layer_idx}_{name}"
-            row = [layer_idx, name]
+            stat_kind = "variance" if name.startswith("LayerNorm") else "element"
+            row = [layer_idx, name, stat_kind]
             for task_name in TASK_NAMES:
                 if task_name in all_stats and key in all_stats[task_name]:
                     s = all_stats[task_name][key]

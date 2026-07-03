@@ -5,7 +5,7 @@ BERT 微调 - MRPC / RTE / SST2
 import os
 import sys
 import torch
-import evaluate
+from sklearn.metrics import accuracy_score
 from datetime import datetime
 from datasets import load_from_disk
 from transformers import (
@@ -45,10 +45,16 @@ TASK_DESCRIPTIONS = {
 }
 # ============================================
 
-metric = evaluate.load("accuracy")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ 使用设备：{device}")
 print(f"✅ 当前任务：{TASK_NAME.upper()} - {TASK_DESCRIPTIONS[TASK_NAME]}")
+
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = predictions.argmax(axis=1)
+    return {"accuracy": float(accuracy_score(labels, predictions))}
+
 
 # 1. 加载模型和分词器
 print(f"\n✅ 加载本地预训练BERT模型：{LOCAL_MODEL_PATH}")
@@ -83,13 +89,7 @@ tokenized_dataset = dataset.map(preprocess_function, batched=True)
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-# 4. 评估函数
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = predictions.argmax(axis=1)
-    return metric.compute(predictions=predictions, references=labels)
-
-# 5. 训练参数
+# 4. 训练参数
 training_args = TrainingArguments(
     output_dir=SAVE_FINETUNED_PATH,
     num_train_epochs=TRAIN_EPOCHS,

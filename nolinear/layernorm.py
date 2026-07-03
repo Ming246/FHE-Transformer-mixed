@@ -36,7 +36,7 @@ from transformers import (
 )
 
 # ===================== 配置 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["sst2"]
 LOCAL_DATA_ROOT = "../glue_datasets/"
 FINETUNED_MODEL_ROOT = "../finetuned_weight/"
 
@@ -51,12 +51,13 @@ BATCH_SIZE = 8
 MAX_VECTORS_FOR_ERROR_EVAL: int | None = None
 ERROR_EVAL_CHUNK_SIZE = 4096
 STATS_CHUNK_SIZE = 4096
+REL_ERR_DENOM_MIN = 1e-4  # |y_ref| 低于此值的点不参与相对误差统计
 
 LAYER_ENABLE = [True] * NUM_LAYERS
 
-INV_SQRT_MAX_ITERS = 50
-W_BUFFER = 1.05
-DEFAULT_INV_SQRT_ALPHA = 0.001
+W_BUFFER = 1
+DEFAULT_INV_SQRT_ALPHA = 0.1
+DEFAULT_INV_SQRT_MAX_ITERS = 50
 
 VAR_MIN_SCALE = 0.9
 VAR_MAX_SCALE = 1.1
@@ -66,11 +67,27 @@ JSON_DIR = os.path.join(_SCRIPT_DIR, "variance_out")
 
 LAYER_INV_SQRT_ALPHA_BY_TASK: dict[str, dict[str, list[float]]] = {
     task: {
-        "ln1": [DEFAULT_INV_SQRT_ALPHA] * NUM_LAYERS,
-        "ln2": [DEFAULT_INV_SQRT_ALPHA] * NUM_LAYERS,
+        "ln1": [0.00005,0.0001,0.0001,0.0001,0.001,0.001,0.001,0.001,0.001,0.0001,0.001,0.001],
+        "ln2": [0.001,0.001,0.0001,0.001,0.001,0.001,0.0001,0.0001,0.001,0.001,0.001,0.001],
     }
     for task in TASK_NAMES
 }
+
+LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, list[int]]] = {
+    task: {
+        # "ln1": [4,4,4,4,4,4,4,4,4,4,5,5],
+        # "ln2": [4,4,6,5,5,5,5,5,5,7,7,4],# mrpc 0.00005
+        # "ln1": [4,4,4,4,4,4,4,4,4,4,5,6],
+        # "ln2": [4,4,6,5,5,5,5,5,5,7,7,4], # rte 0.0001
+        # "ln1": [4,4,4,4,4,4,4,4,4,5,5,5],
+        # "ln2": [4,4,6,5,5,5,5,5,5,7,7,3], # sst2 0.00005
+        "ln1": [20]*12,
+        "ln2": [20]*12,
+    }
+    for task in TASK_NAMES
+}
+LAYER_INV_SQRT_MAX_ITERS_BY_TASK["sst2"]["ln1"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["sst2"]["ln1"]]
+LAYER_INV_SQRT_MAX_ITERS_BY_TASK["sst2"]["ln2"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["sst2"]["ln2"]]
 # =============================================================================
 
 LayerNormKind = str  # "ln1" | "ln2"
@@ -192,6 +209,26 @@ def layer_invsqrt_alpha_for_task(
     return [float(a) for a in alphas]
 
 
+def layer_invsqrt_max_iters_for_task(
+    task_name: str, kind: LayerNormKind
+) -> list[int]:
+    if task_name not in LAYER_INV_SQRT_MAX_ITERS_BY_TASK:
+        raise KeyError(f"任务 {task_name} 未配置 LAYER_INV_SQRT_MAX_ITERS_BY_TASK")
+    table = LAYER_INV_SQRT_MAX_ITERS_BY_TASK[task_name]
+    if kind not in table:
+        raise KeyError(f"未知 LayerNorm 类型：{kind}")
+    max_iters_list = table[kind]
+    if len(max_iters_list) != NUM_LAYERS:
+        raise ValueError(f"{task_name} {kind} max_iters 长度应为 {NUM_LAYERS}")
+    out: list[int] = []
+    for i, m in enumerate(max_iters_list):
+        m_i = int(m)
+        if m_i < 1:
+            raise ValueError(f"{task_name} 层{i} {kind} max_iters 须 ≥ 1")
+        out.append(m_i)
+    return out
+
+
 def _he_invsqrt_kn(en: float) -> float:
     coeffs = [1.0 - en**3, 6.0 * en**2 - 6.0, 9.0 - 9.0 * en]
     roots = np.roots(coeffs)
@@ -202,7 +239,7 @@ def he_invsqrt_batched(
     variance: torch.Tensor,
     e_init: float,
     alpha: float,
-    max_iters: int = INV_SQRT_MAX_ITERS,
+    max_iters: int,
 ) -> tuple[torch.Tensor, int]:
     an = variance.clamp(min=1e-30)
     bn = torch.ones_like(an)
@@ -228,6 +265,7 @@ def he_layernorm_batched(
     min_var: float,
     max_var: float,
     invsqrt_alpha: float,
+    invsqrt_max_iters: int,
 ) -> tuple[torch.Tensor, int]:
     n = float(x.shape[-1])
 
@@ -246,6 +284,7 @@ def he_layernorm_batched(
         variance,
         e_init=min_var / max_var,
         alpha=invsqrt_alpha,
+        max_iters=invsqrt_max_iters,
     )
 
     out = numerator * inv_sqrt.unsqueeze(-1) * gamma + beta
@@ -513,6 +552,7 @@ def evaluate_he_vs_reference_layernorm_gpu(
     min_var: float,
     max_var: float,
     invsqrt_alpha: float,
+    invsqrt_max_iters: int,
     chunk_size: int,
     max_rows: int | None,
     seed: int,
@@ -523,6 +563,8 @@ def evaluate_he_vs_reference_layernorm_gpu(
         return {
             "max_abs_err": float("nan"),
             "mean_abs_err": float("nan"),
+            "max_rel_pct": float("nan"),
+            "mean_rel_pct": float("nan"),
             "num_vectors": 0,
             "invsqrt_iters": 0,
         }
@@ -532,7 +574,10 @@ def evaluate_he_vs_reference_layernorm_gpu(
 
     max_abs = torch.tensor(0.0, device=x.device, dtype=x.dtype)
     sum_abs = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    max_rel = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    sum_rel = torch.tensor(0.0, device=x.device, dtype=x.dtype)
     count = 0
+    rel_count = 0
     last_invsqrt_iters = 0
 
     for start in range(0, n, chunk_size):
@@ -548,6 +593,7 @@ def evaluate_he_vs_reference_layernorm_gpu(
             min_var,
             max_var,
             invsqrt_alpha,
+            invsqrt_max_iters,
         )
         last_invsqrt_iters = inv_iters
 
@@ -556,9 +602,22 @@ def evaluate_he_vs_reference_layernorm_gpu(
         sum_abs = sum_abs + err.sum()
         count += int(err.numel())
 
+        y_ref_abs = torch.abs(y_ref)
+        denom_ok = y_ref_abs >= REL_ERR_DENOM_MIN
+        if denom_ok.any():
+            rel_pct = err[denom_ok] / y_ref_abs[denom_ok] * 100.0
+            max_rel = torch.maximum(max_rel, rel_pct.max())
+            sum_rel = sum_rel + rel_pct.sum()
+            rel_count += int(rel_pct.numel())
+
+    mean_rel_pct = float((sum_rel / rel_count).cpu()) if rel_count > 0 else float("nan")
+    max_rel_pct = float(max_rel.cpu()) if rel_count > 0 else float("nan")
+
     return {
         "max_abs_err": float(max_abs.cpu()),
         "mean_abs_err": float((sum_abs / count).cpu()),
+        "max_rel_pct": max_rel_pct,
+        "mean_rel_pct": mean_rel_pct,
         "num_vectors": n,
         "num_elems": count,
         "invsqrt_iters": last_invsqrt_iters,
@@ -590,18 +649,29 @@ def _print_error_table(
     )
     print(f"    评估向量: {cap}, chunk={ERROR_EVAL_CHUNK_SIZE}")
     print(
+        f"    相对误差: |y_he−y_ref|/|y_ref|×100% "
+        f"(仅统计 |y_ref|≥{REL_ERR_DENOM_MIN:g})"
+    )
+    print(
         f"{'层':>3} {'LN':>4} {'D':>4} {'min_v':>7} {'max_v':>7} "
-        f"{'alpha':>7} {'isqrt':>5} "
-        f"{'向量数':>10} {'max_abs_err':>14} {'mean_abs_err':>14}"
+        f"{'alpha':>7} {'max_i':>5} {'isqrt':>5} "
+        f"{'向量数':>10} {'max_abs_err':>14} {'mean_abs_err':>14} "
+        f"{'max_rel%':>10} {'mean_rel%':>10}"
     )
     for (layer_idx, kind) in sorted(error_results.keys()):
         st = error_results[(layer_idx, kind)]
+        max_rel = st["max_rel_pct"]
+        mean_rel = st["mean_rel_pct"]
+        max_rel_s = f"{max_rel:10.4f}" if math.isfinite(max_rel) else f"{'nan':>10}"
+        mean_rel_s = f"{mean_rel:10.4f}" if math.isfinite(mean_rel) else f"{'nan':>10}"
         print(
             f"{layer_idx:3d} {kind:>4} {st['hidden_dim']:4d} "
             f"{st['min_var']:7.3g} {st['max_var']:7.3g} "
-            f"{st['invsqrt_alpha']:7.4g} {st['invsqrt_iters']:5d} "
+            f"{st['invsqrt_alpha']:7.4g} {st['invsqrt_max_iters']:5d} "
+            f"{st['invsqrt_iters']:5d} "
             f"{st['num_vectors']:10d} {st['max_abs_err']:14.6g} "
-            f"{st['mean_abs_err']:14.6g}"
+            f"{st['mean_abs_err']:14.6g} "
+            f"{max_rel_s} {mean_rel_s}"
         )
 
 
@@ -625,6 +695,8 @@ def run_task(
 
     ln1_alphas = layer_invsqrt_alpha_for_task(task_name, "ln1")
     ln2_alphas = layer_invsqrt_alpha_for_task(task_name, "ln2")
+    ln1_max_iters = layer_invsqrt_max_iters_for_task(task_name, "ln1")
+    ln2_max_iters = layer_invsqrt_max_iters_for_task(task_name, "ln2")
 
     variance_rows: list[tuple[int, LayerNormKind, int, list[float]]] = []
     error_results: dict[tuple[int, LayerNormKind], dict] = {}
@@ -633,9 +705,9 @@ def run_task(
         if not collector.layer_enable[layer_idx]:
             continue
         layer = model.bert.encoder.layer[layer_idx]
-        for kind, ln_module, alphas in (
-            ("ln1", layer.attention.output.LayerNorm, ln1_alphas),
-            ("ln2", layer.output.LayerNorm, ln2_alphas),
+        for kind, ln_module, alphas, max_iters_list in (
+            ("ln1", layer.attention.output.LayerNorm, ln1_alphas, ln1_max_iters),
+            ("ln2", layer.output.LayerNorm, ln2_alphas, ln2_max_iters),
         ):
             inputs = collector.stacked(layer_idx, kind)
             if inputs.shape[0] == 0:
@@ -657,6 +729,7 @@ def run_task(
                 beta = ln_module.bias.detach()
                 min_var, max_var = float(var_range[0]), float(var_range[1])
                 invsqrt_alpha = alphas[layer_idx]
+                invsqrt_max_iters = max_iters_list[layer_idx]
 
                 err = evaluate_he_vs_reference_layernorm_gpu(
                     inputs,
@@ -666,6 +739,7 @@ def run_task(
                     min_var,
                     max_var,
                     invsqrt_alpha,
+                    invsqrt_max_iters,
                     ERROR_EVAL_CHUNK_SIZE,
                     MAX_VECTORS_FOR_ERROR_EVAL,
                     RANDOM_SEED + layer_idx * 2 + (0 if kind == "ln1" else 1),
@@ -677,6 +751,7 @@ def run_task(
                     "min_var": min_var,
                     "max_var": max_var,
                     "invsqrt_alpha": invsqrt_alpha,
+                    "invsqrt_max_iters": invsqrt_max_iters,
                 }
 
             collector.release(layer_idx, kind)

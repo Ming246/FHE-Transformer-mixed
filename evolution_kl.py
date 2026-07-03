@@ -1,8 +1,8 @@
 """
-多目标进化搜索 POLY_SCHEMES 的 Pareto 前沿（|acc−原始acc| vs C_bts）。
+多目标进化搜索 POLY_SCHEMES 的 Pareto 前沿（Output KL vs C_bts）。
 
 目标：
-  f_acc_delta = |验证集准确率 − 原始模型准确率|（越小越好；严格比较，无容差）
+  f_output_kl = KL(p_baseline ‖ p_poly)（验证集平均，越小越好；严格比较，无容差）
   f_cost      = ceil(深度和 / COST_DEPTH_DIVISOR)（越小越好；严格比较，无容差）
 
 评估集：进化搜索时可用 --eval-samples 抽样子集（默认 200）；
@@ -38,9 +38,10 @@ from gelu_poly import gelu_level_allowed
 from poly_model_inference import fmt_metric_delta
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+# TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = [ "rte", "sst2"]
 POLY_LEVELS = (0, 1, 2)
-OUTPUT_DIR = "./results/evolution_acc_results/"
+OUTPUT_DIR = "./results/evolution_kl_results/"
 
 POPULATION_SIZE = 80
 NUM_GENERATIONS = 200
@@ -144,27 +145,27 @@ def compute_f_cost(task_name: str, scheme: list[int], *, cost_mode: str) -> int:
 @dataclass
 class Individual:
     scheme: list[int]
-    f_acc_delta: float = 0.0
+    f_output_kl: float = 0.0
     f_cost: int = 0
     total_depth: int = 0
     accuracy_delta: float = 0.0
     loss_delta: float = 0.0
+    f1_delta: float | None = None
     output_kl: float = 0.0
     flips_pct: float = 0.0
     oor_count: int = 0
     oor_pct: float = 0.0
     n_eval_used: int = 0
-    f1_delta: float | None = None
     rank: int = field(default=0, compare=False)
     crowding: float = field(default=0.0, compare=False)
 
 
-def acc_delta_not_worse(d1: float, d2: float) -> bool:
-    return d1 <= d2
+def kl_not_worse(k1: float, k2: float) -> bool:
+    return k1 <= k2
 
 
-def acc_delta_strictly_better(d1: float, d2: float) -> bool:
-    return d1 < d2
+def kl_strictly_better(k1: float, k2: float) -> bool:
+    return k1 < k2
 
 
 def cost_strictly_better(c1: int, c2: int, *, cost_mode: str) -> bool:
@@ -178,13 +179,13 @@ def cost_not_worse(c1: int, c2: int, *, cost_mode: str) -> bool:
 
 
 def dominates(a: Individual, b: Individual, *, cost_mode: str) -> bool:
-    if not acc_delta_not_worse(a.f_acc_delta, b.f_acc_delta):
+    if not kl_not_worse(a.f_output_kl, b.f_output_kl):
         return False
     if not cost_not_worse(a.f_cost, b.f_cost, cost_mode=cost_mode):
         return False
-    acc_better = acc_delta_strictly_better(a.f_acc_delta, b.f_acc_delta)
+    kl_better = kl_strictly_better(a.f_output_kl, b.f_output_kl)
     cost_better = cost_strictly_better(a.f_cost, b.f_cost, cost_mode=cost_mode)
-    return acc_better or cost_better
+    return kl_better or cost_better
 
 
 def evaluate_individual(
@@ -194,10 +195,14 @@ def evaluate_individual(
     *,
     cost_mode: str,
 ) -> Individual:
-    acc = scheme_eval.accuracy_for_scheme(ind.scheme)
-    ind.f_acc_delta = abs(acc - scheme_eval.baseline_acc)
+    metrics = scheme_eval.evaluate_for_scheme(ind.scheme)
+    ind.f_output_kl = metrics.output_kl
     ind.f_cost = compute_f_cost(task_name, ind.scheme, cost_mode=cost_mode)
     ind.total_depth = int(compute_scheme_cost(task_name, ind.scheme))
+    ind.accuracy_delta = metrics.accuracy_delta
+    ind.loss_delta = metrics.loss_delta
+    ind.f1_delta = metrics.f1_delta
+    ind.output_kl = metrics.output_kl
     return ind
 
 
@@ -249,7 +254,7 @@ def crowding_distance(front: list[Individual]) -> None:
         return
 
     objectives = (
-        ("f_acc_delta", lambda x: x.f_acc_delta),
+        ("f_output_kl", lambda x: x.f_output_kl),
         ("f_cost", lambda x: float(x.f_cost)),
     )
     for _, getter in objectives:
@@ -320,7 +325,7 @@ def environmental_selection(
         if len(next_pop) + len(front) <= target_size:
             next_pop.extend(front)
         else:
-            front.sort(key=lambda x: (-x.crowding, x.f_cost, x.f_acc_delta))
+            front.sort(key=lambda x: (-x.crowding, x.f_cost, x.f_output_kl))
             need = target_size - len(next_pop)
             next_pop.extend(front[:need])
             break
@@ -347,7 +352,7 @@ class Archive:
         self.items.append(
             Individual(
                 scheme=ind.scheme.copy(),
-                f_acc_delta=ind.f_acc_delta,
+                f_output_kl=ind.f_output_kl,
                 f_cost=ind.f_cost,
                 total_depth=ind.total_depth,
                 accuracy_delta=ind.accuracy_delta,
@@ -372,13 +377,13 @@ class Archive:
             if len(kept) + len(front) <= self.max_size:
                 kept.extend(front)
             else:
-                front.sort(key=lambda x: (-x.crowding, x.f_cost, x.f_acc_delta))
+                front.sort(key=lambda x: (-x.crowding, x.f_cost, x.f_output_kl))
                 kept.extend(front[: self.max_size - len(kept)])
                 break
         self.items = kept
 
     def sorted_items(self) -> list[Individual]:
-        return sorted(self.items, key=lambda x: (x.f_cost, x.f_acc_delta))
+        return sorted(self.items, key=lambda x: (x.f_cost, x.f_output_kl))
 
 
 def reference_scheme_extremes(allowed_table: list[tuple[int, ...]]) -> tuple[list[int], list[int]]:
@@ -393,15 +398,16 @@ def print_eval_sanity(
     allowed_table: list[tuple[int, ...]],
 ) -> None:
     all_low, all_high = reference_scheme_extremes(allowed_table)
-    acc_base = scheme_eval.baseline_acc
-    acc_lo = scheme_eval.accuracy_for_scheme(all_low)
-    acc_hi = scheme_eval.accuracy_for_scheme(all_high)
+    kl_base = scheme_eval.baseline_output_kl
+    lo = scheme_eval.evaluate_for_scheme(all_low)
+    hi = scheme_eval.evaluate_for_scheme(all_high)
     print(
-        f"  校准（同一 eval 集）：baseline={acc_base:.4f}  "
-        f"all-low={acc_lo:.4f} (Δ={abs(acc_lo - acc_base):.4f})  "
-        f"all-high={acc_hi:.4f} (Δ={abs(acc_hi - acc_base):.4f})"
+        f"  校准（同一 eval 集）：baseline_KL={kl_base:.6f}  "
+        f"all-low_KL={lo.output_kl:.6f}  "
+        f"all-high_KL={hi.output_kl:.6f}  "
+        f"baseline_acc={scheme_eval.baseline_acc:.4f}"
     )
-    if acc_base < 0.5 or acc_lo < 0.45:
+    if scheme_eval.baseline_acc < 0.5 or lo.accuracy < 0.45:
         print(
             "  警告：准确率异常偏低，请检查 token_type_ids / 权重路径 / eval 子集"
         )
@@ -456,13 +462,13 @@ def run_evolution(
         archive.extend(population)
 
         if gen % PROGRESS_EVERY == 0 or gen == num_generations:
-            best_delta = min(ind.f_acc_delta for ind in population)
-            best = min(population, key=lambda x: (x.f_cost, x.f_acc_delta))
+            best_kl = min(ind.f_output_kl for ind in population)
+            best = min(population, key=lambda x: (x.f_cost, x.f_output_kl))
             print(
                 f"  代 {gen}/{num_generations}  "
-                f"pop_best_Δacc={best_delta:.6f}  "
+                f"pop_best_KL={best_kl:.6f}  "
                 f"archive={len(archive.items)}  "
-                f"cache={len(scheme_eval._acc_cache)}"
+                f"cache={len(scheme_eval._cache)}"
             )
 
     return archive.sorted_items(), archive
@@ -478,7 +484,7 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
     header = [
         "task",
         "rank_hint",
-        "f_acc_delta",
+        "f_output_kl",
         "f_cost",
         "total_depth",
         "accuracy_delta",
@@ -499,7 +505,7 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
             row = [
                 task_name,
                 i,
-                f"{ind.f_acc_delta:.8f}",
+                f"{ind.f_output_kl:.8f}",
                 ind.f_cost,
                 ind.total_depth,
                 fmt_metric_delta(ind.accuracy_delta),
@@ -522,7 +528,7 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="多目标进化（|acc−原始acc| vs C_bts）"
+        description="多目标进化（Output KL vs C_bts）"
     )
     parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
     parser.add_argument("--pop", type=int, default=POPULATION_SIZE)
@@ -551,7 +557,7 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(
-        f"多目标进化（|acc−原始acc| 越小越好；cost={depth_f_cost_label()} 严格越小越好）"
+        f"多目标进化（Output KL 越小越好；cost={depth_f_cost_label()} 严格越小越好）"
     )
     print(
         f"device={device}, pop={args.pop}, gens={args.gens}, seed={args.seed}, "
@@ -595,7 +601,7 @@ def main() -> None:
         )
         enrich_pareto_report(task_name, archive, report_eval)
 
-        out_path = os.path.join(args.output_dir, f"{task_name}_pareto_acc.csv")
+        out_path = os.path.join(args.output_dir, f"{task_name}_pareto_kl.csv")
         save_pareto_csv(task_name, archive, out_path)
         print(f"已保存：{out_path}")
 

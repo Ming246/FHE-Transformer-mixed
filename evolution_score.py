@@ -3,15 +3,13 @@
 
 目标（均越小越好）：
   f_loss = Σ_j S_{j,k_j}   （敏感度得分和，来自 CSV）
-  f_cost = C_bts(scheme)   （完整方案 bootstrap 次数；未实现前用 depth 和占位）
+  f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)（C_bts 未实现前为 depth 占位）
 
 支配关系（x1 支配 x2）：
   x1 在所有目标上都不比 x2 差，且在至少一个目标上严格更好。
 
   loss：严格更好当 L(x1) < 0.9 * L(x2)；不比 x2 差当 L(x1) <= 1.1 * L(x2)
-  cost（depth 占位）：严格更好当差值 > 10（即 C(x1) <= C(x2) - 11）；
-                      不比 x2 差当 C(x1) <= C(x2) + 10
-  cost（bts 实现后，--cost-mode bts）：严格整数比较，小者优，无容差
+  cost：f_cost 严格整数比较，小者优，无容差（depth / bts 均同）
 
 非法个体：交叉在合法父代下不产生非法解；初始化/变异若非法则重生成。
 Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿输出。
@@ -25,19 +23,28 @@ import random
 import time
 from dataclasses import dataclass, field
 
-from cost import NUM_LAYERS, compute_scheme_cost, scheme_index, validate_scheme
+from cost import (
+    NUM_LAYERS,
+    SCHEME_LEN,
+    compute_scheme_cost,
+    depth_f_cost_label,
+    depth_sum_to_f_cost,
+    scheme_index,
+    validate_scheme,
+)
 from gelu_poly import gelu_level_allowed
+from evolution_infer import format_elapsed, save_search_timings
 
 # ===================== 配置区 =====================
 TASK_NAMES = ["mrpc", "rte", "sst2"]
-SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
+SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores/"
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_results/"
 
 POPULATION_SIZE = 120
 NUM_GENERATIONS = 300
 CROSSOVER_RATE = 0.9
-MUTATION_RATE = 1.0 / (NUM_LAYERS * 2)
+MUTATION_RATE = 1.0 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 80
@@ -45,11 +52,8 @@ RANDOM_SEED = 42
 
 LOSS_STRICT_RATIO = 0.9
 LOSS_NOT_WORSE_RATIO = 1.1
-COST_STRICT_MARGIN = 11
-COST_NOT_WORSE_MARGIN = 10
 
-RUN_INFERENCE_ON_ARCHIVE = False
-INFERENCE_ARCHIVE_TOP_K = 5
+RUN_INFERENCE_ON_ARCHIVE = True
 # ==================================================
 
 
@@ -57,7 +61,7 @@ def iter_positions() -> list[tuple[int, str]]:
     return [
         (layer_idx, kind)
         for layer_idx in range(NUM_LAYERS)
-        for kind in ("softmax", "gelu")
+        for kind in ("softmax", "ln1", "gelu", "ln2")
     ]
 
 
@@ -79,17 +83,17 @@ def load_sensitivity_matrix(
                 1: float(row["S_mid"]),
                 2: float(row["S_high"]),
             }
-    if len(out) != NUM_LAYERS * 2:
-        raise ValueError(f"{task_name} 敏感度行数应为 24，当前为 {len(out)}")
+    if len(out) != SCHEME_LEN:
+        raise ValueError(f"{task_name} 敏感度行数应为 {SCHEME_LEN}，当前为 {len(out)}")
     return out
 
 
 def allowed_levels(layer_idx: int, kind: str) -> tuple[int, ...]:
-    if kind == "softmax":
-        return POLY_LEVELS
-    return tuple(
-        level for level in POLY_LEVELS if gelu_level_allowed(layer_idx, level)
-    )
+    if kind == "gelu":
+        return tuple(
+            level for level in POLY_LEVELS if gelu_level_allowed(layer_idx, level)
+        )
+    return POLY_LEVELS
 
 
 def build_allowed_levels_table() -> list[tuple[int, ...]]:
@@ -100,7 +104,7 @@ def build_allowed_levels_table() -> list[tuple[int, ...]]:
 
 
 def is_scheme_legal(scheme: list[int], allowed_table: list[tuple[int, ...]]) -> bool:
-    if len(scheme) != NUM_LAYERS * 2:
+    if len(scheme) != SCHEME_LEN:
         return False
     for idx, level in enumerate(scheme):
         if level not in allowed_table[idx]:
@@ -109,7 +113,7 @@ def is_scheme_legal(scheme: list[int], allowed_table: list[tuple[int, ...]]) -> 
 
 
 def random_legal_scheme(rng: random.Random, allowed_table: list[tuple[int, ...]]) -> list[int]:
-    return [rng.choice(allowed_table[idx]) for idx in range(NUM_LAYERS * 2)]
+    return [rng.choice(allowed_table[idx]) for idx in range(SCHEME_LEN)]
 
 
 def random_scheme_with_mutation_draw(
@@ -117,7 +121,7 @@ def random_scheme_with_mutation_draw(
 ) -> list[int]:
     """随机 scheme，某位可能抽到非法档位（用于变异路径）。"""
     scheme = random_legal_scheme(rng, allowed_table)
-    idx = rng.randrange(NUM_LAYERS * 2)
+    idx = rng.randrange(SCHEME_LEN)
     scheme[idx] = rng.choice(POLY_LEVELS)
     return scheme
 
@@ -180,14 +184,15 @@ def compute_f_cost(task_name: str, scheme: list[int], *, cost_mode: str) -> int:
     """
     f_cost = C_bts(scheme)。
 
-    cost_mode='depth'：占位，用乘法深度之和。
-    cost_mode='bts'  ：预留，当前仍回退 depth，待 bts 求解器接入。
+    cost_mode='depth'：ceil(深度和 / COST_DEPTH_DIVISOR)。
+    cost_mode='bts'  ：预留，当前仍回退 depth 映射，待 bts 求解器接入。
     """
     validate_scheme(scheme, task_name)
     if cost_mode == "bts":
         # TODO: return int(optimize_bootstrap(task_name, scheme))
         pass
-    return int(compute_scheme_cost(task_name, scheme))
+    depth = int(compute_scheme_cost(task_name, scheme))
+    return depth_sum_to_f_cost(depth)
 
 
 @dataclass
@@ -195,6 +200,15 @@ class Individual:
     scheme: list[int]
     f_loss: float = 0.0
     f_cost: int = 0
+    total_depth: int = 0
+    accuracy_delta: float = 0.0
+    loss_delta: float = 0.0
+    output_kl: float = 0.0
+    flips_pct: float = 0.0
+    oor_count: int = 0
+    oor_pct: float = 0.0
+    n_eval_used: int = 0
+    f1_delta: float | None = None
     rank: int = field(default=0, compare=False)
     crowding: float = field(default=0.0, compare=False)
 
@@ -212,15 +226,13 @@ def loss_not_worse(l1: float, l2: float) -> bool:
 
 
 def cost_strictly_better(c1: int, c2: int, *, cost_mode: str) -> bool:
-    if cost_mode == "bts":
-        return c1 < c2
-    return c1 <= c2 - COST_STRICT_MARGIN
+    del cost_mode
+    return c1 < c2
 
 
 def cost_not_worse(c1: int, c2: int, *, cost_mode: str) -> bool:
-    if cost_mode == "bts":
-        return c1 <= c2
-    return c1 <= c2 + COST_NOT_WORSE_MARGIN
+    del cost_mode
+    return c1 <= c2
 
 
 def dominates(a: Individual, b: Individual, *, cost_mode: str) -> bool:
@@ -336,7 +348,7 @@ def crossover(
         return parent1.copy()
     return [
         parent1[i] if rng.random() < 0.5 else parent2[i]
-        for i in range(NUM_LAYERS * 2)
+        for i in range(SCHEME_LEN)
     ]
 
 
@@ -348,7 +360,7 @@ def mutate(
     child = scheme.copy()
     if rng.random() >= MUTATION_RATE:
         return child
-    idx = rng.randrange(NUM_LAYERS * 2)
+    idx = rng.randrange(SCHEME_LEN)
     child[idx] = rng.choice(POLY_LEVELS)
     if is_scheme_legal(child, allowed_table):
         return child
@@ -405,6 +417,11 @@ class Archive:
                 scheme=ind.scheme.copy(),
                 f_loss=ind.f_loss,
                 f_cost=ind.f_cost,
+                total_depth=ind.total_depth,
+                accuracy_delta=ind.accuracy_delta,
+                loss_delta=ind.loss_delta,
+                output_kl=ind.output_kl,
+                f1_delta=ind.f1_delta,
             )
         )
         self._truncate()
@@ -485,70 +502,56 @@ def format_scheme(scheme: list[int]) -> str:
     return str(scheme)
 
 
-def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
+def save_pareto_csv(task_name: str, archive: Archive, path: str, *, with_inference: bool) -> None:
+    from poly_model_inference import fmt_metric_delta
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    mrpc = task_name == "mrpc"
+    header = ["task", "rank_hint", "f_loss", "f_cost"]
+    if with_inference:
+        header.extend(
+            [
+                "total_depth",
+                "accuracy_delta",
+                "loss_delta",
+                "output_kl",
+                "flips_pct",
+                "oor_count",
+                "oor_pct",
+                "n_eval_used",
+            ]
+        )
+        if mrpc:
+            header.append("f1_delta")
+    header.append("scheme")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["task", "rank_hint", "f_loss", "f_cost", "scheme"])
+        writer.writerow(header)
         for i, ind in enumerate(archive.sorted_items(), start=1):
-            writer.writerow(
-                [task_name, i, f"{ind.f_loss:.8e}", ind.f_cost, format_scheme(ind.scheme)]
-            )
+            row = [task_name, i, f"{ind.f_loss:.8e}", ind.f_cost]
+            if with_inference:
+                from evolution_infer import fmt_flips_pct, fmt_oor_pct
 
-
-def format_elapsed(seconds: float) -> str:
-    """将秒数格式化为易读字符串。"""
-    if seconds < 60.0:
-        return f"{seconds:.2f}s"
-    minutes, secs = divmod(seconds, 60.0)
-    if minutes < 60.0:
-        return f"{int(minutes)}m {secs:.1f}s"
-    hours, minutes = divmod(minutes, 60.0)
-    return f"{int(hours)}h {int(minutes)}m {secs:.0f}s"
-
-
-def print_archive(
-    task_name: str,
-    items: list[Individual],
-    *,
-    cost_mode: str,
-    elapsed_s: float | None = None,
-) -> None:
-    cost_label = "bts" if cost_mode == "bts" else "depth(占位)"
-    print(f"\n{'=' * 72}")
-    print(f"Pareto 前沿：{task_name.upper()}  |  cost={cost_label}  |  共 {len(items)} 个解")
-    if elapsed_s is not None:
-        print(f"搜索用时：{format_elapsed(elapsed_s)} ({elapsed_s:.2f}s)")
-    print(f"{'=' * 72}")
-    print(f"{'#':<4} {'f_loss':<14} {'f_cost':<8} scheme")
-    print("-" * 72)
-    for i, ind in enumerate(items, start=1):
-        print(f"{i:<4} {ind.f_loss:<14.6e} {ind.f_cost:<8} {format_scheme(ind.scheme)}")
-
-
-def maybe_run_inference(task_name: str, items: list[Individual], top_k: int) -> None:
-    if not items:
-        return
-    from poly_model_inference import (
-        fmt_accuracy,
-        fmt_accuracy_delta,
-        run_task_with_comparison,
-    )
-
-    print(f"\n>>> Archive 前 {top_k} 个方案验证集推理：{task_name.upper()}")
-    print(
-        f"{'#':<4} {'f_loss':<12} {'f_cost':<8} "
-        f"{'poly_acc':<10} {'Δacc':<10} {'poly_loss':<12}"
-    )
-    print("-" * 70)
-    for i, ind in enumerate(items[:top_k], start=1):
-        result = run_task_with_comparison(task_name, ind.scheme)
-        print(
-            f"{i:<4} {ind.f_loss:<12.4e} {ind.f_cost:<8} "
-            f"{fmt_accuracy(result['poly_accuracy']):<10} "
-            f"{fmt_accuracy_delta(result['accuracy_delta']):<10} "
-            f"{result['poly_loss']:.7f}"
-        )
+                row.extend(
+                    [
+                        ind.total_depth,
+                        fmt_metric_delta(ind.accuracy_delta),
+                        f"{ind.loss_delta:.8f}",
+                        f"{ind.output_kl:.8f}",
+                        fmt_flips_pct(ind.flips_pct),
+                        ind.oor_count,
+                        fmt_oor_pct(ind.oor_pct),
+                        ind.n_eval_used,
+                    ]
+                )
+                if mrpc:
+                    row.append(
+                        fmt_metric_delta(ind.f1_delta)
+                        if ind.f1_delta is not None
+                        else ""
+                    )
+            row.append(format_scheme(ind.scheme))
+            writer.writerow(row)
 
 
 def main() -> None:
@@ -568,7 +571,7 @@ def main() -> None:
         "--cost-mode",
         choices=("depth", "bts"),
         default="depth",
-        help="depth=深度和占位+bts容差; bts=严格整数比较（bts 未接入时仍用 depth 值）",
+        help=f"depth={depth_f_cost_label()}; bts=预留（未接入时同 depth 映射）",
     )
     parser.add_argument(
         "--sensitive-dir",
@@ -581,22 +584,20 @@ def main() -> None:
         help="Pareto CSV 输出目录",
     )
     parser.add_argument(
-        "--inference",
+        "--skip-inference",
         action="store_true",
-        default=RUN_INFERENCE_ON_ARCHIVE,
-        help="对 Archive 前 K 个方案跑验证集推理",
-    )
-    parser.add_argument(
-        "--inference-top-k",
-        type=int,
-        default=INFERENCE_ARCHIVE_TOP_K,
-        help="推理评估的 Archive 方案数",
+        help="跳过 Pareto 解的全验证集推理（仅输出 f_loss / f_cost）",
     )
     args = parser.parse_args()
 
+    with_inference = not args.skip_inference
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print("多目标进化搜索（支配：loss 10% 容差；cost depth 占位 ±10 / bts 严格）")
+    print(
+        "多目标进化搜索（支配：loss 10% 容差；"
+        f"cost={depth_f_cost_label()} 严格越小越好）"
+    )
     print(
         f"pop={args.pop}, gens={args.gens}, seed={args.seed}, "
         f"cost_mode={args.cost_mode}, sensitive_dir={args.sensitive_dir}"
@@ -607,7 +608,7 @@ def main() -> None:
     for task_name in args.tasks:
         try:
             t0 = time.perf_counter()
-            items, archive = run_evolution(
+            _items, archive = run_evolution(
                 task_name,
                 population_size=args.pop,
                 num_generations=args.gens,
@@ -615,38 +616,45 @@ def main() -> None:
                 seed=args.seed,
                 sensitive_dir=args.sensitive_dir,
             )
-            elapsed_s = time.perf_counter() - t0
+            search_elapsed_s = time.perf_counter() - t0
         except FileNotFoundError as exc:
             print(f"\n{task_name.upper()} 跳过：{exc}")
             continue
 
-        print_archive(
-            task_name, items, cost_mode=args.cost_mode, elapsed_s=elapsed_s
+        task_timings.append((task_name, search_elapsed_s))
+        print(
+            f"  {task_name.upper()} 搜索用时："
+            f"{format_elapsed(search_elapsed_s)} ({search_elapsed_s:.2f}s)"
         )
-        out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
-        save_pareto_csv(task_name, archive, out_path)
-        print(f"已保存：{out_path}")
-        task_timings.append((task_name, elapsed_s))
 
-        if args.inference:
-            maybe_run_inference(task_name, items, args.inference_top_k)
+        if with_inference:
+            from evolution_infer import SchemeEvaluator, enrich_pareto_report
+
+            print(f"\n>>> {task_name.upper()}：Pareto 全验证集汇报...")
+            try:
+                report_eval = SchemeEvaluator(
+                    task_name,
+                    eval_samples=None,
+                    seed=args.seed,
+                )
+            except FileNotFoundError as exc:
+                print(f"  推理跳过：{exc}")
+                with_inference_task = False
+            else:
+                enrich_pareto_report(task_name, archive, report_eval)
+                with_inference_task = True
+        else:
+            with_inference_task = False
+
+        out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
+        save_pareto_csv(
+            task_name, archive, out_path, with_inference=with_inference_task
+        )
+        print(f"已保存：{out_path}")
 
     if task_timings:
-        print(f"\n{'=' * 72}")
-        print("搜索用时汇总")
-        print(f"{'=' * 72}")
-        print(f"{'任务':<8} {'用时':<16} {'秒':<10}")
-        print("-" * 36)
-        total_search_s = 0.0
-        for task_name, elapsed_s in task_timings:
-            print(
-                f"{task_name:<8} {format_elapsed(elapsed_s):<16} {elapsed_s:<10.2f}"
-            )
-            total_search_s += elapsed_s
-        print("-" * 36)
-        print(
-            f"{'合计':<8} {format_elapsed(total_search_s):<16} {total_search_s:<10.2f}"
-        )
+        timings_path = save_search_timings(args.output_dir, task_timings)
+        print(f"\n搜索用时已保存：{timings_path}")
 
 
 if __name__ == "__main__":
