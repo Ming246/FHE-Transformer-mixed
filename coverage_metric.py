@@ -1,11 +1,11 @@
 """
-校验集（从 train 分层抽样 + tail 补强）校准各层非线性 [min,max]，
+校验集（从 train 分层抽样）校准各层非线性 [min,max]，
 在验证集（评估集）上统计覆盖率。
 
-默认校验集规模（分层 + tail）：
-  sst2 — 512 + 128，tail 扫描池 4096
-  mrpc — 400 + 50，  tail 扫描池 = min(train, 3668)
-  rte  — 400 + 50，  tail 扫描池 = min(train, 2490)
+默认校验集规模（分层）：
+  sst2 — 512
+  mrpc — 400
+  rte  — 400
 
 支持 --convergence 扫描 n∈{128,256,512,1024,2048} 的区间收敛曲线；
 支持 --calib-seeds 多随机种子稳定性报告。
@@ -37,7 +37,7 @@ from transformers import (
 )
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 OUTPUT_DIR = "./results/coverage_metrics/"
@@ -47,8 +47,7 @@ NUM_LAYERS = 12
 NUM_LABELS = 2
 
 NONLINEAR_NAMES = ["Softmax", "LayerNorm1", "GeLU", "LayerNorm2"]
-TAIL_SCORE_LAYERS = (0, 5, 11)
-CONVERGENCE_SIZES = [128, 256, 512, 1024, 2048]
+CONVERGENCE_SIZES = [128, 256, 400,512, 1024, 2048]
 N_LEN_BINS = 5
 DEFAULT_CALIB_SEED = 42
 SCORE_VALID_THRESHOLD = -1e4
@@ -61,9 +60,9 @@ VAL_LN_VAR_MIN_SCALE = 0.9    # 验证方差下界 = calib_min × scale
 VAL_LN_VAR_MAX_SCALE = 1.2    # 验证方差上界 = calib_max × scale
 
 TASK_CALIB_DEFAULTS: dict[str, dict[str, int]] = {
-    "sst2": {"calib_size": 512, "tail_size": 128, "pool_size": 4096},
-    "mrpc": {"calib_size": 400, "tail_size": 50, "pool_size": 3668},
-    "rte": {"calib_size": 400, "tail_size": 50, "pool_size": 2490},
+    "sst2": {"calib_size": 512},
+    "mrpc": {"calib_size": 400},
+    "rte": {"calib_size": 400},
 }
 # ==================================================
 
@@ -276,152 +275,6 @@ def stratified_sample_indices(
     return sorted(chosen)
 
 
-@dataclass
-class TailScorer:
-    batch_scores: torch.Tensor | None = None
-
-    def reset(self) -> None:
-        self.batch_scores = None
-
-    def update(self, tensor: torch.Tensor) -> None:
-        per = tensor.detach().reshape(tensor.shape[0], -1).abs().amax(dim=1)
-        if self.batch_scores is None:
-            self.batch_scores = per
-        else:
-            self.batch_scores = torch.maximum(self.batch_scores, per)
-
-    def update_attention_scores(self, scores: torch.Tensor) -> None:
-        """仅在有效 key 上取 |score| 最大（mask 后 padding 为大额负数）。"""
-        s = scores.detach()
-        valid = scores_valid_mask(s)
-        rows = s.reshape(s.shape[0], -1)
-        valid_rows = valid.reshape(s.shape[0], -1)
-        per = rows.abs().masked_fill(~valid_rows, 0.0).amax(dim=1)
-        if self.batch_scores is None:
-            self.batch_scores = per
-        else:
-            self.batch_scores = torch.maximum(self.batch_scores, per)
-
-    def consume(self) -> list[float]:
-        if self.batch_scores is None:
-            return []
-        out = self.batch_scores.detach().cpu().tolist()
-        self.reset()
-        return out
-
-
-def register_tail_score_hooks(model, scorer: TailScorer) -> HookState:
-    state = HookState()
-    for layer_idx in TAIL_SCORE_LAYERS:
-        layer = model.bert.encoder.layer[layer_idx]
-        act_fn = layer.intermediate.intermediate_act_fn
-        if isinstance(act_fn, torch.nn.Module):
-
-            def make_gelu_hook(sc):
-                def hook_fn(module, inp, out):
-                    sc.update(inp[0])
-
-                return hook_fn
-
-            state.module_hooks.append(act_fn.register_forward_hook(make_gelu_hook(scorer)))
-        else:
-            intermediate = layer.intermediate
-            orig_inter = intermediate.forward
-
-            def make_gelu_inter(orig_fn, sc):
-                @functools.wraps(orig_fn)
-                def patched(*args, **kwargs):
-                    original_gelu = F.gelu
-
-                    def tracking_gelu(input, approximate="none"):
-                        sc.update(input)
-                        return original_gelu(input, approximate=approximate)
-
-                    F.gelu = tracking_gelu
-                    try:
-                        return orig_fn(*args, **kwargs)
-                    finally:
-                        F.gelu = original_gelu
-
-                return patched
-
-            intermediate.forward = make_gelu_inter(orig_inter, scorer)
-            state.forward_restores.append((intermediate, orig_inter))
-
-        attn_self = layer.attention.self
-        orig_forward = attn_self.forward
-
-        def make_softmax_patched(orig_fn, sc, attn_module):
-            @functools.wraps(orig_fn)
-            def patched_forward(
-                hidden_states,
-                attention_mask=None,
-                head_mask=None,
-                encoder_hidden_states=None,
-                encoder_attention_mask=None,
-                past_key_value=None,
-                output_attentions=False,
-                **kwargs,
-            ):
-                scores = compute_masked_attention_scores(
-                    attn_module,
-                    hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                )
-                sc.update_attention_scores(scores)
-                return orig_fn(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    head_mask=head_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    **kwargs,
-                )
-
-            return patched_forward
-
-        attn_self.forward = make_softmax_patched(orig_forward, scorer, attn_self)
-        state.forward_restores.append((attn_self, orig_forward))
-    return state
-
-
-@torch.no_grad()
-def score_tail_candidates(
-    model,
-    tokenized_train: Dataset,
-    pool_indices: list[int],
-    collator,
-) -> dict[int, float]:
-    """在扫描池上按样本最大激活打分（layers 0/5/11 的 GeLU+Softmax）。"""
-    if not pool_indices:
-        return {}
-    subset = tokenized_train.select(pool_indices)
-    loader = DataLoader(
-        subset,
-        batch_size=BATCH_SIZE,
-        collate_fn=collator,
-        **_dataloader_kwargs(),
-    )
-    scorer = TailScorer()
-    hook_state = register_tail_score_hooks(model, scorer)
-    scores: dict[int, float] = {}
-    try:
-        offset = 0
-        for batch in loader:
-            batch = _batch_to_device(batch)
-            model(**batch)
-            batch_scores = scorer.consume()
-            for j, val in enumerate(batch_scores):
-                scores[pool_indices[offset + j]] = float(val)
-            offset += len(batch_scores)
-    finally:
-        restore_hooks(hook_state)
-    return scores
-
-
 def _get_labels(tokenized_train: Dataset) -> list[int]:
     col = "labels" if "labels" in tokenized_train.column_names else "label"
     if col not in tokenized_train.column_names:
@@ -432,47 +285,17 @@ def _get_labels(tokenized_train: Dataset) -> list[int]:
 def build_calibration_indices(
     tokenized_train: Dataset,
     calib_size: int,
-    tail_size: int,
-    pool_size: int,
     seed: int,
-    model,
-    collator,
 ) -> tuple[list[int], dict]:
     labels = _get_labels(tokenized_train)
     valid_lens = compute_valid_lengths(tokenized_train)
-    n_total = len(labels)
-
-    stratified = stratified_sample_indices(
-        calib_size, labels, valid_lens, seed=seed
-    )
-    stratified_set = set(stratified)
-
-    pool_n = min(pool_size, n_total)
-    rng = random.Random(seed + 1)
-    pool_indices = rng.sample(range(n_total), pool_n)
-
-    tail_indices: list[int] = []
-    meta: dict = {
+    indices = stratified_sample_indices(calib_size, labels, valid_lens, seed=seed)
+    meta = {
         "seed": seed,
         "calib_size": calib_size,
-        "tail_size": tail_size,
-        "pool_size": pool_n,
-        "stratified_count": len(stratified),
+        "total_calib": len(indices),
     }
-    if tail_size > 0:
-        scores = score_tail_candidates(model, tokenized_train, pool_indices, collator)
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        for idx, _ in ranked:
-            if idx in stratified_set:
-                continue
-            tail_indices.append(idx)
-            if len(tail_indices) >= tail_size:
-                break
-        meta["tail_selected"] = len(tail_indices)
-
-    all_indices = sorted(set(stratified) | set(tail_indices))
-    meta["total_calib"] = len(all_indices)
-    return all_indices, meta
+    return indices, meta
 
 
 def save_calib_indices(
@@ -1249,7 +1072,6 @@ def run_convergence_study(
     output_dir: str,
     reference: dict[str, dict[str, float]],
     seed: int,
-    pool_size: int,
 ) -> None:
     rows: list[dict] = []
     detail_rows: list[dict] = []
@@ -1257,15 +1079,10 @@ def run_convergence_study(
     for calib_n in CONVERGENCE_SIZES:
         if calib_n >= len(tokenized_train):
             continue
-        tail_n = max(16, calib_n // 4)
         indices, meta = build_calibration_indices(
             tokenized_train,
             calib_size=calib_n,
-            tail_size=tail_n,
-            pool_size=pool_size,
             seed=seed,
-            model=model,
-            collator=collator,
         )
         calib_ds = tokenized_train.select(indices)
         ranges = collect_calib_ranges(model, calib_ds, collator)
@@ -1276,8 +1093,7 @@ def run_convergence_study(
         rows.append(
             {
                 "task": task_name,
-                "calib_stratified_n": calib_n,
-                "calib_tail_n": tail_n,
+                "calib_n": calib_n,
                 "calib_total_n": len(indices),
                 "seed": seed,
                 "max_rel_err_span": max_rel,
@@ -1292,8 +1108,7 @@ def run_convergence_study(
             detail_rows.append(
                 {
                     "task": task_name,
-                    "calib_stratified_n": calib_n,
-                    "calib_tail_n": tail_n,
+                    "calib_n": calib_n,
                     "seed": seed,
                     "layer": layer_idx,
                     "nonlinear": nl,
@@ -1305,7 +1120,7 @@ def run_convergence_study(
                 }
             )
         print(
-            f"    n={calib_n}+{tail_n} total={len(indices)} "
+            f"    n={calib_n} total={len(indices)} "
             f"max_rel_err_span={max_rel:.4f} mean_sample_cov={mean_cov:.2f}%"
         )
 
@@ -1333,8 +1148,6 @@ def run_stability_study(
     collator,
     output_dir: str,
     calib_size: int,
-    tail_size: int,
-    pool_size: int,
     n_seeds: int,
     base_seed: int,
 ) -> None:
@@ -1344,11 +1157,7 @@ def run_stability_study(
         indices, meta = build_calibration_indices(
             tokenized_train,
             calib_size=calib_size,
-            tail_size=tail_size,
-            pool_size=pool_size,
             seed=seed,
-            model=model,
-            collator=collator,
         )
         calib_ds = tokenized_train.select(indices)
         ranges = collect_calib_ranges(model, calib_ds, collator)
@@ -1378,8 +1187,6 @@ def run_stability_study(
 @dataclass
 class CalibConfig:
     calib_size: int
-    tail_size: int
-    pool_size: int
     seed: int = DEFAULT_CALIB_SEED
 
 
@@ -1387,8 +1194,6 @@ def resolve_calib_config(task_name: str, args) -> CalibConfig:
     defaults = task_calib_defaults(task_name)
     return CalibConfig(
         calib_size=args.calib_size if args.calib_size is not None else defaults["calib_size"],
-        tail_size=args.calib_tail_size if args.calib_tail_size is not None else defaults["tail_size"],
-        pool_size=args.calib_pool_size if args.calib_pool_size is not None else defaults["pool_size"],
         seed=args.calib_seed,
     )
 
@@ -1397,7 +1202,6 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
     print(f"\n>>> {task_name.upper()}")
     model, tokenized_train, tokenized_val, collator = load_model_and_data(task_name)
     cfg = resolve_calib_config(task_name, args)
-    pool_size = min(cfg.pool_size, len(tokenized_train))
 
     if args.convergence:
         reference = load_or_compute_reference_ranges(
@@ -1418,7 +1222,6 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
             output_dir,
             reference,
             seed=cfg.seed,
-            pool_size=pool_size,
         )
         return []
 
@@ -1432,24 +1235,15 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
             collator,
             output_dir,
             cfg.calib_size,
-            cfg.tail_size,
-            pool_size,
             args.calib_seeds,
             cfg.seed,
         )
 
-    print(
-        f"  校验集：分层 {cfg.calib_size} + tail {cfg.tail_size} "
-        f"(pool={pool_size}, seed={cfg.seed})"
-    )
+    print(f"  校验集：分层 n={cfg.calib_size}（seed={cfg.seed}）")
     indices, meta = build_calibration_indices(
         tokenized_train,
         calib_size=cfg.calib_size,
-        tail_size=cfg.tail_size,
-        pool_size=pool_size,
         seed=cfg.seed,
-        model=model,
-        collator=collator,
     )
     idx_path = save_calib_indices(task_name, indices, meta, output_dir, cfg.seed)
     print(f"  校验集索引：{idx_path}（共 {len(indices)} 条）")
@@ -1478,7 +1272,7 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="校验集（train 分层+tail）定区间 + validation 覆盖率"
+        description="校验集（train 分层抽样）定区间 + validation 覆盖率"
     )
     parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
@@ -1487,18 +1281,6 @@ def main() -> None:
         type=int,
         default=None,
         help="分层随机样本数（默认按任务：sst2=512, mrpc/rte=400）",
-    )
-    parser.add_argument(
-        "--calib-tail-size",
-        type=int,
-        default=None,
-        help="tail 补强样本数（默认 sst2=128, mrpc/rte=50）",
-    )
-    parser.add_argument(
-        "--calib-pool-size",
-        type=int,
-        default=None,
-        help="tail 扫描池大小（默认 sst2=4096, mrpc=3668, rte=2490）",
     )
     parser.add_argument("--calib-seed", type=int, default=DEFAULT_CALIB_SEED)
     parser.add_argument(

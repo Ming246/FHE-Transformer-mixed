@@ -27,7 +27,8 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 | `2.FineTuning_bert.py` | BERT 微调 |
 | `3.Infer_Fintuned.py` | 原始微调模型推理 |
 | `sensitive_score.py` | Taylor 型敏感度 \(S_l^{(k)}\)（三档误差 × 梯度） |
-| `cost.py` | 方案 **乘法深度** 估算（Softmax + GeLU per-layer） |
+| `cost.py` | 方案 **乘法深度** 估算（占位）；目标为最优 bootstrap 下的 bts（见 `docs/HE_BOOTSTRAP_COST.md`） |
+| `docs/HE_BOOTSTRAP_COST.md` | **Bootstrap / bts cost** 交接简报（新 agent 优先读） |
 | `ILP_loss_depth.py` | 固定 cost 预算下的 ILP 档位分配 |
 | `evolution_score.py` | NSGA-II：\(\sum S\) vs depth（有 cost 容差） |
 | `evolution_acc.py` | NSGA-II：\(\|\Delta acc\|\) vs \(\lceil depth/10\rceil\)（严格） |
@@ -42,10 +43,10 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 
 ### 方案编码 `POLY_SCHEMES`
 
-长度 **24** = 12 层 × 2（每层 **softmax** + **gelu**）：
+长度 **48** = 12 层 × 4（每层 **softmax / ln1 / gelu / ln2**）：
 
 ```
-[layer0_softmax, layer0_gelu, layer1_softmax, layer1_gelu, ...]
+[layer0_softmax, layer0_ln1, layer0_gelu, layer0_ln2, layer1_softmax, ...]
 ```
 
 | 值 | 含义 |
@@ -53,17 +54,18 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 | 0 | low 多项式档 |
 | 1 | mid |
 | 2 | high |
-| 3 | original（精确 Softmax / GeLU，cost=0） |
+| 3 | original（精确算子，cost/深度=0） |
 
-索引：`scheme_index(layer_idx, "softmax"|"gelu")` → `layer*2` 或 `layer*2+1`。
+索引：`scheme_index(layer_idx, "softmax"|"ln1"|"gelu"|"ln2")` → `layer*4 + slot`（见 `cost.py`）。
 
-GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；Softmax 三档均可选。
+GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；Softmax / LayerNorm 三档规则见各自 `*_poly.py`。
 
 ### Cost（当前为乘法深度占位）
 
 - **GeLU**：来自 `gelu_poly` 的 `depth_he`（Chebyshev PS-tree + 还原 +1）
-- **Softmax**：`7 + gs_sigma*2 + ceil(log2(exp_div)) * gs_sum_sq*2`（`cost.py`）
-- **TODO**：完整 cost 应含 bootstrap 等非 per-position 可分解项
+- **Softmax**：`5 + gs_sigma*2 + ceil(log2(exp_div)) * gs_sum_sq*2`（Stockmeyer 4 + δ1 square 1；`cost.py`）
+- **LayerNorm**：`he_invsqrt` 迭代次数 + 3（`layernorm_poly` / `cost.py`）
+- **TODO / 进行中**：完整 cost = 给定方案下 **最优 bootstrapping 放置** 的 bts 次数；`BOOTSTRAP_DEPTH_BUDGET` 默认 15；须建模密文数量膨胀与相加前深度对齐（提前 vs 中途 bts 择优）。简报见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)。明文非线性与外部 **THOR** HE 库相近但不完全相同，bts 对齐时两边对照。
 
 ### 非线性近似要点
 
@@ -91,8 +93,8 @@ GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；So
 ## 典型工作流
 
 ```
-1. sensitive_score.py     → results/sensitive_scores_1/{task}_sensitivity.csv
-2. cost.py + ILP / evolution_*  → 搜索 24 维档位方案
+1. sensitive_score.py     → results/sensitive_scores_*/{task}_sensitivity.csv
+2. cost.py + ILP / evolution_*  → 搜索 48 维档位方案（cost 现为深度占位）
 3. poly_model_inference.py → 验证集准确率 + 深度和
 4. nolinear/eval_*_cuda.py → 各非线性 HE 近似 vs 参考实现的逐层误差
 5. nolinear/variance.py     → 为 LayerNorm 填 [min_var, max_var]
@@ -159,7 +161,7 @@ docker exec wsm_experiment bash -lc "cd /workspace/nolinear && python3 variance.
 
 ## 已知限制 / TODO
 
-- `cost.py`：`cost_mode=bts` 在 evolution 脚本中仍为 TODO
+- `cost.py` / `evolution_*.py`：`cost_mode=bts` 仍为 TODO → 见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)
 - LayerNorm eval：深层误差依赖 `[min_var, max_var]` 是否与 `variance.py` 统计一致
 - ILP 假设 cost 可 per-position 累加；与真实 HE bootstrap cost 不一致时需换建模
 

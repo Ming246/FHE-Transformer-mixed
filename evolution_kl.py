@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import random
 import time
@@ -38,13 +39,13 @@ from gelu_poly import gelu_level_allowed
 from poly_model_inference import fmt_metric_delta
 
 # ===================== 配置区 =====================
-# TASK_NAMES = ["mrpc", "rte", "sst2"]
-TASK_NAMES = [ "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "sst2"]
+# TASK_NAMES = [ "rte", "sst2"]
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
-POPULATION_SIZE = 80
-NUM_GENERATIONS = 200
+POPULATION_SIZE = 120
+NUM_GENERATIONS = 300
 CROSSOVER_RATE = 0.9
 MUTATION_RATE = 1.0 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
@@ -203,6 +204,10 @@ def evaluate_individual(
     ind.loss_delta = metrics.loss_delta
     ind.f1_delta = metrics.f1_delta
     ind.output_kl = metrics.output_kl
+    # NaN/Inf 不能参与支配：与任意有限 KL 均不可比，否则会混进 archive
+    if not math.isfinite(ind.f_output_kl):
+        ind.f_output_kl = math.inf
+        ind.output_kl = math.inf
     return ind
 
 
@@ -339,6 +344,9 @@ class Archive:
         self.items: list[Individual] = []
 
     def consider(self, ind: Individual) -> None:
+        # 非有限 KL：无法与有限目标比较，禁止进入 archive
+        if not math.isfinite(ind.f_output_kl):
+            return
         key = tuple(ind.scheme)
         if any(tuple(x.scheme) == key for x in self.items):
             return

@@ -94,7 +94,8 @@ ERROR_EVAL_CHUNK_SIZE = 4096
 LAYER_ENABLE = [True] * NUM_LAYERS
 
 # thor exp 多项式系数（与 eval_softmax.py / softmax.py 一致）
-SOFTMAX_DEPTH_BASE = 7
+# 与 cost.SOFTMAX_DEPTH_BASE 一致：Stockmeyer(4) + δ1 square(1)
+SOFTMAX_DEPTH_BASE = 5
 _THOR_P = (
     torch.tensor(
         [

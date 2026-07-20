@@ -1,19 +1,18 @@
 """
-多目标进化搜索 POLY_SCHEMES 的 Pareto 前沿（替代 ILP 固定预算单解）。
+demo 副本：evolution_score + 位置权重 α。
 
 目标（均越小越好）：
-  f_loss = Σ_j S_{j,k_j}   （敏感度得分和，来自 CSV）
-  f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)（C_bts 未实现前为 depth 占位）
+  f_loss = Σ_j α_j · S_{j,k_j}   （无 α 时退化为 ΣS）
+  f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)
 
-支配关系（x1 支配 x2）：
-  x1 在所有目标上都不比 x2 差，且在至少一个目标上严格更好。
+α 来自 demo/calibrate_alpha_s1.py 的 {task}_alpha.csv（按 pos_idx）。
+输出默认写到 demo/results/evolution_alpha/（不改外部 results/）。
 
-  loss：相对容差 LOSS_REL_TOL=10% —
-        严格更好当 L(x1) < (1-τ)·L(x2)；不比 x2 差当 L(x1) ≤ (1+τ)·L(x2)
-  cost：f_cost 严格整数比较，小者优，无容差（depth / bts 均同）
-
-非法个体：交叉在合法父代下不产生非法解；初始化/变异若非法则重生成。
-Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿输出。
+用法：
+  python3 demo/evolution_score_alpha.py --tasks mrpc --pop 60 --gens 80 \\
+    --sensitive-dir results/sensitive_scores_1 \\
+    --alpha-csv demo/results/alpha_calib/mrpc/mrpc_alpha.csv \\
+    --eval-samples 64
 """
 from __future__ import annotations
 
@@ -21,8 +20,16 @@ import argparse
 import csv
 import os
 import random
+import sys
 import time
 from dataclasses import dataclass, field
+
+_DEMO_DIR = os.path.abspath(os.path.dirname(__file__))
+if _DEMO_DIR not in sys.path:
+    sys.path.insert(0, _DEMO_DIR)
+from _repo import DEMO_RESULTS_DIR, REPO_ROOT, SENSITIVE_S1_DIR, chdir_repo
+
+chdir_repo()
 
 from cost import (
     NUM_LAYERS,
@@ -38,9 +45,9 @@ from evolution_infer import format_elapsed, save_search_timings
 
 # ===================== 配置区 =====================
 TASK_NAMES = ["mrpc", "rte", "sst2"]
-SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
+SENSITIVE_OUTPUT_DIR = SENSITIVE_S1_DIR
 POLY_LEVELS = (0, 1, 2)
-EVOLUTION_RESULTS_ROOT = "./results/evolution_results/"
+EVOLUTION_RESULTS_ROOT = os.path.join(DEMO_RESULTS_DIR, "evolution_alpha")
 
 
 def sensitive_dir_tag(sensitive_dir: str) -> str:
@@ -192,14 +199,31 @@ def init_population_strategy(
     return population
 
 
+def load_alpha_weights(alpha_csv: str | None) -> dict[tuple[int, str], float]:
+    """位置权重；缺省全 1。CSV 需含 pos_idx / layer_idx / kind / alpha。"""
+    weights = {(layer_idx, kind): 1.0 for layer_idx, kind in iter_positions()}
+    if not alpha_csv:
+        return weights
+    if not os.path.isfile(alpha_csv):
+        raise FileNotFoundError(f"alpha CSV 不存在：{alpha_csv}")
+    with open(alpha_csv, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            layer_idx = int(row["layer_idx"])
+            kind = row["kind"]
+            weights[(layer_idx, kind)] = float(row["alpha"])
+    return weights
+
+
 def compute_f_loss(
     scheme: list[int],
     s_mat: dict[tuple[int, str], dict[int, float]],
+    alpha: dict[tuple[int, str], float] | None = None,
 ) -> float:
     total = 0.0
     for layer_idx, kind in iter_positions():
         level = scheme[scheme_index(layer_idx, kind)]
-        total += s_mat[(layer_idx, kind)][level]
+        w = 1.0 if alpha is None else float(alpha[(layer_idx, kind)])
+        total += w * s_mat[(layer_idx, kind)][level]
     return total
 
 
@@ -274,8 +298,9 @@ def evaluate_individual(
     s_mat: dict[tuple[int, str], dict[int, float]],
     *,
     cost_mode: str,
+    alpha: dict[tuple[int, str], float] | None = None,
 ) -> Individual:
-    ind.f_loss = compute_f_loss(ind.scheme, s_mat)
+    ind.f_loss = compute_f_loss(ind.scheme, s_mat, alpha=alpha)
     ind.f_cost = compute_f_cost(task_name, ind.scheme, cost_mode=cost_mode)
     return ind
 
@@ -480,6 +505,7 @@ def run_evolution(
     cost_mode: str = "depth",
     seed: int = RANDOM_SEED,
     sensitive_dir: str = SENSITIVE_OUTPUT_DIR,
+    alpha: dict[tuple[int, str], float] | None = None,
 ) -> tuple[list[Individual], Archive]:
     rng = random.Random(seed)
     s_mat = load_sensitivity_matrix(task_name, sensitive_dir)
@@ -490,7 +516,9 @@ def run_evolution(
         for scheme in init_population_strategy(rng, allowed_table, population_size)
     ]
     for ind in population:
-        evaluate_individual(ind, task_name, s_mat, cost_mode=cost_mode)
+        evaluate_individual(
+            ind, task_name, s_mat, cost_mode=cost_mode, alpha=alpha
+        )
 
     archive = Archive(cost_mode=cost_mode)
     archive.extend(population)
@@ -508,7 +536,9 @@ def run_evolution(
             child_scheme = crossover(rng, p1.scheme, p2.scheme)
             child_scheme = mutate(rng, child_scheme, allowed_table)
             child = Individual(scheme=child_scheme)
-            evaluate_individual(child, task_name, s_mat, cost_mode=cost_mode)
+            evaluate_individual(
+                child, task_name, s_mat, cost_mode=cost_mode, alpha=alpha
+            )
             offspring.append(child)
 
         population = environmental_selection(
@@ -579,13 +609,13 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str, *, with_inferen
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="多目标进化搜索 POLY_SCHEMES Pareto 前沿（ΣS vs C_bts）"
+        description="demo：ΣαS vs depth 的 NSGA-II（evolution_score 副本）"
     )
     parser.add_argument(
         "--tasks",
         nargs="+",
-        default=TASK_NAMES,
-        help="任务列表（默认 mrpc rte sst2）",
+        default=["mrpc"],
+        help="任务列表（demo 默认仅 mrpc）",
     )
     parser.add_argument("--pop", type=int, default=POPULATION_SIZE, help="种群规模")
     parser.add_argument("--gens", type=int, default=NUM_GENERATIONS, help="进化代数")
@@ -594,47 +624,72 @@ def main() -> None:
         "--cost-mode",
         choices=("depth", "bts"),
         default="depth",
-        help=f"depth={depth_f_cost_label()}; bts=预留（未接入时同 depth 映射）",
+        help=f"depth={depth_f_cost_label()}; bts=预留",
     )
     parser.add_argument(
         "--sensitive-dir",
         default=SENSITIVE_OUTPUT_DIR,
-        help="敏感度 CSV 目录",
+        help="敏感度 CSV 目录（默认 sensitive_scores_1）",
+    )
+    parser.add_argument(
+        "--alpha-csv",
+        default=None,
+        help="α CSV / 目录 / 含 {task} 的路径模板；缺省 α≡1",
     )
     parser.add_argument(
         "--output-dir",
         default=None,
-        help=(
-            "Pareto CSV 输出目录；默认 "
-            f"{EVOLUTION_RESULTS_ROOT}<敏感度目录名>/"
-            "（随 --sensitive-dir 变化）"
-        ),
+        help=f"输出目录；默认 {EVOLUTION_RESULTS_ROOT}/",
+    )
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=None,
+        help="Pareto 汇报样本数；缺省全量；>0 子集",
     )
     parser.add_argument(
         "--skip-inference",
         action="store_true",
-        help="跳过 Pareto 解的全验证集推理（仅输出 f_loss / f_cost）",
+        help="跳过 Pareto 验证集推理",
     )
     args = parser.parse_args()
 
     with_inference = not args.skip_inference
     if args.output_dir is None:
-        args.output_dir = evolution_output_dir(args.sensitive_dir)
-
+        args.output_dir = EVOLUTION_RESULTS_ROOT
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(
-        "多目标进化搜索"
-    )
+    print("多目标进化搜索（demo / ΣαS）")
     print(
         f"pop={args.pop}, gens={args.gens}, seed={args.seed}, "
         f"cost_mode={args.cost_mode}, sensitive_dir={args.sensitive_dir}"
     )
+    print(f"alpha_csv={args.alpha_csv or '(none → α=1)'}")
     print(f"output_dir={args.output_dir}")
+    print(f"REPO_ROOT={REPO_ROOT}")
 
     task_timings: list[tuple[str, float]] = []
 
     for task_name in args.tasks:
+        alpha_path = args.alpha_csv
+        if alpha_path and "{task}" in alpha_path:
+            alpha_path = alpha_path.format(task=task_name)
+        if alpha_path and os.path.isdir(alpha_path):
+            # 支持 demo/results/alpha_calib/ 或 .../alpha_calib/<task>/
+            cand = os.path.join(alpha_path, f"{task_name}_alpha.csv")
+            cand_nested = os.path.join(alpha_path, task_name, f"{task_name}_alpha.csv")
+            if os.path.isfile(cand):
+                alpha_path = cand
+            elif os.path.isfile(cand_nested):
+                alpha_path = cand_nested
+            else:
+                alpha_path = cand_nested
+        try:
+            alpha = load_alpha_weights(alpha_path)
+        except FileNotFoundError as exc:
+            print(f"\n{task_name.upper()} 跳过：{exc}")
+            continue
+
         try:
             t0 = time.perf_counter()
             _items, archive = run_evolution(
@@ -644,6 +699,7 @@ def main() -> None:
                 cost_mode=args.cost_mode,
                 seed=args.seed,
                 sensitive_dir=args.sensitive_dir,
+                alpha=alpha,
             )
             search_elapsed_s = time.perf_counter() - t0
         except FileNotFoundError as exc:
@@ -659,11 +715,17 @@ def main() -> None:
         if with_inference:
             from evolution_infer import SchemeEvaluator, enrich_pareto_report
 
-            print(f"\n>>> {task_name.upper()}：Pareto 全验证集汇报...")
+            eval_samples = args.eval_samples
+            if eval_samples is not None and eval_samples <= 0:
+                eval_samples = None
+            print(
+                f"\n>>> {task_name.upper()}：Pareto 汇报"
+                f"（samples={eval_samples if eval_samples else 'full'}）..."
+            )
             try:
                 report_eval = SchemeEvaluator(
                     task_name,
-                    eval_samples=None,
+                    eval_samples=eval_samples,
                     seed=args.seed,
                 )
             except FileNotFoundError as exc:

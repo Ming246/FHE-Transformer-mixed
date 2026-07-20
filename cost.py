@@ -5,7 +5,8 @@ POLY_SCHEMES 方案 cost 估算（当前仅用乘法深度占位，后续需更�
 
 深度公式（GeLU Chebyshev / HE PS-tree）：
   取自 gelu_poly 方案配置 depth_he（含 GELU 还原 +1）
-  Softmax:        7 + gs_sigma*2 + ceil(log2(exp_div)) * gs_sum_sq*2
+  Softmax:        SOFTMAX_DEPTH_BASE + gs_sigma*2 + ceil(log2(exp_div))*gs_sum_sq*2
+                  BASE = Stockmeyer(deg15 关键路径 4) + δ1 平方 (log2(delta1)=1) = 5
   LayerNorm:      he_invsqrt 迭代次数 + 3（迭代次数由 variance JSON 的 min/max 与 alpha 确定）
 """
 from __future__ import annotations
@@ -36,8 +37,18 @@ LAYERNORM_DEPTH_OVERHEAD = 3
 # 进化搜索 depth 占位：f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)
 COST_DEPTH_DIVISOR = 5
 
+# 单次 bootstrapping 恢复的乘法深度预算（bts 求解器输入；可调）
+BOOTSTRAP_DEPTH_BUDGET = 15
+
 # TODO: 后续更新 — 完整 cost 应包含非乘法项、数据通路、并行度等；当前仅深度求和。
-SOFTMAX_DEPTH_BASE = 7
+# thor exp：Stockmeyer(deg15) 关键路径 4（ct×ct；pt 系数乘在旁路不拉长关键路径）
+# + δ1=2 的 1 次 square。旧值 7 为未精算占位。
+SOFTMAX_DEPTH_BASE = 5
+SOFTMAX_EXP_STOCKMEYER_DEPTH = 4
+SOFTMAX_EXP_SQUARE_DEPTH = 1  # log2(THOR_DELTA1)；须与 SOFTMAX_DEPTH_BASE 之和一致
+assert (
+    SOFTMAX_EXP_STOCKMEYER_DEPTH + SOFTMAX_EXP_SQUARE_DEPTH == SOFTMAX_DEPTH_BASE
+)
 
 
 def depth_sum_to_f_cost(depth: int) -> int:

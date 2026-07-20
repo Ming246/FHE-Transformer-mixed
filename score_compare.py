@@ -201,14 +201,18 @@ def print_pair_report(m: PairwiseMetrics, kind_rows: list[tuple[str, float, floa
     )
     print(
         f"  log-Pearson r={m.log_pearson_r:.4f} (p={m.log_pearson_p:.2e})  "
-        f"rel err median={m.median_rel_err:.4f} p90={m.p90_rel_err:.4f} max={m.max_rel_err:.4f}"
+        f"rel err median={m.median_rel_err * 100:.2f}% "
+        f"p90={m.p90_rel_err * 100:.2f}% max={m.max_rel_err * 100:.2f}%"
     )
     print(
         f"  top10 Jaccard={m.top10_jaccard:.3f}  "
         f"top20 Jaccard={m.top20_jaccard:.3f}"
     )
     if kind_rows:
-        parts = [f"{k}: ρ={rho:.3f} med_rel={med:.3f} ({v})" for k, rho, med, v in kind_rows]
+        parts = [
+            f"{k}: ρ={rho:.3f} med_rel={med * 100:.2f}% ({v})"
+            for k, rho, med, v in kind_rows
+        ]
         print(f"  按 kind: {' | '.join(parts)}")
 
 
@@ -250,9 +254,9 @@ def main() -> None:
     args = parser.parse_args()
 
     print("三种敏感度方法对比")
-    print("verdict 规则: ρ≥0.99 & med_rel≤0.05 → 近乎一致; "
-          "ρ≥0.95 & med_rel≤0.15 → 高度一致; "
-          "ρ≥0.85 & med_rel≤0.35 → 相关但有明显差异; 否则 → 差异显著")
+    print("verdict 规则: ρ≥0.99 & med_rel≤5% → 近乎一致; "
+          "ρ≥0.95 & med_rel≤15% → 高度一致; "
+          "ρ≥0.85 & med_rel≤35% → 相关但有明显差异; 否则 → 差异显著")
 
     all_metrics: list[PairwiseMetrics] = []
     method_ids = list(SCORE_SOURCES.keys())

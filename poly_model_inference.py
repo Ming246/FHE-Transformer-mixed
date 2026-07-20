@@ -398,6 +398,10 @@ def mrpc_glue_score(accuracy: float, f1: float) -> float:
     return (accuracy + f1) / 2.0
 
 
+# Output KL：valid 内逐样本 KL 非有限「坏点」数达到该阈值 → 整方案不可选（返回 nan）
+OUTPUT_KL_MAX_BAD_SAMPLES = 3
+
+
 def per_sample_output_kl(
     logits_ref: torch.Tensor, logits_approx: torch.Tensor
 ) -> torch.Tensor:
@@ -413,14 +417,30 @@ def mean_output_kl(
     logits_approx: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> float:
-    """验证集平均 Output KL：KL(p_baseline || p_poly)；可传入 valid_mask 排除无效样本。"""
+    """
+    验证集平均 Output KL：KL(p_baseline || p_poly)。
+
+    在 valid_mask 范围内统计逐样本 KL 非有限（NaN/Inf）的坏点数：
+      坏点数 >= OUTPUT_KL_MAX_BAD_SAMPLES → 返回 nan（方案不可选）；
+      否则仅对有限 KL 求平均；若无有限样本亦返回 nan。
+    """
     kl = per_sample_output_kl(logits_ref, logits_approx)
     if valid_mask is None:
-        return float(kl.mean().item())
-    m = valid_mask.to(dtype=torch.bool, device=kl.device)
-    if not bool(m.any()):
+        considered = torch.ones(
+            kl.shape[0], dtype=torch.bool, device=kl.device
+        )
+    else:
+        considered = valid_mask.to(dtype=torch.bool, device=kl.device)
+
+    finite = torch.isfinite(kl)
+    n_bad = int((considered & ~finite).sum().item())
+    if n_bad >= OUTPUT_KL_MAX_BAD_SAMPLES:
         return float("nan")
-    return float(kl[m].mean().item())
+
+    good = considered & finite
+    if not bool(good.any()):
+        return float("nan")
+    return float(kl[good].mean().item())
 
 
 def per_sample_cross_entropy(

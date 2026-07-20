@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import random
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from poly_model_inference import (
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EVAL_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 64
 
 
 def format_elapsed(seconds: float) -> str:
@@ -371,6 +372,22 @@ def enrich_pareto_report(task_name: str, archive, scheme_eval: SchemeEvaluator) 
         ind.oor_pct = metrics.oor_pct
         ind.n_eval_used = metrics.n_eval_used
         if hasattr(ind, "f_output_kl"):
-            ind.f_output_kl = metrics.output_kl
+            # 汇报重算若出现非有限 KL，保留搜索期目标值，避免污染 archive
+            if math.isfinite(metrics.output_kl):
+                ind.f_output_kl = metrics.output_kl
+            elif not math.isfinite(getattr(ind, "f_output_kl", float("nan"))):
+                ind.f_output_kl = float("inf")
         if hasattr(ind, "f_acc_delta"):
             ind.f_acc_delta = abs(metrics.accuracy_delta)
+
+    # 丢掉重算后仍无有效 KL 的个体
+    if hasattr(archive, "items") and archive.items and hasattr(
+        archive.items[0], "f_output_kl"
+    ):
+        before = len(archive.items)
+        archive.items = [
+            ind for ind in archive.items if math.isfinite(ind.f_output_kl)
+        ]
+        dropped = before - len(archive.items)
+        if dropped:
+            print(f"  警告：汇报后剔除 {dropped} 个非有限 KL 的 Pareto 解")

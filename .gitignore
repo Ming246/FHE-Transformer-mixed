@@ -24,3 +24,4 @@ nolinear/gelu/
 *.out.log.gz
 *.err.log.gz.part
 *.out.log.gz.part
+*.pdf

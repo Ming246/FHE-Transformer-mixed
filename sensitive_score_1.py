@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from datetime import datetime
 
 import torch
@@ -489,13 +490,20 @@ def main():
     print(f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     all_results = {}
+    task_timings: list[tuple[str, float]] = []
+    t_all = time.perf_counter()
     for task_name in TASK_NAMES:
+        t0 = time.perf_counter()
         scores, m = compute_sensitivity_for_task(task_name)
         print_scores(task_name, scores, m)
         csv_path = save_scores_csv(task_name, scores)
+        elapsed = time.perf_counter() - t0
+        task_timings.append((task_name, elapsed))
         print(f"已保存：{csv_path}")
+        print(f"耗时：{elapsed:.2f}s")
         all_results[task_name] = scores
 
+    total_elapsed = time.perf_counter() - t_all
     print(f"\n{'=' * 60}")
     print("三任务完成（CSV 宽表 48 行/任务：layer × softmax|ln1|gelu|ln2 × S_low|S_mid|S_high）")
     print(f"{'=' * 60}")
@@ -505,6 +513,10 @@ def main():
             f"{task_name.upper()} Top-5：",
             ", ".join(f"{k}={v:.4e}" for k, v in top),
         )
+    print("耗时统计：")
+    for task_name, elapsed in task_timings:
+        print(f"  {task_name.upper()}：{elapsed:.2f}s")
+    print(f"  合计：{total_elapsed:.2f}s")
 
 
 if __name__ == "__main__":
