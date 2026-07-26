@@ -5,8 +5,9 @@
   f_output_kl = KL(p_baseline ‖ p_poly)（验证集平均，越小越好；严格比较，无容差）
   f_cost      = ceil(深度和 / COST_DEPTH_DIVISOR)（越小越好；严格比较，无容差）
 
-评估集：进化搜索时可用 --eval-samples 抽样子集（默认 200）；
+评估集：进化搜索默认使用全部验证集；可用 --eval-samples N 抽样子集加速。
         Pareto 解最终汇报固定使用全部验证集。
+输出 CSV：精简列（无 task/rank_hint/oor_*）；非有限 KL 搜索期不入 archive。
 """
 from __future__ import annotations
 
@@ -31,7 +32,6 @@ from evolution_infer import (
     device,
     enrich_pareto_report,
     fmt_flips_pct,
-    fmt_oor_pct,
     format_elapsed,
     save_search_timings,
 )
@@ -39,8 +39,7 @@ from gelu_poly import gelu_level_allowed
 from poly_model_inference import fmt_metric_delta
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
-# TASK_NAMES = [ "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte","sst2"]
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
@@ -50,9 +49,9 @@ CROSSOVER_RATE = 0.9
 MUTATION_RATE = 1.0 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
-ARCHIVE_MAX_SIZE = 80
+ARCHIVE_MAX_SIZE = 200
 RANDOM_SEED = 42
-EVAL_SAMPLE_SIZE = 200
+EVAL_SAMPLE_SIZE: int | None = None  # None = 全部验证集
 
 PROGRESS_EVERY = 10
 # ==================================================
@@ -154,9 +153,6 @@ class Individual:
     f1_delta: float | None = None
     output_kl: float = 0.0
     flips_pct: float = 0.0
-    oor_count: int = 0
-    oor_pct: float = 0.0
-    n_eval_used: int = 0
     rank: int = field(default=0, compare=False)
     crowding: float = field(default=0.0, compare=False)
 
@@ -487,21 +483,20 @@ def format_scheme(scheme: list[int]) -> str:
 
 
 def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
+    """
+    写出 Pareto CSV。非有限 KL 在搜索期已禁止入 archive，故不再写
+    oor_count / oor_pct / n_eval_used；也不写 task、rank_hint。
+    f_output_kl 与汇报后的 output_kl 一致，只保留 output_kl。
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     mrpc = task_name == "mrpc"
     header = [
-        "task",
-        "rank_hint",
-        "f_output_kl",
         "f_cost",
         "total_depth",
         "accuracy_delta",
         "loss_delta",
         "output_kl",
         "flips_pct",
-        "oor_count",
-        "oor_pct",
-        "n_eval_used",
     ]
     if mrpc:
         header.append("f1_delta")
@@ -509,20 +504,14 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for i, ind in enumerate(archive.sorted_items(), start=1):
+        for ind in archive.sorted_items():
             row = [
-                task_name,
-                i,
-                f"{ind.f_output_kl:.8f}",
                 ind.f_cost,
                 ind.total_depth,
                 fmt_metric_delta(ind.accuracy_delta),
                 f"{ind.loss_delta:.8f}",
                 f"{ind.output_kl:.8f}",
                 fmt_flips_pct(ind.flips_pct),
-                ind.oor_count,
-                fmt_oor_pct(ind.oor_pct),
-                ind.n_eval_used,
             ]
             if mrpc:
                 row.append(
@@ -546,12 +535,12 @@ def main() -> None:
         "--eval-samples",
         type=int,
         default=EVAL_SAMPLE_SIZE,
-        help="进化搜索用验证集抽样条数（默认 200）；与 --eval-full 互斥",
+        help="进化搜索用验证集抽样条数；默认全部验证集",
     )
     parser.add_argument(
         "--eval-full",
         action="store_true",
-        help="进化搜索使用全部验证集（Pareto 汇报始终为全验证集）",
+        help="进化搜索使用全部验证集（默认已是；保留兼容）",
     )
     parser.add_argument(
         "--cost-mode",

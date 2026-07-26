@@ -5,9 +5,10 @@ POLY_SCHEMES 方案 cost 估算（当前仅用乘法深度占位，后续需更�
 
 深度公式（GeLU Chebyshev / HE PS-tree）：
   取自 gelu_poly 方案配置 depth_he（含 GELU 还原 +1）
-  Softmax:        SOFTMAX_DEPTH_BASE + gs_sigma*2 + ceil(log2(exp_div))*gs_sum_sq*2
-                  BASE = Stockmeyer(deg15 关键路径 4) + δ1 平方 (log2(delta1)=1) = 5
-  LayerNorm:      he_invsqrt 迭代次数 + 3（迭代次数由 variance JSON 的 min/max 与 alpha 确定）
+  Softmax:        SOFTMAX_DEPTH_BASE + asor_σ*2 + Σ_r(asor_Σy²_r)*2
+                  BASE = Stockmeyer(deg15 密路径 4) + δ1 平方 (log2(delta1)=1) = 5
+                  Σy² 轮数 = ceil(log2(exp_div))；第 1/2 轮 iters 可不同
+  LayerNorm:      invsqrt_max_iters + 3（生产路径固定步数，无 α）
 """
 from __future__ import annotations
 
@@ -21,9 +22,10 @@ from layernorm_poly import (
     layernorm_config_for_layer,
 )
 from softmax_poly import (
+    LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK,
+    LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK,
+    LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK,
     LAYER_EXP_DIV_BY_TASK,
-    LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK,
-    LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK,
     SOFTMAX_LEVEL_KEYS,
 )
 
@@ -35,7 +37,7 @@ SCHEME_LEN = NUM_LAYERS * SCHEME_SLOTS_PER_LAYER
 LAYERNORM_DEPTH_OVERHEAD = 3
 
 # 进化搜索 depth 占位：f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)
-COST_DEPTH_DIVISOR = 5
+COST_DEPTH_DIVISOR = 1
 
 # 单次 bootstrapping 恢复的乘法深度预算（bts 求解器输入；可调）
 BOOTSTRAP_DEPTH_BUDGET = 15
@@ -98,19 +100,27 @@ def gelu_poly_depth(layer_idx: int, level: int) -> int:
 
 
 def softmax_poly_depth(task_name: str, layer_idx: int, level: int) -> int:
-    """单层 thor_softmax 乘法深度；level∈{0,1,2}。"""
+    """单层 thor_softmax 乘法深度；level∈{0,1,2}。aSOR 固定 max_iters（无 α）。"""
     level_key = SOFTMAX_LEVEL_KEYS[level]
-    gs_sigma = LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK[task_name][level_key][
+    iters_sigma = LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK[task_name][level_key][
         layer_idx
     ]
-    gs_sum_sq = LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK[task_name][level_key][
-        layer_idx
+    iters_sq = [
+        LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK[task_name][level_key][layer_idx]
     ]
-    exp_div = LAYER_EXP_DIV_BY_TASK[task_name][layer_idx]
+    n2 = log2_ceil(LAYER_EXP_DIV_BY_TASK[task_name][layer_idx])
+    if n2 >= 2:
+        iters_sq.append(
+            LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK[task_name][level_key][layer_idx]
+        )
+    if n2 > 2:
+        raise ValueError(
+            f"{task_name} 层{layer_idx} exp_div 对应 {n2} 轮 Σy²，暂只支持 ≤2"
+        )
     return (
         SOFTMAX_DEPTH_BASE
-        + gs_sigma * 2
-        + log2_ceil(exp_div) * gs_sum_sq * 2
+        + int(iters_sigma) * 2
+        + sum(int(x) for x in iters_sq[:n2]) * 2
     )
 
 
@@ -119,12 +129,7 @@ def layernorm_poly_depth(
 ) -> int:
     """单层 HE LayerNorm 乘法深度 = he_invsqrt 迭代次数 + 3。"""
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
-    iters = count_he_invsqrt_iters(
-        cfg["min_var"],
-        cfg["max_var"],
-        cfg["invsqrt_alpha"],
-        cfg["invsqrt_max_iters"],
-    )
+    iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
     return iters + LAYERNORM_DEPTH_OVERHEAD
 
 

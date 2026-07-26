@@ -32,9 +32,10 @@ from gelu_poly import gelu_config_for_layer
 from layernorm_poly import count_he_invsqrt_iters, layernorm_config_for_layer
 from nolinear.gelu_chebyshev import cheb_he_depth_ps_tree, gelu_he_depth_breakdown
 from softmax_poly import (
+    LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK,
+    LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK,
+    LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK,
     LAYER_EXP_DIV_BY_TASK,
-    LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK,
-    LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK,
     SOFTMAX_LEVEL_KEYS,
 )
 
@@ -221,24 +222,38 @@ def _ev(
     )
 
 
-def _softmax_params(task_name: str, layer_idx: int, level: int) -> tuple[int, int, int, int]:
+def _softmax_params(
+    task_name: str, layer_idx: int, level: int
+) -> tuple[int, list[int], int, int]:
+    """返回 (iters_σ, iters_Σy²[每轮], rounds, total_depth)。"""
     level_key = SOFTMAX_LEVEL_KEYS[level]
-    gs_sigma = LAYER_GOLDSCHMIDT_ITERATIONS_SIGMA_BY_TASK[task_name][level_key][
+    iters_sigma = LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK[task_name][level_key][
         layer_idx
     ]
-    gs_sum_sq = LAYER_GOLDSCHMIDT_ITERATIONS_SUM_SQ_BY_TASK[task_name][level_key][
+    iters_sq1 = LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK[task_name][level_key][
+        layer_idx
+    ]
+    iters_sq2 = LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK[task_name][level_key][
         layer_idx
     ]
     exp_div = LAYER_EXP_DIV_BY_TASK[task_name][layer_idx]
     rounds = log2_ceil(exp_div)
+    iters_sum_sq = [iters_sq1]
+    if rounds >= 2:
+        iters_sum_sq.append(iters_sq2)
+    iters_sum_sq = iters_sum_sq[:rounds]
     total = softmax_poly_depth(task_name, layer_idx, level)
-    split = SOFTMAX_DEPTH_BASE + gs_sigma * 2 + rounds * gs_sum_sq * 2
+    split = (
+        SOFTMAX_DEPTH_BASE
+        + iters_sigma * 2
+        + sum(iters_sum_sq) * 2
+    )
     if split != total:
         raise RuntimeError(
             f"softmax depth 拆分不一致 L{layer_idx} level={level}: "
             f"split={split} total={total}"
         )
-    return gs_sigma, gs_sum_sq, rounds, total
+    return iters_sigma, iters_sum_sq, rounds, total
 
 
 def _cheb_nonzero_count(coeffs: list) -> int:
@@ -381,14 +396,16 @@ def _append_softmax_events(
     task_name: str,
     level: int,
 ) -> None:
-    """阶段 B：exp(Stockmeyer+square) → gs_σ → δ2 归一化轮 → 复制膨胀（8→128）。"""
-    gs_sigma, gs_sum_sq, rounds, _ = _softmax_params(task_name, layer_idx, level)
+    """阶段 B：exp(Stockmeyer+square) → aSOR_σ → δ2 归一化轮 → 复制膨胀（8→128）。"""
+    iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
+        task_name, layer_idx, level
+    )
     _append_softmax_exp_events(events, prefix, layer_idx)
     events.append(
         _ev(
             prefix,
-            "softmax_gs_sigma",
-            gs_sigma * 2,
+            "softmax_asor_sigma",
+            iters_sigma * 2,
             CT_ATT_SCORE,
             CT_ATT_SCORE,
             layer_idx,
@@ -401,7 +418,7 @@ def _append_softmax_events(
             _ev(
                 prefix,
                 f"softmax_norm_r{r}",
-                gs_sum_sq * 2,
+                iters_sum_sq[r] * 2,
                 CT_ATT_SCORE,
                 CT_ATT_SCORE,
                 layer_idx,
@@ -429,8 +446,10 @@ def _append_softmax_events_c(
     task_name: str,
     level: int,
 ) -> None:
-    """阶段 C：exp(Stockmeyer+square) + attn mask + 逐次 Goldschmidt + 分阶复制链。"""
-    gs_sigma, gs_sum_sq, rounds, _ = _softmax_params(task_name, layer_idx, level)
+    """阶段 C：exp(Stockmeyer+square) + attn mask + 逐次 aSOR + 分阶复制链。"""
+    iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
+        task_name, layer_idx, level
+    )
     _append_softmax_exp_events(events, prefix, layer_idx)
     events.append(
         _ev(
@@ -443,11 +462,11 @@ def _append_softmax_events_c(
             "pathway",
         )
     )
-    for i in range(gs_sigma):
+    for i in range(iters_sigma):
         events.append(
             _ev(
                 prefix,
-                f"softmax_gs_sigma_i{i}",
+                f"softmax_asor_sigma_i{i}",
                 GOLDSCHMIDT_ITER_DEPTH,
                 CT_ATT_SCORE,
                 CT_ATT_SCORE,
@@ -456,11 +475,11 @@ def _append_softmax_events_c(
             )
         )
     for r in range(rounds):
-        for g in range(gs_sum_sq):
+        for g in range(iters_sum_sq[r]):
             events.append(
                 _ev(
                     prefix,
-                    f"softmax_norm_r{r}_gs{g}",
+                    f"softmax_norm_r{r}_asor{g}",
                     GOLDSCHMIDT_ITER_DEPTH,
                     CT_ATT_SCORE,
                     CT_ATT_SCORE,
@@ -611,12 +630,7 @@ def _append_layernorm_events(
 ) -> None:
     """阶段 B：统计 prep（depth=3）+ 逐次 invsqrt（每 iter depth=1）。"""
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
-    iters = count_he_invsqrt_iters(
-        cfg["min_var"],
-        cfg["max_var"],
-        cfg["invsqrt_alpha"],
-        cfg["invsqrt_max_iters"],
-    )
+    iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
     slot = kind  # ln1 | ln2
     events.append(
         _ev(
@@ -666,12 +680,7 @@ def _append_layernorm_events_c(
 ) -> None:
     """阶段 C：prep 三步 + invsqrt 逐步（join 对齐接入）。"""
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
-    iters = count_he_invsqrt_iters(
-        cfg["min_var"],
-        cfg["max_var"],
-        cfg["invsqrt_alpha"],
-        cfg["invsqrt_max_iters"],
-    )
+    iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
     slot = kind
     for s in range(LAYERNORM_PREP_STEPS):
         events.append(

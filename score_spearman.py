@@ -2,12 +2,12 @@
 方案级 ΣS proxy 与真实验证集指标的相关性评估。
 
   · 分层随机：按乘法深度或 ΣS（log）区间分层采样合法 scheme，
-    推理后与 |Δloss|、Output KL 做 Spearman / Kendall。
+    推理后与 Output KL 做 Spearman / Kendall。
 
 排序容差仅作用于 proxy ΣS（与 evolution_score 的 f_loss 一致，单一相对容差 τ=LOSS_REL_TOL）：
   严格更好：L(x1) < (1−τ)·L(x2)
   不比 x2 差：L(x1) ≤ (1+τ)·L(x2)
-  |Δloss| / Output KL 仍用严格数值序。
+  Output KL 仍用严格数值序。
 
   非传递性：原始「比值容差」不成等价关系。实现上对 ΣS 按升序贪心分组
  （组代表=组内最小值，v≤(1+τ)·rep 则并入），强制划成互斥组后再赋 average rank，
@@ -94,17 +94,20 @@ PLOT_LOG_FLOOR = 1e-8
 # ==================================================
 
 
+def format_pvalue(p: float) -> str:
+    """三位有效数字的 p 值（科学计数法，如 2.39e-03）。"""
+    if not np.isfinite(p):
+        return "nan"
+    return f"{p:.2e}"
+
+
 @dataclass
 class SchemeMetrics:
     scheme: list[int]
     score_sum: float
-    loss_delta: float
     output_kl: float
     total_depth: int = 0
-
-    @property
-    def abs_loss_delta(self) -> float:
-        return abs(self.loss_delta)
+    loss_delta: float = 0.0  # 推理副产物，不参与相关性
 
 
 def scheme_total_depth(task_name: str, scheme: list[int]) -> int:
@@ -753,7 +756,7 @@ def kendall_tau_proxy_tolerant(
 ) -> tuple[float, float]:
     """
     Kendall τ-b：仅 proxy（ΣS）侧用 STRICT 容差成对符号；
-    truth（|Δloss|/KL）侧严格比较。
+    truth（Output KL）侧严格比较。
     """
     a = np.asarray(proxy, dtype=np.float64)
     b = np.asarray(truth, dtype=np.float64)
@@ -795,7 +798,7 @@ def rank_correlation_report(
     label_proxy: str,
     label_truth: str,
 ) -> dict[str, float]:
-    """proxy=ΣS（容差名次）；truth=|Δloss| 或 KL（严格序）。"""
+    """proxy=ΣS（容差名次）；truth=Output KL（严格序）。"""
     if len(proxy) < 3:
         print(f"  {label_proxy} vs {label_truth}: 样本不足 (n={len(proxy)})")
         nan = float("nan")
@@ -833,7 +836,6 @@ def summarize_correlations(
 ) -> dict[str, float | str | int]:
     print(f"\n--- {source} / {task_name.upper()} 汇总 (n={len(rows)}) ---")
     score_sums = np.array([r.score_sum for r in rows], dtype=np.float64)
-    abs_loss = np.array([r.abs_loss_delta for r in rows], dtype=np.float64)
     kl = np.array([r.output_kl for r in rows], dtype=np.float64)
     depths = np.array([r.total_depth for r in rows], dtype=np.float64)
     if len(depths):
@@ -842,14 +844,12 @@ def summarize_correlations(
             f"mean={depths.mean():.1f}  std={depths.std():.1f}"
         )
 
-    m_loss = rank_correlation_report(score_sums, abs_loss, "ΣS", "|Δloss|")
     m_kl = rank_correlation_report(score_sums, kl, "ΣS", "Output KL")
 
     return {
         "task": task_name,
         "source": source,
         "n_schemes": len(rows),
-        **{f"loss_{k}": v for k, v in m_loss.items()},
         **{f"kl_{k}": v for k, v in m_kl.items()},
     }
 
@@ -924,9 +924,8 @@ def save_metrics_csv(
                 "source",
                 "score_sum",
                 "total_depth",
-                "loss_delta",
-                "abs_loss_delta",
                 "output_kl",
+                "loss_delta",
                 "scheme",
                 "score_csv_dir",
             ]
@@ -938,9 +937,8 @@ def save_metrics_csv(
                     source,
                     f"{r.score_sum:.10e}",
                     r.total_depth,
-                    f"{r.loss_delta:.10f}",
-                    f"{r.abs_loss_delta:.10f}",
                     f"{r.output_kl:.10f}",
+                    f"{r.loss_delta:.10f}",
                     str(r.scheme),
                     csv_dir,
                 ]
@@ -983,7 +981,7 @@ def save_score_kl_scatter_pdf(
             task_name.lower(),
             {"color": "#64748b", "marker": "D"},
         )
-        rho, _ = spearmanr(xs, ys)
+        rho, rho_p = spearmanr(xs, ys)
 
         ax = axes[0, col]
         xs_p = np.maximum(xs, PLOT_LOG_FLOOR)
@@ -1003,7 +1001,10 @@ def save_score_kl_scatter_pdf(
         ax.set_xlabel(r"score_sum ($\sum S$)")
         if col == 0:
             ax.set_ylabel("output_kl")
-        ax.set_title(f"{task_name.upper()}  (n={len(rows)}, ρ={rho:.3f})")
+        ax.set_title(
+            f"{task_name.upper()}  (n={len(rows)}, "
+            f"ρ={rho:.3f}, p={format_pvalue(float(rho_p))})"
+        )
         ax.grid(True, which="both", alpha=0.3, zorder=0)
 
     fig.suptitle(f"{source}", fontsize=12)
@@ -1020,10 +1021,6 @@ def save_summary_csv(summary_rows: list[dict], *, tag: str) -> str:
         "source",
         "n_schemes",
         "score_csv_dir",
-        "spearman_rho_abs_loss",
-        "spearman_p_abs_loss",
-        "kendall_tau_abs_loss",
-        "kendall_p_abs_loss",
         "spearman_rho_kl",
         "spearman_p_kl",
         "kendall_tau_kl",
@@ -1038,7 +1035,7 @@ def save_summary_csv(summary_rows: list[dict], *, tag: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ΣS proxy 与 |Δloss| / Output KL 的排序相关性（分层随机）"
+        description="ΣS proxy 与 Output KL 的排序相关性（分层随机）"
     )
     parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
     parser.add_argument(
@@ -1135,18 +1132,6 @@ def main() -> None:
                 "source": random_tag,
                 "n_schemes": summary_random["n_schemes"],
                 "score_csv_dir": SCORE_CSV_DIR,
-                "spearman_rho_abs_loss": (
-                    f"{summary_random['loss_spearman_rho']:.6f}"
-                ),
-                "spearman_p_abs_loss": (
-                    f"{summary_random['loss_spearman_p']:.6e}"
-                ),
-                "kendall_tau_abs_loss": (
-                    f"{summary_random['loss_kendall_tau']:.6f}"
-                ),
-                "kendall_p_abs_loss": (
-                    f"{summary_random['loss_kendall_p']:.6e}"
-                ),
                 "spearman_rho_kl": (
                     f"{summary_random['kl_spearman_rho']:.6f}"
                 ),

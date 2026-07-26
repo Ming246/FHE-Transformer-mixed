@@ -389,7 +389,10 @@ def compute_sensitivity_for_task(
         calib = calib.select(range(min(MAX_CALIB_SAMPLES, len(calib))))
 
     tokenized = calib.map(get_preprocess_fn(task_name, tokenizer), batched=True)
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    format_cols = ["input_ids", "attention_mask", "label"]
+    if "token_type_ids" in tokenized.column_names:
+        format_cols.insert(2, "token_type_ids")
+    tokenized.set_format(type="torch", columns=format_cols)
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
     loader = DataLoader(
@@ -414,11 +417,16 @@ def compute_sensitivity_for_task(
         label_key = "labels" if "labels" in batch else "label"
         labels = batch[label_key].to(device)
         batch_size = labels.size(0)
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if "token_type_ids" in batch:
+            model_inputs["token_type_ids"] = batch["token_type_ids"].to(device)
 
         model.zero_grad(set_to_none=True)
-        outputs = model(
-            input_ids=input_ids, attention_mask=attention_mask, labels=labels
-        )
+        outputs = model(**model_inputs)
         loss = outputs.loss * batch_size
         loss.backward()
 

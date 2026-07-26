@@ -1,5 +1,5 @@
 """
-BERT 微调 - MRPC / RTE / SST2
+BERT 微调 - MRPC / RTE / SST2 / MNLI
 统一微调脚本，通过 TASK_NAME 切换任务
 """
 import os
@@ -18,9 +18,9 @@ from transformers import (
 )
 
 # ===================== 配置区 =====================
-# 修改这里切换任务，或通过命令行传入：python finetune.py mrpc
+# 修改这里切换任务，或通过命令行传入：python3 2.FineTuning_bert.py mnli
 TASK_NAME = sys.argv[1] if len(sys.argv) > 1 else "mrpc"
-assert TASK_NAME in ["mrpc", "rte", "sst2"], f"不支持的任务：{TASK_NAME}"
+assert TASK_NAME in ["mrpc", "rte", "sst2", "mnli"], f"不支持的任务：{TASK_NAME}"
 
 LOCAL_MODEL_PATH = "./bert_weight/"
 LOCAL_DATA_ROOT = "./glue_datasets/"
@@ -35,19 +35,21 @@ MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
 GRADIENT_ACCUMULATION_STEPS = 2
 LOG_STEP = 10
-NUM_LABELS = 2
+NUM_LABELS = 3 if TASK_NAME == "mnli" else 2
 
 # 任务描述映射
 TASK_DESCRIPTIONS = {
     "mrpc": "句子对语义相似度判断",
     "rte":  "句子对蕴含判断",
     "sst2": "情感分析（单句）",
+    "mnli": "自然语言推断（premise/hypothesis，3 分类）",
 }
 # ============================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ 使用设备：{device}")
 print(f"✅ 当前任务：{TASK_NAME.upper()} - {TASK_DESCRIPTIONS[TASK_NAME]}")
+print(f"✅ 分类类别数：{NUM_LABELS}")
 
 
 def compute_metrics(eval_pred):
@@ -76,13 +78,20 @@ def preprocess_function(examples):
             truncation=True,
             max_length=MAX_SEQ_LENGTH
         )
-    else:  # mrpc, rte（双句任务）
+    if TASK_NAME == "mnli":
         return tokenizer(
-            examples["sentence1"],
-            examples["sentence2"],
+            examples["premise"],
+            examples["hypothesis"],
             truncation=True,
             max_length=MAX_SEQ_LENGTH
         )
+    # mrpc, rte（双句任务）
+    return tokenizer(
+        examples["sentence1"],
+        examples["sentence2"],
+        truncation=True,
+        max_length=MAX_SEQ_LENGTH
+    )
 
 tokenized_dataset = dataset.map(preprocess_function, batched=True)
 # 【修复】不再手动 remove_columns，Trainer 会自动处理

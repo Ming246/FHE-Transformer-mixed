@@ -71,7 +71,7 @@ GeLU 有层组档位约束：`gelu_poly.gelu_level_allowed`。
 | 算子 | 深度来源 |
 |------|----------|
 | GeLU | `gelu_poly.gelu_config_for_layer` → `depth_he`（Chebyshev / PS-tree + 还原 +1） |
-| Softmax | `5 + gs_sigma*2 + ceil(log2(exp_div))*gs_sum_sq*2`（Stockmeyer 4 + δ1 square 1 + Goldschmidt） |
+| Softmax | `5 + asor_σ×2 + Σ_r asor_Σy²_r×2`（Stockmeyer 4 + δ1 square 1 + aSOR；Σy² 轮数 \(=\lceil\log_2\delta_2\rceil\)，未用轮填 0） |
 | LayerNorm | `count_he_invsqrt_iters(...) + 3` |
 
 API：`compute_scheme_cost(task, scheme)` → 深度和；`detailed=True` 得 per-slot 明细。
@@ -172,19 +172,20 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 2. 再对照 THOR 源码提取工程细节（迭代次数、缩放、多项式度数、乘法树形状、CT 膨胀）；
 3. 差异处在文档/注释中显式记录，勿假设 1:1（尤其 GeLU 基、线性是否复打包）。
 
-### Softmax（thor + Goldschmidt）
+### Softmax（thor + aSOR）
 
 | 角色 | 路径 |
 |------|------|
-| 生产推理 | `softmax_poly.py`（`ThorSoftmaxEvaluator`、per-task `exp_div` / Goldschmidt 迭代表） |
-| 离线误差 | `nolinear/eval_softmax_cuda.py`（GPU 批量 thor + Goldschmidt） |
+| 生产推理 | `softmax_poly.py`（`ThorSoftmaxEvaluator`；固定 `max_iters`，无 α） |
+| 离线误差 | `nolinear/eval_softmax_cuda.py`（GPU 批量 thor + aSOR，α+max_iters） |
 | CPU 参考 | `nolinear/softmax.py` |
 
 要点（AGENTS 约定）：
 
-- 倒数是 **Goldschmidt**：`y=1-x; result=2-x; loop: y=y²; result*=(1+y)`  
-- **不是** Newton（无 `D*r` 耦合项）
-- 深度公式与 `cost.softmax_poly_depth` / eval 脚本中的 depth 打印应对齐
+- 倒数是 **aSOR**（与 THOR `he_inv` 同形；固定 kn 更新）
+- **不是** Newton（无 `D*r` 耦合项）；生产路径已不用 Goldschmidt
+- 深度公式与 `cost.softmax_poly_depth` 对齐；eval 打印可用实际 iters（α 提前停）
+- `LAYER_ASOR_MAX_ITERS_SUM_SQ2_*`：仅 \(\delta_2=4\) 的层非零，其余为 0 且不计深度
 
 ### GeLU（Chebyshev）
 
@@ -197,15 +198,16 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 
 | 角色 | 路径 |
 |------|------|
-| 生产配置 + 推理 | `layernorm_poly.py` |
-| 离线误差 | `nolinear/eval_layernorm_cuda.py` |
-| 方差区间 | `nolinear/variance.py` → `nolinear/variance_out/{task}_variance.json` |
+| 生产配置 + 推理 | `layernorm_poly.py`（固定 `invsqrt_max_iters`，无 α） |
+| 离线误差 / 调参 | `nolinear/layernorm.py`（可含 α） |
+| 方差区间 | `nolinear/variance_out/{task}_variance.json` |
 
 要点：
 
 - **不要**用 `exp`/`log` 做 InvertSqrt 初值
 - `min_var` → invsqrt 的 \(e_0\)；`max_var` → 缩放 \(M\)；二者勿混
 - 取向 B：无 CKKS 编码 bookend（mask/2、out×2 已移除）
+- 深度：`invsqrt_max_iters + 3`
 
 ### 端到端明文替换推理
 

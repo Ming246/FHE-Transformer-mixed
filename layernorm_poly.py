@@ -3,8 +3,8 @@ HE LayerNorm 近似：参数 + 实现（来源 nolinear/layernorm.py）。
 
 M 缩放 + he_invsqrt；不含 CKKS 编码 bookend。
 方差区间来自 nolinear/variance_out/{task}_variance.json；
-he_invsqrt 停止阈值 alpha 由 LAYER_INV_SQRT_ALPHA_BY_TASK 按 task×ln1/ln2×层 配置（三档共用）；
-高中低精度档由 LAYER_INV_SQRT_MAX_ITERS_BY_TASK 的迭代上限区分。
+he_invsqrt 固定跑 max_iters 步（无 α；α 仅留在 nolinear/layernorm.py 调参）；
+高中低精度档由 LAYER_INV_SQRT_MAX_ITERS_BY_TASK 区分。
 
 用法：
     from layernorm_poly import HeLayerNormPolyEvaluator, layernorm_config_for_layer
@@ -41,41 +41,7 @@ _VARIANCE_JSON_DIR = os.path.join(
 )
 
 
-# task → {ln1, ln2} → 12 层 alpha（三档 low/mid/high 共用）
-LAYER_INV_SQRT_ALPHA_BY_TASK: dict[str, dict[str, list[float]]] = {
-    "mrpc": {
-        "ln1": [
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-        ],
-        "ln2": [
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-        ],
-    },
-    "rte": {
-        "ln1": [
-            0.0001, 0.0001, 0.0001, 0.0001, 0.0001, 0.0001,
-            0.0001, 0.0001, 0.0001, 0.0001, 0.0001, 0.0001,
-        ],
-        "ln2": [
-            0.0001, 0.0001, 0.0001, 0.0001, 0.0001, 0.0001,
-            0.0001, 0.0001, 0.0001, 0.0001, 0.0001, 0.0001,
-        ],
-    },
-    "sst2": {
-        "ln1": [
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-        ],
-        "ln2": [
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-            0.00005, 0.00005, 0.00005, 0.00005, 0.00005, 0.00005,
-        ],
-    },
-}
-
-# task → level → {ln1, ln2} → 12 层 he_invsqrt 迭代上限（high 为基准；mid/high−1，low/high−2）
+# task → level → {ln1, ln2} → 12 层 he_invsqrt 迭代次数（固定步数，无 α）
 LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
     "mrpc": {
         "low": {
@@ -120,24 +86,6 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
         },
     },
 }
-
-
-def layer_invsqrt_alpha_for_task(task_name: str, kind: str) -> list[float]:
-    if task_name not in LAYER_INV_SQRT_ALPHA_BY_TASK:
-        raise KeyError(f"任务 {task_name} 未配置 LAYER_INV_SQRT_ALPHA_BY_TASK")
-    table = LAYER_INV_SQRT_ALPHA_BY_TASK[task_name]
-    if kind not in table:
-        raise KeyError(f"未知 LayerNorm 类型：{kind}")
-    alphas = table[kind]
-    if len(alphas) != NUM_LAYERS:
-        raise ValueError(f"{task_name} {kind} alpha 长度应为 {NUM_LAYERS}")
-    out: list[float] = []
-    for i, a in enumerate(alphas):
-        a_f = float(a)
-        if not (0.0 < a_f < 1.0):
-            raise ValueError(f"{task_name} 层{i} {kind} alpha 须满足 0 < alpha < 1")
-        out.append(a_f)
-    return out
 
 
 def variance_json_path(task_name: str, json_dir: str = _VARIANCE_JSON_DIR) -> str:
@@ -239,8 +187,8 @@ def layernorm_config_for_layer(
     kind: str,
     level: int,
 ) -> dict:
-    if task_name not in LAYER_INV_SQRT_ALPHA_BY_TASK:
-        raise KeyError(f"任务 {task_name} 未配置 LAYER_INV_SQRT_ALPHA_BY_TASK")
+    if task_name not in LAYER_INV_SQRT_MAX_ITERS_BY_TASK:
+        raise KeyError(f"任务 {task_name} 未配置 LAYER_INV_SQRT_MAX_ITERS_BY_TASK")
     if kind not in LAYERNORM_KIND_KEYS:
         raise ValueError(f"未知 LayerNorm 类型：{kind}")
     if level < 0 or level >= len(LAYERNORM_LEVEL_KEYS):
@@ -249,8 +197,6 @@ def layernorm_config_for_layer(
         raise ValueError(f"layer_idx 非法：{layer_idx}")
 
     level_key = LAYERNORM_LEVEL_KEYS[level]
-    alpha = layer_invsqrt_alpha_for_task(task_name, kind)[layer_idx]
-
     min_var, max_var = _var_ranges_for_task(task_name)[kind][layer_idx]
     invsqrt_max_iters = layer_invsqrt_max_iters_for_task(
         task_name, kind, level_key
@@ -263,7 +209,6 @@ def layernorm_config_for_layer(
         "level_name": level_key,
         "min_var": float(min_var),
         "max_var": float(max_var),
-        "invsqrt_alpha": alpha,
         "w_buffer": W_BUFFER,
         "invsqrt_max_iters": invsqrt_max_iters,
     }
@@ -275,35 +220,29 @@ def _he_invsqrt_kn(en: float) -> float:
     return float(roots[1].real)
 
 
-def count_he_invsqrt_iters(
-    min_var: float,
-    max_var: float,
-    alpha: float,
-    max_iters: int,
-) -> int:
-    """
-    he_invsqrt 迭代次数；仅依赖 e₀=min_var/max_var 与 alpha（与方差标量无关）。
-    """
-    en = float(min_var / max_var)
-    iters = 0
-    while en < 1.0 - alpha and iters < max_iters:
-        kn = _he_invsqrt_kn(en)
-        en = kn * en * (3.0 - kn * en) ** 2 / 4.0
-        iters += 1
-    return iters
+def count_he_invsqrt_iters(max_iters: int) -> int:
+    """生产路径固定跑 max_iters 步，深度直接取该值。"""
+    mi = int(max_iters)
+    if mi < 1:
+        raise ValueError(f"max_iters 须 ≥ 1，得到 {max_iters}")
+    return mi
 
 
 def he_invsqrt_batched(
     variance: torch.Tensor,
     e_init: float,
-    alpha: float,
     max_iters: int,
 ) -> torch.Tensor:
+    """he_invsqrt；固定 max_iters 步（无 α）。"""
     an = variance.clamp(min=1e-30)
     bn = torch.ones_like(an)
     en = float(e_init)
-    iters = 0
-    while en < 1.0 - alpha and iters < max_iters:
+    if en <= 0.0:
+        raise ValueError(f"e_init 须 > 0，得到 {e_init}")
+    max_iters = int(max_iters)
+    if max_iters < 1:
+        raise ValueError(f"max_iters 须 ≥ 1，得到 {max_iters}")
+    for _ in range(max_iters):
         kn = _he_invsqrt_kn(en)
         inv_kn = 3.0 / kn
         bn = bn * (kn ** (3.0 / 2.0) / 2.0) * (inv_kn - an)
@@ -311,7 +250,6 @@ def he_invsqrt_batched(
         an = an.clamp(min=1e-30)
         bn = bn.clamp(min=1e-30, max=1e30)
         en = kn * en * (3.0 - kn * en) ** 2 / 4.0
-        iters += 1
     return bn
 
 
@@ -325,7 +263,6 @@ def he_layernorm_from_config(
     """HE LayerNorm；x: [..., D]，gamma/beta: [D]。"""
     min_var = cfg["min_var"]
     max_var = cfg["max_var"]
-    invsqrt_alpha = cfg["invsqrt_alpha"]
     max_iters = int(cfg["invsqrt_max_iters"])
     w_buffer = float(cfg.get("w_buffer", W_BUFFER))
 
@@ -344,7 +281,6 @@ def he_layernorm_from_config(
     inv_sqrt = he_invsqrt_batched(
         variance,
         e_init=min_var / max_var,
-        alpha=invsqrt_alpha,
         max_iters=max_iters,
     )
 

@@ -14,14 +14,22 @@
 
 非法个体：交叉在合法父代下不产生非法解；初始化/变异若非法则重生成。
 Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿输出。
+
+评估后写出两份 CSV：
+  {task}_pareto_full.csv — 完整 Pareto（含 OOR 等列）
+  {task}_pareto.csv      — 按 total_depth 筛选：排除 oor≠0；
+                           每深度至多保留 KL 最小与翻转率最小各一
+                           （翻转率并列时取 KL 更小）；列更精简供下游读取
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import random
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 from cost import (
@@ -68,11 +76,11 @@ CROSSOVER_RATE = 0.9
 MUTATION_RATE = 1.0 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
-ARCHIVE_MAX_SIZE = 80
+ARCHIVE_MAX_SIZE = 300
 RANDOM_SEED = 42
 
 # loss 目标单一相对容差（10%）；由 τ 导出严格 / 不差阈值
-LOSS_REL_TOL = 0.01
+LOSS_REL_TOL = 0.02
 LOSS_STRICT_RATIO = 1.0 - LOSS_REL_TOL   # 0.9
 LOSS_NOT_WORSE_RATIO = 1.0 + LOSS_REL_TOL  # 1.1
 
@@ -525,12 +533,80 @@ def format_scheme(scheme: list[int]) -> str:
     return str(scheme)
 
 
-def save_pareto_csv(task_name: str, archive: Archive, path: str, *, with_inference: bool) -> None:
+def _finite_or_inf(x: float) -> float:
+    return float(x) if math.isfinite(x) else float("inf")
+
+
+def filter_pareto_depth_representatives(
+    items: list[Individual],
+) -> list[Individual]:
+    """
+    评估后筛选：
+      · 丢弃 oor_count != 0
+      · 同一 total_depth：保留 KL 最小者，以及翻转率最小者
+        （翻转率相同时取 KL 更小）；二者可重合 → 每深度 ≤ 2 条
+    结果按 (total_depth, output_kl, flips_pct) 排序。
+    """
+    clean = [ind for ind in items if int(ind.oor_count) == 0]
+    by_depth: dict[int, list[Individual]] = defaultdict(list)
+    for ind in clean:
+        by_depth[int(ind.total_depth)].append(ind)
+
+    selected: list[Individual] = []
+    for depth in sorted(by_depth):
+        group = by_depth[depth]
+        best_kl = min(
+            group,
+            key=lambda x: (
+                _finite_or_inf(x.output_kl),
+                _finite_or_inf(x.flips_pct),
+                x.f_loss,
+            ),
+        )
+        best_flip = min(
+            group,
+            key=lambda x: (
+                _finite_or_inf(x.flips_pct),
+                _finite_or_inf(x.output_kl),
+                x.f_loss,
+            ),
+        )
+        kept: list[Individual] = []
+        for cand in (best_kl, best_flip):
+            if cand not in kept:
+                kept.append(cand)
+        selected.extend(kept)
+
+    selected.sort(
+        key=lambda x: (
+            int(x.total_depth),
+            _finite_or_inf(x.output_kl),
+            _finite_or_inf(x.flips_pct),
+        )
+    )
+    return selected
+
+
+def save_pareto_csv(
+    task_name: str,
+    items: list[Individual],
+    path: str,
+    *,
+    with_inference: bool,
+    compact: bool = False,
+) -> None:
+    """
+    compact=True（新版下游文件）：去掉 task / rank_hint / oor_* / n_eval_used。
+    compact=False（完整存档）：保留全部汇报列。
+    """
     from poly_model_inference import fmt_metric_delta
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     mrpc = task_name == "mrpc"
-    header = ["task", "rank_hint", "f_loss", "f_cost"]
+    if compact:
+        header = ["f_loss", "f_cost"]
+    else:
+        header = ["task", "rank_hint", "f_loss", "f_cost"]
     if with_inference:
         header.extend(
             [
@@ -539,19 +615,21 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str, *, with_inferen
                 "loss_delta",
                 "output_kl",
                 "flips_pct",
-                "oor_count",
-                "oor_pct",
-                "n_eval_used",
             ]
         )
+        if not compact:
+            header.extend(["oor_count", "oor_pct", "n_eval_used"])
         if mrpc:
             header.append("f1_delta")
     header.append("scheme")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for i, ind in enumerate(archive.sorted_items(), start=1):
-            row = [task_name, i, f"{ind.f_loss:.8e}", ind.f_cost]
+        for i, ind in enumerate(items, start=1):
+            if compact:
+                row: list = [f"{ind.f_loss:.8e}", ind.f_cost]
+            else:
+                row = [task_name, i, f"{ind.f_loss:.8e}", ind.f_cost]
             if with_inference:
                 from evolution_infer import fmt_flips_pct, fmt_oor_pct
 
@@ -562,11 +640,16 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str, *, with_inferen
                         f"{ind.loss_delta:.8f}",
                         f"{ind.output_kl:.8f}",
                         fmt_flips_pct(ind.flips_pct),
-                        ind.oor_count,
-                        fmt_oor_pct(ind.oor_pct),
-                        ind.n_eval_used,
                     ]
                 )
+                if not compact:
+                    row.extend(
+                        [
+                            ind.oor_count,
+                            fmt_oor_pct(ind.oor_pct),
+                            ind.n_eval_used,
+                        ]
+                    )
                 if mrpc:
                     row.append(
                         fmt_metric_delta(ind.f1_delta)
@@ -675,11 +758,40 @@ def main() -> None:
         else:
             with_inference_task = False
 
-        out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
+        out_full = os.path.join(args.output_dir, f"{task_name}_pareto_full.csv")
+        full_items = archive.sorted_items()
         save_pareto_csv(
-            task_name, archive, out_path, with_inference=with_inference_task
+            task_name,
+            full_items,
+            out_full,
+            with_inference=with_inference_task,
+            compact=False,
         )
-        print(f"已保存：{out_path}")
+        print(f"已保存完整 Pareto：{out_full}  (n={len(full_items)})")
+
+        out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
+        if with_inference_task:
+            filtered = filter_pareto_depth_representatives(full_items)
+            save_pareto_csv(
+                task_name,
+                filtered,
+                out_path,
+                with_inference=True,
+                compact=True,
+            )
+            print(
+                f"已保存筛选 Pareto：{out_path}  "
+                f"(n={len(filtered)}；按深度去重+排除 OOR)"
+            )
+        else:
+            save_pareto_csv(
+                task_name,
+                full_items,
+                out_path,
+                with_inference=False,
+                compact=True,
+            )
+            print(f"已保存：{out_path}  (无推理，未做深度筛选)")
 
     if task_timings:
         timings_path = save_search_timings(args.output_dir, task_timings)
