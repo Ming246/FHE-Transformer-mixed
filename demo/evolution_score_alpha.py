@@ -44,7 +44,7 @@ from gelu_poly import gelu_level_allowed
 from evolution_infer import format_elapsed, save_search_timings
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 SENSITIVE_OUTPUT_DIR = SENSITIVE_S1_DIR
 POLY_LEVELS = (0, 1, 2)
 EVOLUTION_RESULTS_ROOT = os.path.join(DEMO_RESULTS_DIR, "evolution_alpha")

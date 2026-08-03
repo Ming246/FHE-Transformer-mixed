@@ -1,7 +1,7 @@
 """
 计算 BERT 各非线性输出位置的一阶 Taylor 型敏感度 S_l（三档近似误差）。
 
-对每个位置 l、精度档 k∈{low,mid,high}，在验证集上：
+对每个位置 l、精度档 k∈{low,mid,high}，在校验集（calib）上：
 
   S_{l,j}^{(k)} = g_{l,j}·Δy_{l,j}^{(k)}
   S_l^{(k)}     = |Σ_j S_{l,j}^{(k)}|
@@ -12,12 +12,14 @@
 - Δy = y_poly − y_exact（近似输出减精确输出，保留符号）
 - 每个 batch：1 次精确 forward+backward；Δy 在缓存的中间结果上逐层串行、
   同层三档并行用 gelu_poly / softmax_poly / layernorm_poly 计算
+- 校验集：读取 coverage_metric 落盘索引（train 分层子集），禁止现场重建
 
 方案位置顺序（与 poly_model_inference 一致）：softmax, ln1, gelu, ln2 → 48 行/任务 CSV。
 """
 from __future__ import annotations
 
 import functools
+import json
 import os
 import time
 from datetime import datetime
@@ -45,18 +47,29 @@ from softmax_poly import (
 )
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
-
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+#TASK_NAMES = ["cola", "qnli", "mnli"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
 
 MAX_SEQ_LENGTH = 128
 NUM_LAYERS = 12
-NUM_LABELS = 2
+TASK_NUM_LABELS: dict[str, int] = {
+    "mrpc": 2,
+    "rte": 2,
+    "sst2": 2,
+    "cola": 2,
+    "qnli": 2,
+    "mnli": 3,
+}
 BATCH_SIZE = 1
 NUM_PRECISION_LEVELS = 3
 MAX_CALIB_SAMPLES = None
+
+CALIB_SEED = 42
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIB_INDICES_DIR = os.path.join(_SCRIPT_DIR, "results", "coverage_metrics")
 
 SCHEME_KINDS_PER_LAYER = ("softmax", "ln1", "gelu", "ln2")
 SCHEME_SLOTS_PER_LAYER = len(SCHEME_KINDS_PER_LAYER)
@@ -76,11 +89,37 @@ _gelu_capture: dict[int, dict] = {}
 _ln_capture: dict[tuple[int, str], dict] = {}
 
 
+def task_num_labels(task_name: str) -> int:
+    if task_name not in TASK_NUM_LABELS:
+        raise KeyError(f"未知任务 {task_name}，请在 TASK_NUM_LABELS 中配置")
+    return TASK_NUM_LABELS[task_name]
+
+
 def get_preprocess_fn(task_name: str, tokenizer):
-    if task_name == "sst2":
+    if task_name in ("sst2", "cola"):
 
         def fn(examples):
             return tokenizer(
+                examples["sentence"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "mnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["premise"],
+                examples["hypothesis"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "qnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["question"],
                 examples["sentence"],
                 truncation=True,
                 max_length=MAX_SEQ_LENGTH,
@@ -97,6 +136,60 @@ def get_preprocess_fn(task_name: str, tokenizer):
             )
 
     return fn
+
+
+def _calib_indices_path(task_name: str, seed: int, indices_dir: str) -> str:
+    return os.path.join(indices_dir, f"{task_name}_calib_indices_seed{seed}.json")
+
+
+def load_calib_indices_json(
+    task_name: str, seed: int, indices_dir: str
+) -> tuple[list[int], dict]:
+    """必须存在 coverage_metric 落盘索引；禁止现场重建。"""
+    path = _calib_indices_path(task_name, seed, indices_dir)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"校验集索引不存在：{path}；请先运行 coverage_metric.py 生成"
+        )
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    if "indices" not in payload or not payload["indices"]:
+        raise ValueError(f"校验集索引为空或缺少 indices：{path}")
+    indices = [int(i) for i in payload["indices"]]
+    meta = {k: v for k, v in payload.items() if k != "indices"}
+    meta["indices_path"] = path
+    return indices, meta
+
+
+def load_calib_split(
+    task_name: str,
+    *,
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+):
+    """从 train 按落盘索引取出校验集；返回 (split, 描述字符串)。"""
+    data_path = os.path.join(LOCAL_DATA_ROOT, task_name)
+    dataset = load_from_disk(data_path)
+    if "train" not in dataset:
+        raise KeyError(f"{task_name} 缺少 train，无法构造校验集")
+    indices, meta = load_calib_indices_json(
+        task_name, calib_seed, calib_indices_dir
+    )
+    n_train = len(dataset["train"])
+    bad = [i for i in indices if i < 0 or i >= n_train]
+    if bad:
+        raise IndexError(
+            f"{task_name} 校验集索引越界（train n={n_train}），例：{bad[:5]}"
+        )
+    split = dataset["train"].select(indices)
+    if MAX_CALIB_SAMPLES is not None:
+        split = split.select(range(min(MAX_CALIB_SAMPLES, len(split))))
+    desc = (
+        f"calib n={len(split)} seed={calib_seed} "
+        f"← {meta.get('indices_path')} "
+        f"(file calib_size={meta.get('calib_size', '?')})"
+    )
+    return split, desc
 
 
 def position_label(layer_idx: int, kind: str, level: int) -> str:
@@ -373,7 +466,7 @@ def compute_sensitivity_for_task(
     tokenizer = AutoTokenizer.from_pretrained(finetuned_model_path)
     model = AutoModelForSequenceClassification.from_pretrained(
         finetuned_model_path,
-        num_labels=NUM_LABELS,
+        num_labels=task_num_labels(task_name),
         attn_implementation="eager",
     )
     model = model.to(device)
@@ -382,11 +475,8 @@ def compute_sensitivity_for_task(
     register_gelu_capture_hooks(model)
     register_layernorm_capture_hooks(model)
 
-    data_path = os.path.join(LOCAL_DATA_ROOT, task_name)
-    dataset = load_from_disk(data_path)
-    calib = dataset["validation"]
-    if MAX_CALIB_SAMPLES is not None:
-        calib = calib.select(range(min(MAX_CALIB_SAMPLES, len(calib))))
+    calib, split_desc = load_calib_split(task_name)
+    print(f"评估数据：{split_desc}")
 
     tokenized = calib.map(get_preprocess_fn(task_name, tokenizer), batched=True)
     format_cols = ["input_ids", "attention_mask", "label"]
@@ -404,7 +494,7 @@ def compute_sensitivity_for_task(
     layernorm_accum: dict[tuple[int, str, int], float] = {}
     sample_count = 0
 
-    print(f"校准样本数 M = {len(tokenized)}，batch_size = {BATCH_SIZE}")
+    print(f"校验集样本数 M = {len(tokenized)}，batch_size = {BATCH_SIZE}")
 
     for step, batch in enumerate(loader):
         global _softmax_capture, _gelu_capture, _ln_capture

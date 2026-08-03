@@ -30,7 +30,7 @@ from _repo import (  # noqa: E402
     REPO_ROOT,
 )
 
-TASK_NAMES = ("mrpc", "rte", "sst2")
+TASK_NAMES = ("mrpc", "rte", "sst2", "cola", "qnli", "mnli")
 SCORE1_PARETO_DIR = EVOLUTION_S1_DIR
 ALPHA_PARETO_DIR = os.path.join(DEMO_RESULTS_DIR, "evolution_alpha")
 KL_PARETO_DIR = EVOLUTION_KL_DIR

@@ -30,12 +30,12 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 | `cost.py` | 方案 **乘法深度** 估算（占位）；目标为最优 bootstrap 下的 bts（见 `docs/HE_BOOTSTRAP_COST.md`） |
 | `docs/HE_BOOTSTRAP_COST.md` | **Bootstrap / bts cost** 交接简报（新 agent 优先读） |
 | `ILP_loss_depth.py` | 固定 cost 预算下的 ILP 档位分配 |
-| `evolution_score.py` | NSGA-II：\(\sum S\) vs depth（有 cost 容差） |
-| `evolution_acc.py` | NSGA-II：\(\|\Delta acc\|\) vs \(\lceil depth/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)（严格） |
-| `poly_model_inference.py` | 按 48 维方案替换 Softmax/LN/GeLU 并评估验证集 |
+| `evolution_score.py` | NSGA-II：\(\sum S\)（校验集敏感度）vs depth；校验集深度过滤后写 calib/validation CSV |
+| `evolution_kl.py` | NSGA-II：Output KL（校验集搜索）vs depth；最终 calib + validation 双 CSV |
+| `poly_model_inference.py` | 按 48 维方案替换 Softmax/LN/GeLU 并评估验证集/校验集 |
 | `gelu_poly.py` / `softmax_poly.py` / `layernorm_poly.py` | 推理时多项式实现与 per-layer 配置 |
 | `nolinear/` | 非线性近似 **离线评估** 与 Remez/Chebyshev 拟合 |
-| `results/` | 敏感度 CSV、进化 Pareto、进化 acc 结果等 |
+| `results/` | 敏感度 CSV、进化 Pareto 等 |
 
 ---
 
@@ -108,8 +108,8 @@ GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；So
 
 | 脚本 | \(f_1\) | \(f_2\) | 输出 |
 |------|---------|---------|------|
-| `evolution_score.py` | \(\sum S\) | depth 和（±容差支配） | `results/evolution_results/*_pareto.csv` |
-| `evolution_acc.py` | \(\|\text{acc}-\text{baseline}\|\) | \(\lceil depth/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)（严格） | `results/evolution_acc_results/*_pareto_acc.csv` |
+| `evolution_score.py` | \(\sum S\)（校验集 CSV） | depth（±容差支配） | `*_pareto_calib.csv` / `*_pareto_validation.csv`（同深度仅留最小 KL） |
+| `evolution_kl.py` | Output KL（校验集搜索） | \(\lceil depth/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)（严格） | `*_pareto_kl_calib.csv` / `*_pareto_kl_validation.csv` |
 
 句对任务（MRPC/RTE）推理/敏感度须保留并传入 **`token_type_ids`**（勿在 `set_format` 时丢掉）。
 
@@ -124,8 +124,8 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 sensitive_score_1.
 # ILP
 docker exec wsm_experiment bash -lc "cd /workspace && python3 ILP_loss_depth.py"
 
-# NSGA-II（acc）
-docker exec wsm_experiment bash -lc "cd /workspace && python3 evolution_acc.py --task mrpc"
+# NSGA-II（ΣS）
+docker exec wsm_experiment bash -lc "cd /workspace && python3 evolution_score.py --tasks mrpc"
 
 # 多项式推理
 docker exec wsm_experiment bash -lc "cd /workspace && python3 poly_model_inference.py"
@@ -174,9 +174,9 @@ docker exec wsm_experiment bash -lc "cd /workspace/nolinear && python3 layernorm
 
 ## 结果文件
 
-- `results/sensitive_scores_1/` — 敏感度宽表
-- `results/evolution_results/` — score-based Pareto
-- `results/evolution_acc_results/` — acc-delta Pareto
+- `results/sensitive_scores_1/` — 校验集敏感度宽表
+- `results/evolution_results/` — score-based Pareto（calib / validation）
+- `results/evolution_kl_results/` — KL 搜索 Pareto（calib / validation）
 - `results/score_spearman/` — ΣS vs Output KL 相关性
 - `nolinear/variance_out/` — LayerNorm 方差 JSON
 - `nolinear/sigma_out/` — Softmax σ JSON

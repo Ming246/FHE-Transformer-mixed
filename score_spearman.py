@@ -1,8 +1,8 @@
 """
-方案级 ΣS proxy 与真实验证集指标的相关性评估。
+方案级 ΣS proxy 与真实校验集指标的相关性评估。
 
   · 分层随机：按乘法深度或 ΣS（log）区间分层采样合法 scheme，
-    推理后与 Output KL 做 Spearman / Kendall。
+    在校验集上推理后与 Output KL 做 Spearman / Kendall。
 
 排序容差仅作用于 proxy ΣS（与 evolution_score 的 f_loss 一致，单一相对容差 τ=LOSS_REL_TOL）：
   严格更好：L(x1) < (1−τ)·L(x2)
@@ -13,7 +13,8 @@
  （组代表=组内最小值，v≤(1+τ)·rep 则并入），强制划成互斥组后再赋 average rank，
   从而得到可传递的全预序；并非对 pairwise 关系做传递闭包。
 
-敏感度 CSV：SCORE_CSV_DIR。
+敏感度 CSV：SCORE_CSV_DIR（默认 sensitive_scores_1，校验集上计算）。
+推理评估：默认全量校验集（calib）；可用 --eval-samples 抽样加速。
 输出：
   {task}_random_{depth|score}.csv
   random_{depth|score}.pdf（各任务并排 log–log 散点）
@@ -53,9 +54,10 @@ from evolution_score import (
     loss_strictly_better,
     random_legal_scheme,
 )
+from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 
 # 换 score 版本时改此目录（需含 {task}_sensitivity.csv）
 SCORE_CSV_DIR = "./results/sensitive_scores_1/"
@@ -64,7 +66,7 @@ SCORE_CSV_DIR = "./results/sensitive_scores_1/"
 RANDOM_SCHEME_COUNT = 200
 RANDOM_SCHEME_SEED = 42
 # 随机方案分层方式：depth（默认）| score（ΣS，log 等宽档）
-RANDOM_STRATIFY = "depth"
+RANDOM_STRATIFY = "score"
 
 # 将 [d_min, d_max] 等宽分为若干档；None = 按深度跨度自适应（约每 20 深度一档，上限 20）
 DEPTH_BIN_COUNT: int | None = None
@@ -78,9 +80,10 @@ SCORE_BIN_WIDTH_HINT = 0.25  # 每个档位约 0.25 个 log10
 SCORE_BIN_COUNT_MAX = 20
 SCORE_BIN_COUNT_MIN = 5
 
-# None = 全验证集；整数 = 固定子集加速
+# None = 全校验集；整数 = 固定子集加速
 EVAL_SAMPLES: int | None = None
 EVAL_SEED = 42
+EVAL_SPLIT = "calib"
 
 OUTPUT_DIR = "./results/score_spearman/"
 
@@ -89,6 +92,9 @@ TASK_PLOT_STYLES = {
     "mrpc": {"color": "#2563eb", "marker": "o"},
     "rte": {"color": "#ea580c", "marker": "^"},
     "sst2": {"color": "#16a34a", "marker": "s"},
+    "cola": {"color": "#7c3aed", "marker": "D"},
+    "qnli": {"color": "#db2777", "marker": "v"},
+    "mnli": {"color": "#0d9488", "marker": "P"},
 }
 PLOT_LOG_FLOOR = 1e-8
 # ==================================================
@@ -667,12 +673,19 @@ def evaluate_schemes(
     s_mat: dict,
     *,
     eval_samples: int | None,
+    eval_split: str = EVAL_SPLIT,
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
 ) -> list[SchemeMetrics]:
     evaluator = SchemeEvaluator(
         task_name,
         eval_samples=eval_samples,
         seed=EVAL_SEED,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
     )
+    print(f"  推理评估集：{evaluator.eval_desc}")
     out: list[SchemeMetrics] = []
     n = len(schemes)
     for i, scheme in enumerate(schemes, start=1):
@@ -864,6 +877,9 @@ def run_random(
     stratify: str = "depth",
     n_depth_bins: int | None = None,
     n_score_bins: int | None = None,
+    eval_split: str = EVAL_SPLIT,
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
 ) -> list[SchemeMetrics]:
     stratify = stratify.strip().lower()
     label = "深度分层" if stratify == "depth" else "ΣS分层"
@@ -872,7 +888,7 @@ def run_random(
         f"{label}随机 — {task_name.upper()}  "
         f"n={n_schemes}  seed={seed}  stratify={stratify}"
     )
-    print(f"score={csv_dir}  设备：{device}")
+    print(f"score={csv_dir}  设备：{device}  eval_split={eval_split}")
     print(f"{'=' * 60}")
 
     s_mat = load_sensitivity_matrix(task_name, csv_dir)
@@ -905,6 +921,9 @@ def run_random(
         schemes,
         s_mat,
         eval_samples=eval_samples,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
     )
 
 
@@ -964,16 +983,19 @@ def save_score_kl_scatter_pdf(
         return path
 
     n = len(tasks)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
     plt.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42})
     fig, axes = plt.subplots(
-        1,
-        n,
-        figsize=(4.0 * n, 3.8),
+        nrows,
+        ncols,
+        figsize=(4.0 * ncols, 3.6 * nrows),
         squeeze=False,
         constrained_layout=True,
     )
 
-    for col, task_name in enumerate(tasks):
+    for i, task_name in enumerate(tasks):
+        row, col = divmod(i, ncols)
         rows = task_rows[task_name]
         xs = np.asarray([r.score_sum for r in rows], dtype=np.float64)
         ys = np.asarray([r.output_kl for r in rows], dtype=np.float64)
@@ -983,7 +1005,7 @@ def save_score_kl_scatter_pdf(
         )
         rho, rho_p = spearmanr(xs, ys)
 
-        ax = axes[0, col]
+        ax = axes[row, col]
         xs_p = np.maximum(xs, PLOT_LOG_FLOOR)
         ys_p = np.maximum(ys, PLOT_LOG_FLOOR)
         ax.scatter(
@@ -1006,6 +1028,10 @@ def save_score_kl_scatter_pdf(
             f"ρ={rho:.3f}, p={format_pvalue(float(rho_p))})"
         )
         ax.grid(True, which="both", alpha=0.3, zorder=0)
+
+    for j in range(n, nrows * ncols):
+        row, col = divmod(j, ncols)
+        axes[row, col].set_visible(False)
 
     fig.suptitle(f"{source}", fontsize=12)
     fig.savefig(path)
@@ -1035,14 +1061,34 @@ def save_summary_csv(summary_rows: list[dict], *, tag: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ΣS proxy 与 Output KL 的排序相关性（分层随机）"
+        description="ΣS proxy 与 Output KL 的排序相关性（校验集推理）"
     )
     parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
     parser.add_argument(
         "--eval-samples",
         type=int,
         default=EVAL_SAMPLES,
-        help="验证子集大小；省略则用配置区 EVAL_SAMPLES（默认全量）",
+        help="校验子集大小；省略则用配置区 EVAL_SAMPLES（默认全量校验集）",
+    )
+    parser.add_argument(
+        "--eval-split",
+        choices=("calib", "validation"),
+        default=EVAL_SPLIT,
+        help="推理评估集：默认 calib（校验集）",
+    )
+    parser.add_argument(
+        "--calib-seed",
+        type=int,
+        default=CALIB_SEED,
+        help=(
+            f"校验集索引 seed（默认 {CALIB_SEED}）；"
+            "读 {task}_calib_indices_seed{seed}.json"
+        ),
+    )
+    parser.add_argument(
+        "--calib-indices-dir",
+        default=CALIB_INDICES_DIR,
+        help="calib 索引 JSON 目录（coverage_metric 输出，只读）",
     )
     parser.add_argument(
         "--random-schemes",
@@ -1080,6 +1126,12 @@ def main() -> None:
     random_tag = random_source_tag(stratify)
 
     print(f"score CSV 目录：{SCORE_CSV_DIR}")
+    print(f"eval-split：{args.eval_split}")
+    if args.eval_split == "calib":
+        print(
+            f"  calib indices: seed={args.calib_seed} "
+            f"dir={args.calib_indices_dir}（只读，不重建）"
+        )
     print(f"分层随机：stratify={stratify}")
     if stratify == "depth":
         bins_msg = (
@@ -1117,6 +1169,9 @@ def main() -> None:
             stratify=stratify,
             n_depth_bins=args.depth_bins,
             n_score_bins=args.score_bins,
+            eval_split=args.eval_split,
+            calib_seed=args.calib_seed,
+            calib_indices_dir=args.calib_indices_dir,
         )
         summary_random = summarize_correlations(
             task_name, random_tag, rows_random

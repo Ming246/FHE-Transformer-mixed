@@ -1,22 +1,28 @@
 """
-对比进化搜索 Pareto 前沿（仅 Output KL）：
-  - evolution_results/sensitive_scores_1/{task}_pareto_full.csv  （ΣS₁ 完整 archive）
-  - evolution_results/sensitive_scores_1/{task}_pareto.csv       （ΣS₁ 深度筛选后）
-  - evolution_kl_results/{task}_pareto_kl.csv                    （Output KL 搜索）
+对比进化搜索 Pareto（ΣS₁ filtered vs KL search）：
 
-横轴：乘法深度和 total_depth；纵轴：Output KL（上行 log，下行线性原值）。
+  校验集 / 验证集 各两张图（共 4 张）：
+    1) Output KL Pareto（上行 log，下行线性 + 下包络）
+    2) 准确率 + 翻转率（上行 accuracy = baseline + Δacc；下行 flips_pct）
 
-输出：
-  - evolution_compare.pdf           ：三系（full / filtered / KL），纵轴 Output KL
-  - evolution_compare_clean.pdf     ：仅蓝+橙；剔除 |Δacc|≥2% 或 flips≥2% 的点
-  - evolution_compare_quality.pdf   ：蓝+橙；上行 |Δacc|（仅散点）、下行 flips_pct
+数据：
+  - evolution_results/sensitive_scores_1/{task}_pareto_{calib|validation}.csv
+  - evolution_kl_results/{task}_pareto_kl_{calib|validation}.csv
+
+输出（默认写入 picture/）：
+  - evolution_compare_pareto_calib.pdf
+  - evolution_compare_acc_calib.pdf
+  - evolution_compare_pareto_validation.pdf
+  - evolution_compare_acc_validation.pdf
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,37 +30,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ===================== 配置区 =====================
-TASK_NAMES = ("mrpc", "rte", "sst2")
+TASK_NAMES = ("mrpc", "rte", "sst2", "cola","qnli","mnli")
+EVAL_SPLITS = ("calib", "validation")
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+_PIC_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCORE1_PARETO_DIR = os.path.join(
     _REPO_ROOT, "results", "evolution_results", "sensitive_scores_1"
 )
 KL_PARETO_DIR = os.path.join(_REPO_ROOT, "results", "evolution_kl_results")
 
-SCORE_FILE_PATTERN = "{task}_pareto.csv"
-SCORE_FULL_FILE_PATTERN = "{task}_pareto_full.csv"
-KL_FILE_PATTERN = "{task}_pareto_kl.csv"
+SCORE_FILE_PATTERN = "{task}_pareto_{split}.csv"
+KL_FILE_PATTERN = "{task}_pareto_kl_{split}.csv"
 
-_PIC_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_PDF = os.path.join(_PIC_DIR, "evolution_compare.pdf")
-OUTPUT_PDF_CLEAN = os.path.join(_PIC_DIR, "evolution_compare_clean.pdf")
-OUTPUT_PDF_QUALITY = os.path.join(_PIC_DIR, "evolution_compare_quality.pdf")
+BASELINE_CACHE_PATH = os.path.join(_PIC_DIR, "baseline_acc_cache.json")
 
 LOG_FLOOR = 1e-6
-# 质量门：|accuracy_delta| 或 flips_pct 达到该百分点则剔除（clean 图）
-QUALITY_PCT_MAX = 2.0
 
 METHODS: tuple[dict[str, Any], ...] = (
-    {
-        "key": "score1_full",
-        "label": r"$\Sigma S_1$ full",
-        "dir": SCORE1_PARETO_DIR,
-        "pattern": SCORE_FULL_FILE_PATTERN,
-        "color": "#94a3b8",
-        "marker": "D",
-    },
     {
         "key": "score1",
         "label": r"$\Sigma S_1$ filtered",
@@ -71,11 +67,6 @@ METHODS: tuple[dict[str, Any], ...] = (
         "color": "#ea580c",
         "marker": "^",
     },
-)
-
-# clean 图：仅蓝（filtered）+ 橙（KL）
-METHODS_CLEAN: tuple[dict[str, Any], ...] = tuple(
-    m for m in METHODS if m["key"] in ("score1", "kl")
 )
 # ==================================================
 
@@ -131,27 +122,9 @@ def load_pareto_csv(path: str) -> list[ParetoPoint]:
     return points
 
 
-def passes_quality_gate(
-    p: ParetoPoint, *, max_pct: float = QUALITY_PCT_MAX
-) -> bool:
-    """保留 |Δacc|<max_pct 且 flips<max_pct 的点；缺字段则剔除。"""
-    if p.accuracy_delta_pct is None or p.flips_pct is None:
-        return False
-    if abs(p.accuracy_delta_pct) >= max_pct:
-        return False
-    if p.flips_pct >= max_pct:
-        return False
-    return True
-
-
-def filter_quality(
-    points: list[ParetoPoint], *, max_pct: float = QUALITY_PCT_MAX
-) -> list[ParetoPoint]:
-    return [p for p in points if passes_quality_gate(p, max_pct=max_pct)]
-
-
 def load_task_points(
     task: str,
+    split: str,
     *,
     method_dirs: dict[str, str] | None = None,
     methods: tuple[dict[str, Any], ...] = METHODS,
@@ -159,7 +132,13 @@ def load_task_points(
     out: dict[str, list[ParetoPoint]] = {}
     for method in methods:
         directory = (method_dirs or {}).get(method["key"], method["dir"])
-        path = os.path.join(directory, method["pattern"].format(task=task))
+        path = os.path.join(
+            directory, method["pattern"].format(task=task, split=split)
+        )
+        if not os.path.isfile(path):
+            print(f"  跳过缺失文件：{path}")
+            out[method["key"]] = []
+            continue
         out[method["key"]] = load_pareto_csv(path)
     return out
 
@@ -180,42 +159,72 @@ def pareto_envelope(
     return d, env_v
 
 
-def y_output_kl(p: ParetoPoint) -> float | None:
-    return p.kl
+def _load_baseline_cache(path: str) -> dict:
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def y_abs_acc_delta_pct(p: ParetoPoint) -> float | None:
-    if p.accuracy_delta_pct is None:
-        return None
-    return abs(p.accuracy_delta_pct)
+def _save_baseline_cache(path: str, cache: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+        f.write("\n")
 
 
-def y_flips_pct(p: ParetoPoint) -> float | None:
-    return p.flips_pct
+def resolve_baseline_acc_pct(
+    task: str,
+    split: str,
+    *,
+    cache_path: str = BASELINE_CACHE_PATH,
+    force_refresh: bool = False,
+) -> float:
+    """
+    原始准确率（百分点，如 87.25）。
+    优先读缓存；否则用 SchemeEvaluator 在对应 split 上跑 baseline。
+    """
+    cache = _load_baseline_cache(cache_path)
+    key = f"{task}/{split}"
+    if not force_refresh and key in cache:
+        return float(cache[key]) * 100.0
+
+    from evolution_infer import SchemeEvaluator
+    from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
+
+    print(f"  计算 baseline 准确率：{task}/{split} …")
+    evaluator = SchemeEvaluator(
+        task,
+        eval_samples=None,
+        eval_split=split,
+        calib_seed=CALIB_SEED,
+        calib_indices_dir=CALIB_INDICES_DIR,
+    )
+    acc = float(evaluator.baseline_acc)
+    cache[key] = acc
+    _save_baseline_cache(cache_path, cache)
+    print(f"  baseline_acc={acc:.4f} → 已缓存 {cache_path}")
+    return acc * 100.0
 
 
-def plot_panel(
+def plot_pareto_panel(
     ax: plt.Axes,
     task: str,
     task_data: dict[str, list[ParetoPoint]],
     *,
     methods: tuple[dict[str, Any], ...],
-    y_fn,
-    ylabel: str,
     log_scale: bool,
     show_title: bool,
-    draw_envelope: bool = True,
 ) -> None:
     for method in methods:
-        pts = task_data[method["key"]]
+        pts = task_data.get(method["key"], [])
         depths_list: list[float] = []
         ys_list: list[float] = []
         for p in pts:
-            y = y_fn(p)
-            if y is None or not np.isfinite(p.depth) or not np.isfinite(y):
+            if not np.isfinite(p.depth) or not np.isfinite(p.kl):
                 continue
             depths_list.append(p.depth)
-            ys_list.append(float(y))
+            ys_list.append(float(p.kl))
         depths = np.asarray(depths_list, dtype=np.float64)
         ys = np.asarray(ys_list, dtype=np.float64)
         if log_scale:
@@ -233,22 +242,22 @@ def plot_panel(
             label=method["label"],
             zorder=2,
         )
-
-        if draw_envelope:
-            env_d, env_y = pareto_envelope(depths, ys)
-            if len(env_d):
-                ax.plot(
-                    env_d,
-                    env_y,
-                    color=method["color"],
-                    linewidth=1.6,
-                    alpha=0.9,
-                    zorder=3,
-                )
+        env_d, env_y = pareto_envelope(depths, ys)
+        if len(env_d):
+            ax.plot(
+                env_d,
+                env_y,
+                color=method["color"],
+                linewidth=1.6,
+                alpha=0.9,
+                zorder=3,
+            )
 
     if log_scale:
         ax.set_yscale("log")
-    ax.set_ylabel(ylabel)
+        ax.set_ylabel("Output KL (log)")
+    else:
+        ax.set_ylabel("Output KL")
     ax.set_xlabel("Depth sum")
     if show_title:
         ax.set_title(task.upper(), fontsize=11, fontweight="medium")
@@ -261,21 +270,123 @@ def plot_panel(
     ax.set_axisbelow(True)
 
 
-def build_figure(
-    task_data: dict[str, dict[str, list[ParetoPoint]]],
-    tasks: list[str],
+def plot_acc_panel(
+    ax: plt.Axes,
+    task: str,
+    task_data: dict[str, list[ParetoPoint]],
     *,
-    methods: tuple[dict[str, Any], ...] = METHODS,
-    title: str = r"Pareto archive: $\Sigma S_1$ full / filtered vs KL-direct search",
-    top_y_fn=y_output_kl,
-    top_ylabel: str = "Output KL (log)",
-    top_log: bool = True,
-    top_draw_envelope: bool = True,
-    bottom_y_fn=y_output_kl,
-    bottom_ylabel: str = "Output KL",
-    bottom_log: bool = False,
-    bottom_draw_envelope: bool = True,
-) -> plt.Figure:
+    methods: tuple[dict[str, Any], ...],
+    baseline_pct: float,
+    show_title: bool,
+) -> None:
+    # baseline 虚线（每任务一条；legend 只标一次）
+    ax.axhline(
+        baseline_pct,
+        color="#64748b",
+        linestyle="--",
+        linewidth=1.4,
+        alpha=0.9,
+        label="baseline",
+        zorder=1,
+    )
+
+    for method in methods:
+        pts = task_data.get(method["key"], [])
+        pairs: list[tuple[float, float]] = []
+        for p in pts:
+            if p.accuracy_delta_pct is None:
+                continue
+            if not np.isfinite(p.depth) or not np.isfinite(p.accuracy_delta_pct):
+                continue
+            pairs.append((p.depth, baseline_pct + p.accuracy_delta_pct))
+        if not pairs:
+            continue
+        pairs.sort(key=lambda x: x[0])
+        depths = np.asarray([d for d, _ in pairs], dtype=np.float64)
+        ys = np.asarray([a for _, a in pairs], dtype=np.float64)
+
+        ax.plot(
+            depths,
+            ys,
+            color=method["color"],
+            linewidth=1.5,
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.scatter(
+            depths,
+            ys,
+            s=28,
+            c=method["color"],
+            marker=method["marker"],
+            alpha=0.7,
+            edgecolors="white",
+            linewidths=0.4,
+            label=method["label"],
+            zorder=3,
+        )
+
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_xlabel("Depth sum")
+    if show_title:
+        ax.set_title(task.upper(), fontsize=11, fontweight="medium")
+    ax.grid(True, which="major", alpha=0.25, linewidth=0.6)
+    ax.set_axisbelow(True)
+
+
+def plot_flips_panel(
+    ax: plt.Axes,
+    task: str,
+    task_data: dict[str, list[ParetoPoint]],
+    *,
+    methods: tuple[dict[str, Any], ...],
+    show_title: bool,
+) -> None:
+    for method in methods:
+        pts = task_data.get(method["key"], [])
+        pairs: list[tuple[float, float]] = []
+        for p in pts:
+            if p.flips_pct is None:
+                continue
+            if not np.isfinite(p.depth) or not np.isfinite(p.flips_pct):
+                continue
+            pairs.append((p.depth, p.flips_pct))
+        if not pairs:
+            continue
+        pairs.sort(key=lambda x: x[0])
+        depths = np.asarray([d for d, _ in pairs], dtype=np.float64)
+        ys = np.asarray([f for _, f in pairs], dtype=np.float64)
+
+        ax.plot(
+            depths,
+            ys,
+            color=method["color"],
+            linewidth=1.5,
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.scatter(
+            depths,
+            ys,
+            s=28,
+            c=method["color"],
+            marker=method["marker"],
+            alpha=0.7,
+            edgecolors="white",
+            linewidths=0.4,
+            label=method["label"],
+            zorder=3,
+        )
+
+    ax.set_ylabel("Flip rate (%)")
+    ax.set_xlabel("Depth sum")
+    if show_title:
+        ax.set_title(task.upper(), fontsize=11, fontweight="medium")
+    ax.grid(True, which="major", alpha=0.25, linewidth=0.6)
+    ax.set_axisbelow(True)
+
+
+def _apply_rc() -> None:
     plt.rcParams.update(
         {
             "font.size": 10,
@@ -287,6 +398,15 @@ def build_figure(
         }
     )
 
+
+def build_pareto_figure(
+    task_data: dict[str, dict[str, list[ParetoPoint]]],
+    tasks: list[str],
+    *,
+    split: str,
+    methods: tuple[dict[str, Any], ...] = METHODS,
+) -> plt.Figure:
+    _apply_rc()
     n = len(tasks)
     fig, axes = plt.subplots(
         2,
@@ -296,29 +416,22 @@ def build_figure(
         squeeze=False,
         constrained_layout=True,
     )
-
     for col, task in enumerate(tasks):
-        plot_panel(
+        plot_pareto_panel(
             axes[0, col],
             task,
             task_data[task],
             methods=methods,
-            y_fn=top_y_fn,
-            ylabel=top_ylabel,
-            log_scale=top_log,
+            log_scale=True,
             show_title=True,
-            draw_envelope=top_draw_envelope,
         )
-        plot_panel(
+        plot_pareto_panel(
             axes[1, col],
             task,
             task_data[task],
             methods=methods,
-            y_fn=bottom_y_fn,
-            ylabel=bottom_ylabel,
-            log_scale=bottom_log,
+            log_scale=False,
             show_title=False,
-            draw_envelope=bottom_draw_envelope,
         )
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -332,106 +445,161 @@ def build_figure(
         bbox_to_anchor=(0.5, -0.02),
         bbox_transform=fig.transFigure,
     )
-
-    fig.suptitle(title, fontsize=12, fontweight="medium")
+    fig.suptitle(
+        rf"Pareto: $\Sigma S_1$ filtered vs KL ({split})",
+        fontsize=12,
+        fontweight="medium",
+    )
     return fig
+
+
+def build_acc_figure(
+    task_data: dict[str, dict[str, list[ParetoPoint]]],
+    tasks: list[str],
+    baselines_pct: dict[str, float],
+    *,
+    split: str,
+    methods: tuple[dict[str, Any], ...] = METHODS,
+) -> plt.Figure:
+    _apply_rc()
+    n = len(tasks)
+    fig, axes = plt.subplots(
+        2,
+        n,
+        figsize=(3.8 * n, 7.2),
+        sharex="col",
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for col, task in enumerate(tasks):
+        plot_acc_panel(
+            axes[0, col],
+            task,
+            task_data[task],
+            methods=methods,
+            baseline_pct=baselines_pct[task],
+            show_title=True,
+        )
+        plot_flips_panel(
+            axes[1, col],
+            task,
+            task_data[task],
+            methods=methods,
+            show_title=False,
+        )
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    # 去重 legend（多列可能重复）
+    seen: set[str] = set()
+    uniq_h, uniq_l = [], []
+    for h, lab in zip(handles, labels):
+        if lab in seen:
+            continue
+        seen.add(lab)
+        uniq_h.append(h)
+        uniq_l.append(lab)
+    fig.legend(
+        uniq_h,
+        uniq_l,
+        loc="upper center",
+        ncol=len(uniq_l),
+        frameon=False,
+        fontsize=9,
+        bbox_to_anchor=(0.5, -0.02),
+        bbox_transform=fig.transFigure,
+    )
+    fig.suptitle(
+        rf"Accuracy & flip rate vs depth ({split})",
+        fontsize=12,
+        fontweight="medium",
+    )
+    return fig
+
+
+def default_output_path(kind: str, split: str) -> str:
+    return os.path.join(_PIC_DIR, f"evolution_compare_{kind}_{split}.pdf")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="对比 ΣS₁ full/filtered 与 KL 搜索的 Pareto 前沿（Output KL）"
+        description="ΣS₁ / KL Pareto 与准确率/翻转率对比（calib + validation 共 4 图）"
     )
     parser.add_argument("--tasks", nargs="+", default=list(TASK_NAMES))
-    parser.add_argument("--output", default=OUTPUT_PDF)
-    parser.add_argument("--output-clean", default=OUTPUT_PDF_CLEAN)
-    parser.add_argument("--output-quality", default=OUTPUT_PDF_QUALITY)
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=list(EVAL_SPLITS),
+        default=list(EVAL_SPLITS),
+        help="评估集：默认同时画 calib 与 validation",
+    )
     parser.add_argument("--score1-dir", default=SCORE1_PARETO_DIR)
     parser.add_argument("--kl-dir", default=KL_PARETO_DIR)
     parser.add_argument(
-        "--quality-pct",
-        type=float,
-        default=QUALITY_PCT_MAX,
-        help="clean 图剔除阈值：|Δacc| 或 flips 达到该百分点则丢弃（默认 2）",
+        "--baseline-cache",
+        default=BASELINE_CACHE_PATH,
+        help="baseline 准确率缓存 JSON",
+    )
+    parser.add_argument(
+        "--refresh-baseline",
+        action="store_true",
+        help="强制重算并刷新 baseline 缓存",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=_PIC_DIR,
+        help="PDF 输出目录（默认 picture/）",
     )
     args = parser.parse_args()
 
     method_dirs = {
-        "score1_full": args.score1_dir,
         "score1": args.score1_dir,
         "kl": args.kl_dir,
     }
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    task_data: dict[str, dict[str, list[ParetoPoint]]] = {}
-    for task in args.tasks:
-        task_data[task] = load_task_points(task, method_dirs=method_dirs)
-        counts = {m["key"]: len(task_data[task][m["key"]]) for m in METHODS}
-        print(
-            f"{task.upper()}: "
-            f"full={counts['score1_full']}  "
-            f"filtered={counts['score1']}  "
-            f"KL={counts['kl']}"
+    for split in args.splits:
+        print(f"\n=== split={split} ===")
+        task_data: dict[str, dict[str, list[ParetoPoint]]] = {}
+        for task in args.tasks:
+            task_data[task] = load_task_points(
+                task, split, method_dirs=method_dirs
+            )
+            counts = {
+                m["key"]: len(task_data[task][m["key"]]) for m in METHODS
+            }
+            print(
+                f"{task.upper()}: score1={counts['score1']}  KL={counts['kl']}"
+            )
+
+        # 1) Pareto KL
+        fig_p = build_pareto_figure(task_data, args.tasks, split=split)
+        out_p = os.path.join(
+            args.output_dir, f"evolution_compare_pareto_{split}.pdf"
         )
+        fig_p.savefig(out_p, format="pdf", bbox_inches="tight")
+        plt.close(fig_p)
+        print(f"Saved: {out_p}")
 
-    # --- 原图：三系 ---
-    fig = build_figure(task_data, args.tasks, methods=METHODS)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-    fig.savefig(args.output, format="pdf", bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {args.output}")
+        # 2) Accuracy fluctuation
+        baselines_pct: dict[str, float] = {}
+        for task in args.tasks:
+            baselines_pct[task] = resolve_baseline_acc_pct(
+                task,
+                split,
+                cache_path=args.baseline_cache,
+                force_refresh=args.refresh_baseline,
+            )
+            print(f"  {task} baseline={baselines_pct[task]:.2f}%")
 
-    # --- clean 图：仅蓝+橙，质量门过滤 ---
-    task_data_clean: dict[str, dict[str, list[ParetoPoint]]] = {}
-    for task in args.tasks:
-        task_data_clean[task] = {}
-        parts = []
-        for method in METHODS_CLEAN:
-            key = method["key"]
-            before = task_data[task][key]
-            after = filter_quality(before, max_pct=args.quality_pct)
-            task_data_clean[task][key] = after
-            parts.append(f"{key} {len(before)}→{len(after)}")
-        print(f"{task.upper()} clean (|Δacc|or flips≥{args.quality_pct:g}% dropped): {', '.join(parts)}")
-
-    fig_clean = build_figure(
-        task_data_clean,
-        args.tasks,
-        methods=METHODS_CLEAN,
-        title=(
-            r"Pareto archive: $\Sigma S_1$ filtered vs KL "
-            rf"($|\Delta$acc$|$ & flips $<${args.quality_pct:g}\%)"
-        ),
-    )
-    os.makedirs(
-        os.path.dirname(os.path.abspath(args.output_clean)) or ".", exist_ok=True
-    )
-    fig_clean.savefig(args.output_clean, format="pdf", bbox_inches="tight")
-    plt.close(fig_clean)
-    print(f"Saved: {args.output_clean}")
-
-    # --- quality 图：蓝+橙；上行 |Δacc| 仅散点、下行 flips ---
-    fig_q = build_figure(
-        task_data,
-        args.tasks,
-        methods=METHODS_CLEAN,
-        title=(
-            r"Pareto archive: $|\Delta$acc$|$ / flips vs depth "
-            r"($\Sigma S_1$ filtered / KL)"
-        ),
-        top_y_fn=y_abs_acc_delta_pct,
-        top_ylabel=r"$|\Delta$acc$|$ (%)",
-        top_log=False,
-        top_draw_envelope=False,
-        bottom_y_fn=y_flips_pct,
-        bottom_ylabel="flips (%)",
-        bottom_log=False,
-        bottom_draw_envelope=True,
-    )
-    os.makedirs(
-        os.path.dirname(os.path.abspath(args.output_quality)) or ".", exist_ok=True
-    )
-    fig_q.savefig(args.output_quality, format="pdf", bbox_inches="tight")
-    plt.close(fig_q)
-    print(f"Saved: {args.output_quality}")
+        fig_a = build_acc_figure(
+            task_data, args.tasks, baselines_pct, split=split
+        )
+        out_a = os.path.join(
+            args.output_dir, f"evolution_compare_acc_{split}.pdf"
+        )
+        fig_a.savefig(out_a, format="pdf", bbox_inches="tight")
+        plt.close(fig_a)
+        print(f"Saved: {out_a}")
 
 
 if __name__ == "__main__":

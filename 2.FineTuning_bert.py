@@ -1,11 +1,11 @@
 """
-BERT 微调 - MRPC / RTE / SST2 / MNLI
+BERT 微调 - MRPC / RTE / SST2 / MNLI / CoLA / QNLI
 统一微调脚本，通过 TASK_NAME 切换任务
 """
 import os
 import sys
 import torch
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, matthews_corrcoef
 from datetime import datetime
 from datasets import load_from_disk
 from transformers import (
@@ -14,35 +14,37 @@ from transformers import (
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding,
-    TrainerCallback
+    TrainerCallback,
 )
 
 # ===================== 配置区 =====================
-# 修改这里切换任务，或通过命令行传入：python3 2.FineTuning_bert.py mnli
+# 用法：python3 2.FineTuning_bert.py cola
+SUPPORTED_TASKS = ["mrpc", "rte", "sst2", "mnli", "cola", "qnli"]
 TASK_NAME = sys.argv[1] if len(sys.argv) > 1 else "mrpc"
-assert TASK_NAME in ["mrpc", "rte", "sst2", "mnli"], f"不支持的任务：{TASK_NAME}"
+assert TASK_NAME in SUPPORTED_TASKS, f"不支持的任务：{TASK_NAME}；可选 {SUPPORTED_TASKS}"
 
 LOCAL_MODEL_PATH = "./bert_weight/"
 LOCAL_DATA_ROOT = "./glue_datasets/"
 SAVE_FINETUNED_PATH = f"./finetuned_weight/{TASK_NAME}/"
 
-# 训练参数
-TRAIN_EPOCHS = 3
+TRAIN_EPOCHS = 5 if TASK_NAME == "cola" else 3
 LEARNING_RATE = 2e-5
-WEIGHT_DECAY = 0.01          # 【修复】添加权重衰减
-WARMUP_RATIO = 0.06          # 【修复】添加学习率预热
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.06
 MAX_SEQ_LENGTH = 128
 BATCH_SIZE = 8
 GRADIENT_ACCUMULATION_STEPS = 2
 LOG_STEP = 10
 NUM_LABELS = 3 if TASK_NAME == "mnli" else 2
+METRIC_FOR_BEST = "matthews_correlation" if TASK_NAME == "cola" else "accuracy"
 
-# 任务描述映射
 TASK_DESCRIPTIONS = {
     "mrpc": "句子对语义相似度判断",
-    "rte":  "句子对蕴含判断",
+    "rte": "句子对蕴含判断",
     "sst2": "情感分析（单句）",
     "mnli": "自然语言推断（premise/hypothesis，3 分类）",
+    "cola": "语言可接受性判断（单句，MCC）",
+    "qnli": "问答蕴含判断（question/sentence）",
 }
 # ============================================
 
@@ -50,55 +52,67 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ 使用设备：{device}")
 print(f"✅ 当前任务：{TASK_NAME.upper()} - {TASK_DESCRIPTIONS[TASK_NAME]}")
 print(f"✅ 分类类别数：{NUM_LABELS}")
+print(f"✅ 最优模型指标：{METRIC_FOR_BEST}")
 
 
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = predictions.argmax(axis=1)
-    return {"accuracy": float(accuracy_score(labels, predictions))}
+    metrics = {"accuracy": float(accuracy_score(labels, predictions))}
+    if TASK_NAME == "cola":
+        metrics["matthews_correlation"] = float(matthews_corrcoef(labels, predictions))
+    return metrics
 
 
-# 1. 加载模型和分词器
 print(f"\n✅ 加载本地预训练BERT模型：{LOCAL_MODEL_PATH}")
 tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
 model = AutoModelForSequenceClassification.from_pretrained(
     LOCAL_MODEL_PATH, num_labels=NUM_LABELS
 )
 
-# 2. 加载数据集
 data_path = os.path.join(LOCAL_DATA_ROOT, TASK_NAME)
 print(f"✅ 加载本地数据集：{data_path}")
 dataset = load_from_disk(data_path)
 
-# 3. 数据预处理（根据任务类型自动切换）
+
 def preprocess_function(examples):
-    if TASK_NAME == "sst2":
+    if TASK_NAME in ("sst2", "cola"):
         return tokenizer(
             examples["sentence"],
             truncation=True,
-            max_length=MAX_SEQ_LENGTH
+            max_length=MAX_SEQ_LENGTH,
         )
     if TASK_NAME == "mnli":
         return tokenizer(
             examples["premise"],
             examples["hypothesis"],
             truncation=True,
-            max_length=MAX_SEQ_LENGTH
+            max_length=MAX_SEQ_LENGTH,
         )
-    # mrpc, rte（双句任务）
+    if TASK_NAME == "qnli":
+        return tokenizer(
+            examples["question"],
+            examples["sentence"],
+            truncation=True,
+            max_length=MAX_SEQ_LENGTH,
+        )
     return tokenizer(
         examples["sentence1"],
         examples["sentence2"],
         truncation=True,
-        max_length=MAX_SEQ_LENGTH
+        max_length=MAX_SEQ_LENGTH,
     )
 
-tokenized_dataset = dataset.map(preprocess_function, batched=True)
-# 【修复】不再手动 remove_columns，Trainer 会自动处理
 
+tokenized_dataset = dataset.map(preprocess_function, batched=True)
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-# 4. 训练参数
+steps_per_epoch = max(
+    1,
+    len(tokenized_dataset["train"]) // (BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS),
+)
+warmup_steps = int(WARMUP_RATIO * steps_per_epoch * TRAIN_EPOCHS)
+
 training_args = TrainingArguments(
     output_dir=SAVE_FINETUNED_PATH,
     num_train_epochs=TRAIN_EPOCHS,
@@ -106,26 +120,25 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     learning_rate=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,         # 【修复】
-    # warmup_ratio=WARMUP_RATIO,         # 【修复】
-    warmup_steps=int(0.06 * len(tokenized_dataset["train"])),
+    weight_decay=WEIGHT_DECAY,
+    warmup_steps=warmup_steps,
     logging_steps=LOG_STEP,
     logging_first_step=True,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    # overwrite_output_dir=True,
+    metric_for_best_model=METRIC_FOR_BEST,
+    greater_is_better=True,
     fp16=torch.cuda.is_available(),
     report_to="none",
     disable_tqdm=False,
-    seed=42,                           # 【新增】明确随机种子
+    seed=42,
 )
 
-# 6. 回调：打印训练进度
+
 class PrintProgressCallback(TrainerCallback):
     def __init__(self):
-        super().__init__()             # 【修复】调用父类 init
+        super().__init__()
         self.is_training = False
 
     def on_train_begin(self, args, state, control, **kwargs):
@@ -135,9 +148,9 @@ class PrintProgressCallback(TrainerCallback):
         self.is_training = False
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if self.is_training and logs and 'loss' in logs:
-            loss = logs.get('loss', 'N/A')
-            lr = logs.get('learning_rate', 'N/A')
+        if self.is_training and logs and "loss" in logs:
+            loss = logs.get("loss", "N/A")
+            lr = logs.get("learning_rate", "N/A")
             loss_str = f"{float(loss):.4f}" if isinstance(loss, (int, float)) else str(loss)
             lr_str = f"{float(lr):.2e}" if isinstance(lr, (int, float)) else str(lr)
             print(f"  Step {state.global_step} | loss: {loss_str} | lr: {lr_str}")
@@ -146,65 +159,71 @@ class PrintProgressCallback(TrainerCallback):
         if self.is_training:
             print(f"\n✅ Epoch {state.epoch} 完成！")
 
-# 7. 初始化 Trainer
+
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_dataset["train"],
     eval_dataset=tokenized_dataset["validation"],
-    # tokenizer=tokenizer,
     processing_class=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[PrintProgressCallback()],  # 【修复】传实例而非类
+    callbacks=[PrintProgressCallback()],
 )
 
-# 8. 评估初始模型
 print("\n📊 评估【未微调】的初始模型性能...")
 initial_results = trainer.evaluate()
-initial_acc = initial_results['eval_accuracy']
+initial_acc = initial_results["eval_accuracy"]
+initial_mcc = initial_results.get("eval_matthews_correlation")
 print(f"初始验证集准确率：{initial_acc:.4f}")
+if initial_mcc is not None:
+    print(f"初始验证集 MCC：    {initial_mcc:.4f}")
 
-# 9. 开始训练
 print(f"\n🚀 开始微调 BERT on {TASK_NAME.upper()} 数据集...")
 print(f"   有效批大小：{BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
 print(f"   训练样本数：{len(tokenized_dataset['train'])}")
 print(f"   验证样本数：{len(tokenized_dataset['validation'])}")
 trainer.train()
 
-# 10. 保存最优模型
 trainer.save_model(SAVE_FINETUNED_PATH)
-tokenizer.save_pretrained(SAVE_FINETUNED_PATH)  # 【新增】确保 tokenizer 也保存
+tokenizer.save_pretrained(SAVE_FINETUNED_PATH)
 print(f"\n🎉 微调完成！最优模型已保存至：{SAVE_FINETUNED_PATH}")
 
-# 11. 最终验证集评估（使用 load_best_model_at_end 加载的最优模型）
 print(f"\n📊 在 {TASK_NAME.upper()} 验证集上评估最终最优模型...")
 val_results = trainer.evaluate()
-val_acc = val_results['eval_accuracy']
-val_loss = val_results['eval_loss']
-best_val_acc = trainer.state.best_metric
+val_acc = val_results["eval_accuracy"]
+val_loss = val_results["eval_loss"]
+val_mcc = val_results.get("eval_matthews_correlation")
+best_val_metric = trainer.state.best_metric
 print(f"✅ 最终验证集准确率：{val_acc:.4f}")
 print(f"✅ 最终验证集损失：  {val_loss:.4f}")
+if val_mcc is not None:
+    print(f"✅ 最终验证集 MCC：   {val_mcc:.4f}")
 
-# 12. 测试集说明
-# 【修复】GLUE 三个数据集的 test set 标签全部是 -1，不做评估
-print(f"\nℹ️  跳过测试集评估（GLUE 测试集标签均为 -1，未公开）")
-print(f"   如需提交测试集预测，请使用 GLUE Benchmark 官网提交。")
+print("\nℹ️  跳过测试集评估（GLUE 测试集标签均为 -1，未公开）")
 
-# 13. 计算提升幅度
 acc_improvement = val_acc - initial_acc
 acc_improvement_pct = (acc_improvement / max(initial_acc, 1e-8)) * 100
 
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print(f"📈 微调效果对比 - {TASK_NAME.upper()}")
-print(f"{'='*60}")
+print(f"{'=' * 60}")
 print(f"   微调前验证集准确率：{initial_acc:.4f}")
 print(f"   微调后验证集准确率：{val_acc:.4f}")
 print(f"   绝对提升：          +{acc_improvement:.4f}")
 print(f"   相对提升：          +{acc_improvement_pct:.2f}%")
-print(f"{'='*60}")
+if val_mcc is not None and initial_mcc is not None:
+    print(f"   微调前 MCC：        {initial_mcc:.4f}")
+    print(f"   微调后 MCC：        {val_mcc:.4f}")
+print(f"{'=' * 60}")
 
-# 14. 生成详细 README 报告（包含微调前后对比）
+mcc_row = ""
+if val_mcc is not None and initial_mcc is not None:
+    mcc_row = (
+        f"| 验证集 MCC | {initial_mcc:.4f} | {val_mcc:.4f} | "
+        f"**{val_mcc - initial_mcc:+.4f}** |\n"
+    )
+
 readme_content = f"""# BERT 微调结果报告 - {TASK_NAME.upper()} 数据集
 
 > 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -235,6 +254,7 @@ readme_content = f"""# BERT 微调结果报告 - {TASK_NAME.upper()} 数据集
 | 单卡批大小 | {BATCH_SIZE} |
 | 梯度累积步数 | {GRADIENT_ACCUMULATION_STEPS} |
 | 有效批大小 | {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS} |
+| 最优模型指标 | {METRIC_FOR_BEST} |
 | 随机种子 | 42 |
 
 ---
@@ -255,7 +275,7 @@ readme_content = f"""# BERT 微调结果报告 - {TASK_NAME.upper()} 数据集
 |------|--------|--------|------|
 | 验证集准确率 | {initial_acc:.4f} | {val_acc:.4f} | **+{acc_improvement:.4f}** (+{acc_improvement_pct:.2f}%) |
 | 验证集损失 | - | {val_loss:.4f} | - |
-| 训练最优轮次 | - | Best (自动选择) | - |
+{mcc_row}| 训练最优轮次 | - | Best (自动选择) | - |
 
 ### 关键结论
 
@@ -277,25 +297,10 @@ readme_content = f"""# BERT 微调结果报告 - {TASK_NAME.upper()} 数据集
 ## 六、训练策略说明
 
 - 使用 `load_best_model_at_end=True`，自动保存验证集上最优的模型
-- 评估指标：`accuracy`
+- 评估指标：`{METRIC_FOR_BEST}`
 - 每个 epoch 结束后进行一次验证集评估
 - FP16 混合精度训练，减少显存占用
 - 梯度累积 {GRADIENT_ACCUMULATION_STEPS} 步，等效增大批大小
-
----
-
-## 七、文件清单
-
-```
-{SAVE_FINETUNED_PATH}
-├── config.json              # 模型配置
-├── model.safetensors        # 模型权重
-├── tokenizer.json           # 分词器
-├── tokenizer_config.json    # 分词器配置
-├── special_tokens_map.json  # 特殊 token 映射
-├── vocab.txt                # 词表
-└── README.md                # 本报告
-```
 """
 
 readme_path = os.path.join(SAVE_FINETUNED_PATH, "README.md")
@@ -303,16 +308,19 @@ with open(readme_path, "w", encoding="utf-8") as f:
     f.write(readme_content)
 print(f"\n📄 详细训练报告已生成：{readme_path}")
 
-# 15. 额外保存一份纯文本摘要（方便脚本解析）
 summary_path = os.path.join(SAVE_FINETUNED_PATH, "result_summary.txt")
 with open(summary_path, "w", encoding="utf-8") as f:
     f.write(f"task={TASK_NAME}\n")
     f.write(f"initial_val_acc={initial_acc:.6f}\n")
     f.write(f"final_val_acc={val_acc:.6f}\n")
     f.write(f"final_val_loss={val_loss:.6f}\n")
+    if val_mcc is not None:
+        f.write(f"initial_val_mcc={initial_mcc:.6f}\n")
+        f.write(f"final_val_mcc={val_mcc:.6f}\n")
     f.write(f"acc_improvement={acc_improvement:.6f}\n")
     f.write(f"acc_improvement_pct={acc_improvement_pct:.2f}\n")
-    f.write(f"best_val_acc={best_val_acc:.6f}\n")
+    f.write(f"best_val_metric={best_val_metric:.6f}\n")
+    f.write(f"metric_for_best={METRIC_FOR_BEST}\n")
     f.write(f"epochs={TRAIN_EPOCHS}\n")
     f.write(f"learning_rate={LEARNING_RATE}\n")
     f.write(f"weight_decay={WEIGHT_DECAY}\n")
@@ -322,8 +330,10 @@ with open(summary_path, "w", encoding="utf-8") as f:
     f.write(f"timestamp={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 print(f"📄 结果摘要已保存：{summary_path}")
 
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print(f"🎉 {TASK_NAME.upper()} 微调全部完成！")
 print(f"   模型权重：{SAVE_FINETUNED_PATH}")
 print(f"   验证准确率：{initial_acc:.4f} → {val_acc:.4f} (+{acc_improvement:.4f})")
-print(f"{'='*60}")
+if val_mcc is not None and initial_mcc is not None:
+    print(f"   验证 MCC：    {initial_mcc:.4f} → {val_mcc:.4f}")
+print(f"{'=' * 60}")

@@ -1,4 +1,4 @@
-"""进化搜索与 Pareto 汇报共用的验证集推理评估。"""
+"""进化搜索与 Pareto 汇报共用的推理评估（validation / calib）。"""
 from __future__ import annotations
 
 import csv
@@ -9,21 +9,21 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from datasets import load_from_disk
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 from transformers import DataCollatorWithPadding
 
 from cost import SCHEME_LEN, compute_scheme_cost
 from poly_model_inference import (
+    CALIB_INDICES_DIR,
+    CALIB_SEED,
     FINETUNED_MODEL_ROOT,
-    LOCAL_DATA_ROOT,
     SCHEME_ORIGINAL,
+    _load_raw_eval_split,
     _warmup_poly_kernels,
     abnormal_output_mask,
     apply_polynomial_scheme,
     compute_flips_pct,
-    fmt_oor_pct,
     get_preprocess_fn,
     install_eager_attention_poly_patch,
     mean_output_kl,
@@ -47,16 +47,44 @@ def format_elapsed(seconds: float) -> str:
 
 
 def save_search_timings(output_dir: str, timings: list[tuple[str, float]]) -> str:
-    """写入各任务进化搜索用时（秒）。"""
+    """合并写入各任务进化搜索用时（秒）。
+
+    已有 CSV：同名 task 覆盖，新 task 追加；不写 total 行。
+    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, "search_timings.csv")
+
+    merged: dict[str, float] = {}
+    order: list[str] = []
+    if os.path.isfile(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                task = (row.get("task") or "").strip()
+                if not task or task == "total":
+                    continue
+                try:
+                    seconds = float(row["search_seconds"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if task not in merged:
+                    order.append(task)
+                merged[task] = seconds
+
+    for task_name, elapsed_s in timings:
+        if task_name == "total":
+            continue
+        if task_name not in merged:
+            order.append(task_name)
+        merged[task_name] = float(elapsed_s)
+
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["task", "search_seconds", "search_time"])
-        for task_name, elapsed_s in timings:
-            writer.writerow([task_name, f"{elapsed_s:.2f}", format_elapsed(elapsed_s)])
-        total = sum(elapsed_s for _, elapsed_s in timings)
-        writer.writerow(["total", f"{total:.2f}", format_elapsed(total)])
+        for task_name in order:
+            elapsed_s = merged[task_name]
+            writer.writerow(
+                [task_name, f"{elapsed_s:.2f}", format_elapsed(elapsed_s)]
+            )
     return path
 
 
@@ -81,17 +109,30 @@ class SchemeEvalResult:
 
 
 class SchemeEvaluator:
-    """固定验证子集 + 单模型；scheme→KL / acc / loss 带缓存。"""
+    """固定评估子集 + 单模型；scheme→KL / acc / loss 带缓存。
+
+    eval_split:
+      - validation：官方验证集
+      - calib：coverage_metric 落盘索引对应的 train 校验子集
+    """
 
     def __init__(
         self,
         task_name: str,
         *,
-        eval_samples: int | None = 200,
+        eval_samples: int | None = 256,
         seed: int = 42,
+        eval_split: str = "validation",
+        calib_seed: int = CALIB_SEED,
+        calib_indices_dir: str = CALIB_INDICES_DIR,
     ) -> None:
+        if eval_split not in ("validation", "calib"):
+            raise ValueError(
+                f"eval_split 须为 validation/calib，得到 {eval_split!r}"
+            )
         self.task_name = task_name
         self.eval_samples = eval_samples
+        self.eval_split = eval_split
         self._cache: dict[tuple[int, ...], SchemeEvalResult] = {}
         self._acc_cache: dict[tuple[int, ...], float] = {}
 
@@ -102,21 +143,27 @@ class SchemeEvaluator:
         install_eager_attention_poly_patch()
         self.tokenizer, self.model, _ = _load_tokenizer_and_model(task_name)
 
-        data_path = os.path.join(LOCAL_DATA_ROOT, task_name)
-        dataset = load_from_disk(data_path)
-        val = dataset["validation"]
-        n_total = len(val)
+        split, split_desc = _load_raw_eval_split(
+            task_name,
+            eval_split=eval_split,
+            calib_seed=calib_seed,
+            calib_indices_dir=calib_indices_dir,
+        )
+        n_total = len(split)
 
         if eval_samples is not None and eval_samples < n_total:
             rng = random.Random(seed)
             indices = sorted(rng.sample(range(n_total), eval_samples))
-            val = val.select(indices)
-            self.eval_desc = f"{eval_samples}/{n_total} 条（seed={seed} 固定）"
+            split = split.select(indices)
+            self.eval_desc = (
+                f"{eval_split} {eval_samples}/{n_total} 条"
+                f"（seed={seed} 固定；{split_desc}）"
+            )
         else:
-            self.eval_desc = f"全部 {n_total} 条"
+            self.eval_desc = f"{eval_split} 全部 {n_total} 条（{split_desc}）"
 
-        drop_cols = [c for c in val.column_names if c != "label"]
-        self.eval_dataset = val.map(
+        drop_cols = [c for c in split.column_names if c != "label"]
+        self.eval_dataset = split.map(
             get_preprocess_fn(task_name, self.tokenizer),
             batched=True,
             remove_columns=drop_cols,
@@ -342,7 +389,7 @@ class SchemeEvaluator:
 
 
 def enrich_pareto_report(task_name: str, archive, scheme_eval: SchemeEvaluator) -> None:
-    """全验证集单遍推理，刷新 Pareto 解汇报指标。"""
+    """在 scheme_eval 对应评估集上单遍推理，刷新 Pareto 解汇报指标。"""
     unique_schemes: dict[tuple[int, ...], list[int]] = {}
     for ind in archive.items:
         key = tuple(ind.scheme)
@@ -351,7 +398,7 @@ def enrich_pareto_report(task_name: str, archive, scheme_eval: SchemeEvaluator) 
 
     n_unique = len(unique_schemes)
     print(
-        f"  全验证集汇报评估 {n_unique} 个 Pareto 方案"
+        f"  汇报评估 {n_unique} 个 Pareto 方案"
         f"（{scheme_eval.eval_desc}）..."
     )
     metrics_by_key: dict[tuple[int, ...], SchemeEvalResult] = {}

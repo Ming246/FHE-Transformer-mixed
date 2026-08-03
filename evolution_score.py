@@ -2,24 +2,24 @@
 多目标进化搜索 POLY_SCHEMES 的 Pareto 前沿（替代 ILP 固定预算单解）。
 
 目标（均越小越好）：
-  f_loss = Σ_j S_{j,k_j}   （敏感度得分和，来自 CSV）
+  f_loss = Σ_j S_{j,k_j}   （敏感度得分和；默认读校验集上算出的 CSV）
   f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)（C_bts 未实现前为 depth 占位）
 
 支配关系（x1 支配 x2）：
   x1 在所有目标上都不比 x2 差，且在至少一个目标上严格更好。
 
-  loss：相对容差 LOSS_REL_TOL=10% —
+  loss：相对容差 LOSS_REL_TOL —
         严格更好当 L(x1) < (1-τ)·L(x2)；不比 x2 差当 L(x1) ≤ (1+τ)·L(x2)
   cost：f_cost 严格整数比较，小者优，无容差（depth / bts 均同）
 
 非法个体：交叉在合法父代下不产生非法解；初始化/变异若非法则重生成。
-Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿输出。
+Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿。
 
-评估后写出两份 CSV：
-  {task}_pareto_full.csv — 完整 Pareto（含 OOR 等列）
-  {task}_pareto.csv      — 按 total_depth 筛选：排除 oor≠0；
-                           每深度至多保留 KL 最小与翻转率最小各一
-                           （翻转率并列时取 KL 更小）；列更精简供下游读取
+推理汇报（默认开启）：
+  1) 全量校验集评估 archive
+  2) 按 total_depth 过滤：排除 OOR / 非有限 KL；同深度只保留 KL 最小方案
+  3) 写出 {task}_pareto_calib.csv（仅过滤后解）
+  4) 再在全量验证集上评估过滤后解，写出 {task}_pareto_validation.csv
 """
 from __future__ import annotations
 
@@ -43,9 +43,10 @@ from cost import (
 )
 from gelu_poly import gelu_level_allowed
 from evolution_infer import format_elapsed, save_search_timings
+from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "cola", "qnli", "mnli"]
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
 POLY_LEVELS = (0, 1, 2)
 EVOLUTION_RESULTS_ROOT = "./results/evolution_results/"
@@ -79,10 +80,10 @@ MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 300
 RANDOM_SEED = 42
 
-# loss 目标单一相对容差（10%）；由 τ 导出严格 / 不差阈值
+# loss 目标单一相对容差；由 τ 导出严格 / 不差阈值
 LOSS_REL_TOL = 0.02
-LOSS_STRICT_RATIO = 1.0 - LOSS_REL_TOL   # 0.9
-LOSS_NOT_WORSE_RATIO = 1.0 + LOSS_REL_TOL  # 1.1
+LOSS_STRICT_RATIO = 1.0 - LOSS_REL_TOL
+LOSS_NOT_WORSE_RATIO = 1.0 + LOSS_REL_TOL
 
 RUN_INFERENCE_ON_ARCHIVE = True
 # ==================================================
@@ -537,52 +538,32 @@ def _finite_or_inf(x: float) -> float:
     return float(x) if math.isfinite(x) else float("inf")
 
 
-def filter_pareto_depth_representatives(
-    items: list[Individual],
-) -> list[Individual]:
+def filter_pareto_depth_min_kl(items: list[Individual]) -> list[Individual]:
     """
-    评估后筛选：
-      · 丢弃 oor_count != 0
-      · 同一 total_depth：保留 KL 最小者，以及翻转率最小者
-        （翻转率相同时取 KL 更小）；二者可重合 → 每深度 ≤ 2 条
-    结果按 (total_depth, output_kl, flips_pct) 排序。
+    校验集评估后筛选：
+      · 丢弃 oor_count != 0 或非有限 output_kl
+      · 同一 total_depth：只保留 KL 最小者（并列看 f_loss）
+    结果按 (total_depth, output_kl) 排序。
     """
-    clean = [ind for ind in items if int(ind.oor_count) == 0]
+    clean = [
+        ind
+        for ind in items
+        if int(ind.oor_count) == 0 and math.isfinite(ind.output_kl)
+    ]
     by_depth: dict[int, list[Individual]] = defaultdict(list)
     for ind in clean:
         by_depth[int(ind.total_depth)].append(ind)
 
     selected: list[Individual] = []
     for depth in sorted(by_depth):
-        group = by_depth[depth]
-        best_kl = min(
-            group,
-            key=lambda x: (
-                _finite_or_inf(x.output_kl),
-                _finite_or_inf(x.flips_pct),
-                x.f_loss,
-            ),
+        best = min(
+            by_depth[depth],
+            key=lambda x: (_finite_or_inf(x.output_kl), x.f_loss),
         )
-        best_flip = min(
-            group,
-            key=lambda x: (
-                _finite_or_inf(x.flips_pct),
-                _finite_or_inf(x.output_kl),
-                x.f_loss,
-            ),
-        )
-        kept: list[Individual] = []
-        for cand in (best_kl, best_flip):
-            if cand not in kept:
-                kept.append(cand)
-        selected.extend(kept)
+        selected.append(best)
 
     selected.sort(
-        key=lambda x: (
-            int(x.total_depth),
-            _finite_or_inf(x.output_kl),
-            _finite_or_inf(x.flips_pct),
-        )
+        key=lambda x: (int(x.total_depth), _finite_or_inf(x.output_kl))
     )
     return selected
 
@@ -593,20 +574,14 @@ def save_pareto_csv(
     path: str,
     *,
     with_inference: bool,
-    compact: bool = False,
 ) -> None:
-    """
-    compact=True（新版下游文件）：去掉 task / rank_hint / oor_* / n_eval_used。
-    compact=False（完整存档）：保留全部汇报列。
-    """
+    """精简列：去掉 task / rank_hint / oor_* / n_eval_used。"""
+    from evolution_infer import fmt_flips_pct
     from poly_model_inference import fmt_metric_delta
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     mrpc = task_name == "mrpc"
-    if compact:
-        header = ["f_loss", "f_cost"]
-    else:
-        header = ["task", "rank_hint", "f_loss", "f_cost"]
+    header = ["f_loss", "f_cost"]
     if with_inference:
         header.extend(
             [
@@ -617,22 +592,15 @@ def save_pareto_csv(
                 "flips_pct",
             ]
         )
-        if not compact:
-            header.extend(["oor_count", "oor_pct", "n_eval_used"])
         if mrpc:
             header.append("f1_delta")
     header.append("scheme")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
-        for i, ind in enumerate(items, start=1):
-            if compact:
-                row: list = [f"{ind.f_loss:.8e}", ind.f_cost]
-            else:
-                row = [task_name, i, f"{ind.f_loss:.8e}", ind.f_cost]
+        for ind in items:
+            row: list = [f"{ind.f_loss:.8e}", ind.f_cost]
             if with_inference:
-                from evolution_infer import fmt_flips_pct, fmt_oor_pct
-
                 row.extend(
                     [
                         ind.total_depth,
@@ -642,14 +610,6 @@ def save_pareto_csv(
                         fmt_flips_pct(ind.flips_pct),
                     ]
                 )
-                if not compact:
-                    row.extend(
-                        [
-                            ind.oor_count,
-                            fmt_oor_pct(ind.oor_pct),
-                            ind.n_eval_used,
-                        ]
-                    )
                 if mrpc:
                     row.append(
                         fmt_metric_delta(ind.f1_delta)
@@ -660,6 +620,26 @@ def save_pareto_csv(
             writer.writerow(row)
 
 
+def _make_scheme_evaluator(
+    task_name: str,
+    *,
+    eval_split: str,
+    seed: int,
+    calib_seed: int,
+    calib_indices_dir: str,
+):
+    from evolution_infer import SchemeEvaluator
+
+    return SchemeEvaluator(
+        task_name,
+        eval_samples=None,
+        seed=seed,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="多目标进化搜索 POLY_SCHEMES Pareto 前沿（ΣS vs C_bts）"
@@ -668,7 +648,7 @@ def main() -> None:
         "--tasks",
         nargs="+",
         default=TASK_NAMES,
-        help="任务列表（默认 mrpc rte sst2）",
+        help="任务列表（默认 mrpc rte sst2 cola qnli mnli）",
     )
     parser.add_argument("--pop", type=int, default=POPULATION_SIZE, help="种群规模")
     parser.add_argument("--gens", type=int, default=NUM_GENERATIONS, help="进化代数")
@@ -682,7 +662,7 @@ def main() -> None:
     parser.add_argument(
         "--sensitive-dir",
         default=SENSITIVE_OUTPUT_DIR,
-        help="敏感度 CSV 目录",
+        help="敏感度 CSV 目录（默认 sensitive_scores_1，校验集上计算）",
     )
     parser.add_argument(
         "--output-dir",
@@ -694,9 +674,23 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--calib-seed",
+        type=int,
+        default=CALIB_SEED,
+        help=(
+            f"校验集索引 seed（默认 {CALIB_SEED}）；"
+            "读 {task}_calib_indices_seed{seed}.json"
+        ),
+    )
+    parser.add_argument(
+        "--calib-indices-dir",
+        default=CALIB_INDICES_DIR,
+        help="calib 索引 JSON 目录（coverage_metric 输出，只读）",
+    )
+    parser.add_argument(
         "--skip-inference",
         action="store_true",
-        help="跳过 Pareto 解的全验证集推理（仅输出 f_loss / f_cost）",
+        help="跳过推理汇报（仅按 f_loss/f_cost 写出未过滤 archive）",
     )
     args = parser.parse_args()
 
@@ -706,16 +700,24 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(
-        "多目标进化搜索"
-    )
+    print("多目标进化搜索（ΣS 来自校验集敏感度；汇报：校验集过滤 → 验证集）")
     print(
         f"pop={args.pop}, gens={args.gens}, seed={args.seed}, "
         f"cost_mode={args.cost_mode}, sensitive_dir={args.sensitive_dir}"
     )
     print(f"output_dir={args.output_dir}")
+    if with_inference:
+        print(
+            f"  calib indices: seed={args.calib_seed} "
+            f"dir={args.calib_indices_dir}（只读，不重建）"
+        )
 
     task_timings: list[tuple[str, float]] = []
+    eval_common = dict(
+        seed=args.seed,
+        calib_seed=args.calib_seed,
+        calib_indices_dir=args.calib_indices_dir,
+    )
 
     for task_name in args.tasks:
         try:
@@ -739,59 +741,67 @@ def main() -> None:
             f"{format_elapsed(search_elapsed_s)} ({search_elapsed_s:.2f}s)"
         )
 
-        if with_inference:
-            from evolution_infer import SchemeEvaluator, enrich_pareto_report
-
-            print(f"\n>>> {task_name.upper()}：Pareto 全验证集汇报...")
-            try:
-                report_eval = SchemeEvaluator(
-                    task_name,
-                    eval_samples=None,
-                    seed=args.seed,
-                )
-            except FileNotFoundError as exc:
-                print(f"  推理跳过：{exc}")
-                with_inference_task = False
-            else:
-                enrich_pareto_report(task_name, archive, report_eval)
-                with_inference_task = True
-        else:
-            with_inference_task = False
-
-        out_full = os.path.join(args.output_dir, f"{task_name}_pareto_full.csv")
-        full_items = archive.sorted_items()
-        save_pareto_csv(
-            task_name,
-            full_items,
-            out_full,
-            with_inference=with_inference_task,
-            compact=False,
-        )
-        print(f"已保存完整 Pareto：{out_full}  (n={len(full_items)})")
-
-        out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
-        if with_inference_task:
-            filtered = filter_pareto_depth_representatives(full_items)
+        if not with_inference:
+            out_path = os.path.join(args.output_dir, f"{task_name}_pareto.csv")
             save_pareto_csv(
                 task_name,
-                filtered,
-                out_path,
-                with_inference=True,
-                compact=True,
-            )
-            print(
-                f"已保存筛选 Pareto：{out_path}  "
-                f"(n={len(filtered)}；按深度去重+排除 OOR)"
-            )
-        else:
-            save_pareto_csv(
-                task_name,
-                full_items,
+                archive.sorted_items(),
                 out_path,
                 with_inference=False,
-                compact=True,
             )
             print(f"已保存：{out_path}  (无推理，未做深度筛选)")
+            continue
+
+        from evolution_infer import enrich_pareto_report
+
+        print(f"\n>>> {task_name.upper()}：Pareto 校验集评估...")
+        try:
+            calib_eval = _make_scheme_evaluator(
+                task_name, eval_split="calib", **eval_common
+            )
+        except FileNotFoundError as exc:
+            print(f"  校验集推理跳过：{exc}")
+            continue
+        print(f"  评估集：{calib_eval.eval_desc}")
+        enrich_pareto_report(task_name, archive, calib_eval)
+
+        full_n = len(archive.items)
+        filtered = filter_pareto_depth_min_kl(archive.sorted_items())
+        archive.items = filtered
+        print(
+            f"  深度过滤：{full_n} → {len(filtered)} "
+            f"（同 total_depth 仅留 KL 最小；已排除 OOR）"
+        )
+
+        out_calib = os.path.join(
+            args.output_dir, f"{task_name}_pareto_calib.csv"
+        )
+        save_pareto_csv(
+            task_name, filtered, out_calib, with_inference=True
+        )
+        print(f"已保存校验集 Pareto：{out_calib}  (n={len(filtered)})")
+
+        print(f"\n>>> {task_name.upper()}：过滤解验证集评估...")
+        try:
+            val_eval = _make_scheme_evaluator(
+                task_name, eval_split="validation", **eval_common
+            )
+        except FileNotFoundError as exc:
+            print(f"  验证集推理跳过：{exc}")
+            continue
+        print(f"  评估集：{val_eval.eval_desc}")
+        enrich_pareto_report(task_name, archive, val_eval)
+
+        out_val = os.path.join(
+            args.output_dir, f"{task_name}_pareto_validation.csv"
+        )
+        save_pareto_csv(
+            task_name,
+            archive.sorted_items(),
+            out_val,
+            with_inference=True,
+        )
+        print(f"已保存验证集 Pareto：{out_val}  (n={len(archive.items)})")
 
     if task_timings:
         timings_path = save_search_timings(args.output_dir, task_timings)

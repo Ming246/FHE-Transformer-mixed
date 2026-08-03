@@ -1,16 +1,23 @@
 """
 多项式近似 BERT 推理
-按 per-dataset 方案数组替换各层 Softmax / GeLU / LayerNorm，在验证集上评估并与原始模型对比。
+按 per-dataset 方案数组替换各层 Softmax / GeLU / LayerNorm，在验证集/校验集上评估并与原始模型对比。
 
 方案数组顺序（长度 48 = 12 层 × 4）：
   [layer0_softmax, layer0_ln1, layer0_gelu, layer0_ln2,
    layer1_softmax, layer1_ln1, layer1_gelu, layer1_ln2, ...]
 元素 0 / 1 / 2 / 3 分别表示低 / 中 / 高多项式方案 / 原始函数。
+
+用法：
+  python3 poly_model_inference.py                         # 默认 all：校验集+验证集
+  python3 poly_model_inference.py --eval-split validation # 仅验证集
+  python3 poly_model_inference.py --eval-split calib      # 仅校验集
 """
+import argparse
+import functools
+import json
+import math
 import os
 import types
-import functools
-import math
 
 import numpy as np
 import torch
@@ -26,16 +33,28 @@ from transformers import (
 )
 
 # ===================== 配置区 =====================
-#TASK_NAMES = ["mrpc", "rte", "sst2"]
-TASK_NAMES = ["rte"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+#TASK_NAMES = ["rte"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 
 MAX_SEQ_LENGTH = 128
 NUM_LAYERS = 12
-NUM_LABELS = 2
+TASK_NUM_LABELS: dict[str, int] = {
+    "mrpc": 2,
+    "rte": 2,
+    "sst2": 2,
+    "cola": 2,
+    "qnli": 2,
+    "mnli": 3,
+}
 SCHEME_SLOTS_PER_LAYER = 4
 SCHEME_LEN = NUM_LAYERS * SCHEME_SLOTS_PER_LAYER
+
+DEFAULT_EVAL_SPLIT = "all"  # "all" | "validation" | "calib"
+CALIB_SEED = 42
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIB_INDICES_DIR = os.path.join(_SCRIPT_DIR, "results", "coverage_metrics")
 
 # per-dataset 方案：key=数据集名，value=长度 48 的 0/1/2/3 数组
 SCHEME_ORIGINAL = 3
@@ -90,26 +109,44 @@ def normalize_scheme(
 
 def _init_poly_schemes() -> dict[str, list[int]]:
     raw: dict[str, list[int]] = {
-        # "mrpc": [
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 1, 1,
-        # ],
+        "mrpc": [
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+        ],
         "rte": [
-            3, 3, 3, 3,   3, 3, 3, 3,   3, 3, 3, 3,
-            3, 3, 3, 3,   3, 3, 2, 3,   3, 3, 2, 3,
-            3, 3, 2, 3,   3, 3, 2, 3,   3, 3, 2, 3,
-            3, 3, 2, 3,   3, 3, 2, 3,    3, 3, 2, 3,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
         ], #rte数据集第四层gelu有问题
-        # "sst2": [
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-        #     1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
-        # ],
-        # "mrpc": [2, 1, 2, 2, 2, 0, 0, 0, 2, 2, 0, 2, 2, 2, 0, 0, 2, 0, 2, 2, 0, 1, 0, 0, 0, 2, 2, 0, 0, 2, 2, 2, 0, 2, 2, 0, 0, 0, 2, 2, 2, 0, 2, 2, 0, 0, 2, 2],
-        #"rte": [2]*48
+        "sst2": [
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+        ],
+        "cola": [
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+        ],
+        "qnli": [
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+        ],
+        "mnli": [
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+        ],
+        # "mrpc": [0]*48,
+        # "rte": [0]*48,
         # "sst2": [0]*48,
     }
     return {
@@ -578,11 +615,37 @@ def _parse_validation_metrics(task_name: str, val_results: dict) -> dict[str, fl
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def task_num_labels(task_name: str) -> int:
+    if task_name not in TASK_NUM_LABELS:
+        raise KeyError(f"未知任务 {task_name}，请在 TASK_NUM_LABELS 中配置")
+    return TASK_NUM_LABELS[task_name]
+
+
 def get_preprocess_fn(task_name: str, tokenizer):
-    if task_name == "sst2":
+    if task_name in ("sst2", "cola"):
 
         def fn(examples):
             return tokenizer(
+                examples["sentence"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "mnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["premise"],
+                examples["hypothesis"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "qnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["question"],
                 examples["sentence"],
                 truncation=True,
                 max_length=MAX_SEQ_LENGTH,
@@ -609,7 +672,7 @@ def _load_tokenizer_and_model(task_name: str):
     tokenizer = AutoTokenizer.from_pretrained(finetuned_model_path)
     model = AutoModelForSequenceClassification.from_pretrained(
         finetuned_model_path,
-        num_labels=NUM_LABELS,
+        num_labels=task_num_labels(task_name),
         attn_implementation="eager",
     )
     model = model.to(device)
@@ -617,16 +680,96 @@ def _load_tokenizer_and_model(task_name: str):
     return tokenizer, model, finetuned_model_path
 
 
-def _load_tokenized_validation(task_name: str, tokenizer):
+def _calib_indices_path(task_name: str, seed: int, indices_dir: str) -> str:
+    return os.path.join(indices_dir, f"{task_name}_calib_indices_seed{seed}.json")
+
+
+def load_calib_indices_json(
+    task_name: str, seed: int, indices_dir: str
+) -> tuple[list[int], dict]:
+    """必须存在 coverage_metric 落盘索引；禁止现场重建。"""
+    path = _calib_indices_path(task_name, seed, indices_dir)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"校验集索引不存在：{path}；请先运行 coverage_metric.py 生成"
+        )
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    if "indices" not in payload or not payload["indices"]:
+        raise ValueError(f"校验集索引为空或缺少 indices：{path}")
+    indices = [int(i) for i in payload["indices"]]
+    meta = {k: v for k, v in payload.items() if k != "indices"}
+    meta["indices_path"] = path
+    return indices, meta
+
+
+def _load_raw_eval_split(
+    task_name: str,
+    *,
+    eval_split: str,
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+):
+    """返回 (raw_dataset_split, 描述字符串)。"""
+    if eval_split not in ("validation", "calib"):
+        raise ValueError(
+            f"未知 eval_split={eval_split!r}，可选 validation / calib"
+        )
     data_path = os.path.join(LOCAL_DATA_ROOT, task_name)
     dataset = load_from_disk(data_path)
-    validation = dataset["validation"]
-    drop_cols = [c for c in validation.column_names if c != "label"]
-    return validation.map(
+    if eval_split == "validation":
+        split = dataset["validation"]
+        return split, f"validation (n={len(split)})"
+    if "train" not in dataset:
+        raise KeyError(f"{task_name} 缺少 train，无法构造校验集")
+    indices, meta = load_calib_indices_json(
+        task_name, calib_seed, calib_indices_dir
+    )
+    n_train = len(dataset["train"])
+    bad = [i for i in indices if i < 0 or i >= n_train]
+    if bad:
+        raise IndexError(
+            f"{task_name} 校验集索引越界（train n={n_train}），例：{bad[:5]}"
+        )
+    split = dataset["train"].select(indices)
+    desc = (
+        f"calib n={len(indices)} seed={calib_seed} "
+        f"← {meta.get('indices_path')} "
+        f"(file calib_size={meta.get('calib_size', '?')})"
+    )
+    return split, desc
+
+
+def _load_tokenized_eval_split(
+    task_name: str,
+    tokenizer,
+    *,
+    eval_split: str = "validation",
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+):
+    raw_split, split_desc = _load_raw_eval_split(
+        task_name,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
+    )
+    drop_cols = [c for c in raw_split.column_names if c != "label"]
+    tokenized = raw_split.map(
         get_preprocess_fn(task_name, tokenizer),
         batched=True,
         remove_columns=drop_cols,
+        desc=f"tokenize {task_name}/{eval_split}",
     )
+    return tokenized, split_desc
+
+
+def _load_tokenized_validation(task_name: str, tokenizer):
+    """兼容旧接口：仅验证集。"""
+    tokenized, _ = _load_tokenized_eval_split(
+        task_name, tokenizer, eval_split="validation"
+    )
+    return tokenized
 
 
 def evaluate_on_validation(
@@ -653,14 +796,14 @@ def evaluate_on_validation(
 @torch.no_grad()
 def collect_output_logits(
     model,
-    tokenized_validation,
+    tokenized_eval,
     tokenizer,
     batch_size: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """验证集分类 logits 与 labels，顺序与 tokenized_validation 一致。"""
+    """评估集分类 logits 与 labels，顺序与 tokenized_eval 一致。"""
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     loader = DataLoader(
-        tokenized_validation,
+        tokenized_eval,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=data_collator,
@@ -715,8 +858,15 @@ def _warmup_poly_kernels(model, scheme: list[int]) -> None:
             layer.output.LayerNorm.forward(ln_warmup)
 
 
-def run_poly_inference(task_name: str, scheme: list[int]) -> dict:
-    """加载微调模型 → 应用多项式方案 → 验证集评估。"""
+def run_poly_inference(
+    task_name: str,
+    scheme: list[int],
+    *,
+    eval_split: str = "validation",
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+) -> dict:
+    """加载微调模型 → 应用多项式方案 → 指定 split 评估。"""
     scheme = normalize_scheme(scheme, task_name=task_name)
 
     print(f"{task_name.upper()}：{scheme}")
@@ -724,36 +874,63 @@ def run_poly_inference(task_name: str, scheme: list[int]) -> dict:
     install_eager_attention_poly_patch()
 
     tokenizer, model, model_path = _load_tokenizer_and_model(task_name)
-    tokenized_validation = _load_tokenized_validation(task_name, tokenizer)
+    tokenized_eval, split_desc = _load_tokenized_eval_split(
+        task_name,
+        tokenizer,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
+    )
+    print(f"  评估数据：{split_desc}")
 
     apply_polynomial_scheme(model, scheme, task_name)
     with torch.no_grad():
         _warmup_poly_kernels(model, scheme)
-        logits, labels = collect_output_logits(
-            model, tokenized_validation, tokenizer
-        )
+        logits, labels = collect_output_logits(model, tokenized_eval, tokenizer)
     metrics = evaluate_logits_metrics(logits, labels, task_name)
     total_depth = int(compute_scheme_cost(task_name, scheme))
 
     return {
         "task": task_name,
+        "eval_split": eval_split,
+        "split_desc": split_desc,
         "scheme": scheme,
         "total_depth": total_depth,
         **metrics,
     }
 
 
-def run_task_with_comparison(task_name: str, scheme: list[int]) -> dict:
+def run_task_with_comparison(
+    task_name: str,
+    scheme: list[int],
+    *,
+    eval_split: str = "validation",
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+) -> dict:
+    """在单个 split（validation 或 calib）上对比 baseline vs poly。"""
+    if eval_split not in ("validation", "calib"):
+        raise ValueError(
+            f"run_task_with_comparison 的 eval_split 须为 validation/calib，"
+            f"得到 {eval_split!r}"
+        )
     scheme = normalize_scheme(scheme, task_name=task_name)
-    print(f"{task_name.upper()}：{scheme}")
+    print(f"{task_name.upper()} [{eval_split}]：{scheme}")
 
     install_eager_attention_poly_patch()
     tokenizer, model, _ = _load_tokenizer_and_model(task_name)
-    tokenized_validation = _load_tokenized_validation(task_name, tokenizer)
+    tokenized_eval, split_desc = _load_tokenized_eval_split(
+        task_name,
+        tokenizer,
+        eval_split=eval_split,
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
+    )
+    print(f"  评估数据：{split_desc}")
 
     with torch.no_grad():
         logits_baseline, labels = collect_output_logits(
-            model, tokenized_validation, tokenizer
+            model, tokenized_eval, tokenizer
         )
     baseline = evaluate_logits_metrics(logits_baseline, labels, task_name)
     baseline["task"] = task_name
@@ -762,7 +939,7 @@ def run_task_with_comparison(task_name: str, scheme: list[int]) -> dict:
     with torch.no_grad():
         _warmup_poly_kernels(model, scheme)
         logits_poly, _ = collect_output_logits(
-            model, tokenized_validation, tokenizer
+            model, tokenized_eval, tokenizer
         )
     poly = evaluate_logits_metrics(
         logits_poly, labels, task_name, baseline_logits=logits_baseline
@@ -784,6 +961,8 @@ def run_task_with_comparison(task_name: str, scheme: list[int]) -> dict:
 
     result = {
         "task": task_name,
+        "eval_split": eval_split,
+        "split_desc": split_desc,
         "baseline_accuracy": baseline["val_accuracy"],
         "baseline_loss": baseline["val_loss"],
         "poly_accuracy": poly["val_accuracy"],
@@ -812,24 +991,37 @@ def run_task_with_comparison(task_name: str, scheme: list[int]) -> dict:
     return result
 
 
-def main():
-    results = []
-    for task_name in TASK_NAMES:
-        if task_name not in POLY_SCHEMES:
-            print(f"未配置方案，跳过：{task_name}")
-            continue
-        scheme = normalize_scheme(POLY_SCHEMES[task_name], task_name=task_name)
-        results.append(run_task_with_comparison(task_name, scheme))
+def run_task_with_comparison_all(
+    task_name: str,
+    scheme: list[int],
+    *,
+    calib_seed: int = CALIB_SEED,
+    calib_indices_dir: str = CALIB_INDICES_DIR,
+) -> list[dict]:
+    """先独立评估校验集，再独立评估验证集。"""
+    common = dict(
+        calib_seed=calib_seed,
+        calib_indices_dir=calib_indices_dir,
+    )
+    r_calib = run_task_with_comparison(
+        task_name, scheme, eval_split="calib", **common
+    )
+    r_val = run_task_with_comparison(
+        task_name, scheme, eval_split="validation", **common
+    )
+    return [r_calib, r_val]
 
+
+def _print_summary(results: list[dict]) -> None:
     print(f"\n{'=' * 60}")
     print("汇总（近似 vs 原始）")
     print(f"{'=' * 60}")
     print(
-        f"{'任务':<6} {'深度和':<6} "
+        f"{'任务':<6} {'split':<8} {'深度和':<6} "
         f"{'Δ准确率':<10} {'Δ损失':<10} "
         f"{'Output KL':<12} {'异常%':<8} {'flips%':<8}"
     )
-    print("-" * 110)
+    print("-" * 120)
     for r in results:
         flips_s = (
             f"{r['flips_pct']:.2f}%"
@@ -838,6 +1030,7 @@ def main():
         )
         print(
             f"{r['task']:<8} "
+            f"{r.get('eval_split', 'validation'):<8} "
             f"{r['total_depth']:<6} "
             f"{fmt_accuracy_delta(r['accuracy_delta']):<13} "
             f"{r['loss_delta']:+.7f}{'':<3} "
@@ -847,19 +1040,85 @@ def main():
         )
         if r["task"] == "mrpc":
             print(
-                f"         {'F1':<6} "
-                # f"{fmt_accuracy(r['baseline_f1']):<13} "
-                # f"{fmt_accuracy(r['poly_f1']):<13} "
+                f"         {'':8} {'F1':<6} "
                 f"{fmt_metric_delta(r['f1_delta'])}"
             )
-            # print(
-            #     f"         {'GLUE':<6} "
-            #     f"{fmt_accuracy(r['baseline_glue']):<13} "
-            #     f"{fmt_accuracy(r['poly_glue']):<13} "
-            #     f"{fmt_metric_delta(r['glue_delta'])}  "
-            #     f"(acc+f1)/2"
-            # )
 
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="多项式近似 BERT 推理：验证集/校验集评估"
+    )
+    parser.add_argument(
+        "--eval-split",
+        choices=("all", "validation", "calib"),
+        default=DEFAULT_EVAL_SPLIT,
+        help=(
+            "评估数据：all=校验集+验证集（默认）；"
+            "validation=官方验证集；calib=train 分层校验集"
+        ),
+    )
+    parser.add_argument(
+        "--calib-seed",
+        type=int,
+        default=CALIB_SEED,
+        help=(
+            f"仅 calib/all：读取 {{task}}_calib_indices_seed{{seed}}.json "
+            f"（默认 {CALIB_SEED}）"
+        ),
+    )
+    parser.add_argument(
+        "--calib-indices-dir",
+        default=CALIB_INDICES_DIR,
+        help="calib 索引 JSON 目录（coverage_metric 输出，只读）",
+    )
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        help="任务名列表；默认用配置区 TASK_NAMES",
+    )
+    args = parser.parse_args(argv)
+
+    tasks = args.tasks if args.tasks else list(TASK_NAMES)
+    print(f"eval-split：{args.eval_split}")
+    if args.eval_split in ("calib", "all"):
+        print(
+            f"  calib indices: seed={args.calib_seed} "
+            f"dir={args.calib_indices_dir}（只读，不重建）"
+        )
+
+    results: list[dict] = []
+    for task_name in tasks:
+        if task_name not in POLY_SCHEMES:
+            print(f"未配置方案，跳过：{task_name}")
+            continue
+        scheme = normalize_scheme(POLY_SCHEMES[task_name], task_name=task_name)
+        try:
+            if args.eval_split == "all":
+                results.extend(
+                    run_task_with_comparison_all(
+                        task_name,
+                        scheme,
+                        calib_seed=args.calib_seed,
+                        calib_indices_dir=args.calib_indices_dir,
+                    )
+                )
+            else:
+                results.append(
+                    run_task_with_comparison(
+                        task_name,
+                        scheme,
+                        eval_split=args.eval_split,
+                        calib_seed=args.calib_seed,
+                        calib_indices_dir=args.calib_indices_dir,
+                    )
+                )
+        except FileNotFoundError as e:
+            print(f"跳过 {task_name}：{e}")
+
+    if results:
+        _print_summary(results)
 
 
 if __name__ == "__main__":

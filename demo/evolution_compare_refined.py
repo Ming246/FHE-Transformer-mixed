@@ -137,7 +137,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="对比 ΣS1 / ΣαS(nnls) / KL 三条 Pareto"
     )
-    parser.add_argument("--tasks", nargs="+", default=["mrpc", "rte", "sst2"])
+    parser.add_argument("--tasks", nargs="+", default=["mrpc", "rte", "sst2", "cola", "qnli", "mnli"])
     parser.add_argument("--output", default=OUTPUT_PDF)
     parser.add_argument("--score1-dir", default=EVOLUTION_S1_DIR)
     parser.add_argument(

@@ -1,4 +1,5 @@
-__pycache__/ 
+__pycache__/
+HE/cache/
 *.pyc
 .idea/
 node_modules/

@@ -2,12 +2,16 @@
 校验集（从 train 分层抽样）校准各层非线性 [min,max]，
 在验证集（评估集）上统计覆盖率。
 
-默认校验集规模（分层）：
-  sst2 — 512
-  mrpc — 400
-  rte  — 400
+安全：默认不运行任何任务；必须显式传入 --tasks（如 --tasks mrpc），
+避免误跑覆盖已落盘、已被下游复用的校验集索引。
 
-支持 --convergence 扫描 n∈{128,256,512,1024,2048} 的区间收敛曲线；
+抽样（默认）：
+  1) 按 label × 长度分层，先抽 pool = calib_size × OVERSAMPLE_RATIO
+  2) 在 pool 上前向，标出各 slot 贡献全局 min/max 的样本（强制保留）
+  3) 剩余名额再分层补足到 calib_size（极值样本过多时可略大于目标）
+
+默认校验集规模：各任务见 TASK_CALIB_DEFAULTS。
+
 支持 --calib-seeds 多随机种子稳定性报告。
 """
 from __future__ import annotations
@@ -21,6 +25,9 @@ import math
 import os
 import random
 
+# DataLoader fork 前禁用 tokenizers 并行，避免刷屏警告（不影响抽样/前向逻辑）
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -28,26 +35,36 @@ from datetime import datetime
 
 import torch
 import torch.nn.functional as F
-from datasets import Dataset, load_from_disk
+from datasets import Dataset, disable_progress_bar, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
+    logging as hf_logging,
 )
 
+disable_progress_bar()
+hf_logging.set_verbosity_error()
+
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 OUTPUT_DIR = "./results/coverage_metrics/"
 
 MAX_SEQ_LENGTH = 128
 NUM_LAYERS = 12
-NUM_LABELS = 2
+TASK_NUM_LABELS: dict[str, int] = {
+    "mrpc": 2,
+    "rte": 2,
+    "sst2": 2,
+    "cola": 2,
+    "qnli": 2,
+    "mnli": 3,
+}
 
 NONLINEAR_NAMES = ["Softmax", "LayerNorm1", "GeLU", "LayerNorm2"]
-CONVERGENCE_SIZES = [128, 256, 400,512, 1024, 2048]
 N_LEN_BINS = 5
 DEFAULT_CALIB_SEED = 42
 SCORE_VALID_THRESHOLD = -1e4
@@ -61,9 +78,14 @@ VAL_LN_VAR_MAX_SCALE = 1.2    # 验证方差上界 = calib_max × scale
 
 TASK_CALIB_DEFAULTS: dict[str, dict[str, int]] = {
     "sst2": {"calib_size": 512},
-    "mrpc": {"calib_size": 400},
-    "rte": {"calib_size": 400},
+    "mrpc": {"calib_size": 256},
+    "rte": {"calib_size": 256},
+    "cola": {"calib_size": 256},
+    "qnli": {"calib_size": 512},
+    "mnli": {"calib_size": 512},
 }
+# 先抽更大 pool，再保留极值样本并缩到 calib_size；1.0 = 关闭过采样
+DEFAULT_CALIB_OVERSAMPLE_RATIO = 4.0
 # ==================================================
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -287,6 +309,7 @@ def build_calibration_indices(
     calib_size: int,
     seed: int,
 ) -> tuple[list[int], dict]:
+    """仅分层抽样（无过采样 / 无极值保留）。"""
     labels = _get_labels(tokenized_train)
     valid_lens = compute_valid_lengths(tokenized_train)
     indices = stratified_sample_indices(calib_size, labels, valid_lens, seed=seed)
@@ -294,8 +317,420 @@ def build_calibration_indices(
         "seed": seed,
         "calib_size": calib_size,
         "total_calib": len(indices),
+        "oversample_ratio": 1.0,
+        "pool_size": len(indices),
+        "n_extreme_kept": 0,
     }
     return indices, meta
+
+
+def resolve_pool_size(calib_size: int, n_train: int, oversample_ratio: float) -> int:
+    if calib_size <= 0:
+        return 0
+    if oversample_ratio <= 1.0:
+        return min(calib_size, n_train)
+    return min(n_train, max(calib_size, int(math.ceil(calib_size * oversample_ratio))))
+
+
+@dataclass
+class SlotExtremeState:
+    min_val: float = field(default_factory=lambda: float("inf"))
+    max_val: float = field(default_factory=lambda: float("-inf"))
+    min_sample: int | None = None
+    max_sample: int | None = None
+
+
+@dataclass
+class ExtremeTracker:
+    """在 pool（0..n_pool-1）上跟踪各 slot 的全局 min/max 及贡献样本。"""
+
+    slots: dict[str, SlotExtremeState] = field(default_factory=dict)
+
+    def _slot(self, key: str) -> SlotExtremeState:
+        if key not in self.slots:
+            self.slots[key] = SlotExtremeState()
+        return self.slots[key]
+
+    def consider(self, key: str, value: float, sample_idx: int) -> None:
+        if not math.isfinite(value):
+            return
+        st = self._slot(key)
+        if value < st.min_val:
+            st.min_val = value
+            st.min_sample = sample_idx
+        if value > st.max_val:
+            st.max_val = value
+            st.max_sample = sample_idx
+
+    def consider_sample_minmax(
+        self, key: str, sample_min: float, sample_max: float, sample_idx: int
+    ) -> None:
+        self.consider(key, sample_min, sample_idx)
+        self.consider(key, sample_max, sample_idx)
+
+    def extreme_sample_indices(self) -> set[int]:
+        out: set[int] = set()
+        for st in self.slots.values():
+            if st.min_sample is not None:
+                out.add(int(st.min_sample))
+            if st.max_sample is not None:
+                out.add(int(st.max_sample))
+        return out
+
+    def to_ranges(self) -> dict[str, dict[str, float]]:
+        ranges = create_empty_ranges()
+        for key, st in self.slots.items():
+            if key not in ranges:
+                continue
+            if math.isfinite(st.min_val):
+                ranges[key]["min"] = st.min_val
+            if math.isfinite(st.max_val):
+                ranges[key]["max"] = st.max_val
+        return ranges
+
+
+def _update_softmax_extremes(
+    tracker: ExtremeTracker,
+    ranges: dict[str, dict[str, float]],
+    key: str,
+    scores: torch.Tensor,
+    query_mask_2d: torch.Tensor | None,
+    batch_offset: int,
+) -> None:
+    s = scores.detach()
+    valid = scores_valid_mask(s)
+    if query_mask_2d is not None:
+        b, h, q, k = s.shape
+        q_mask = query_mask_2d[:, :q].to(device=s.device).bool()
+        query_row_valid = q_mask.unsqueeze(1).expand(-1, h, -1)
+        valid = valid & query_row_valid.unsqueeze(-1)
+    if bool(valid.any()):
+        vals = s[valid]
+        ranges[key]["min"] = min(ranges[key]["min"], float(vals.min().item()))
+        ranges[key]["max"] = max(ranges[key]["max"], float(vals.max().item()))
+    bsz = int(s.shape[0])
+    for bi in range(bsz):
+        vb = valid[bi]
+        if not bool(vb.any()):
+            continue
+        sample_vals = s[bi][vb]
+        tracker.consider_sample_minmax(
+            key,
+            float(sample_vals.min().item()),
+            float(sample_vals.max().item()),
+            batch_offset + bi,
+        )
+
+
+def _update_gelu_extremes(
+    tracker: ExtremeTracker,
+    ranges: dict[str, dict[str, float]],
+    key: str,
+    tensor: torch.Tensor,
+    batch_offset: int,
+) -> None:
+    x = tensor.detach()
+    ranges[key]["min"] = min(ranges[key]["min"], float(x.min().item()))
+    ranges[key]["max"] = max(ranges[key]["max"], float(x.max().item()))
+    bsz = int(x.shape[0])
+    flat = x.reshape(bsz, -1)
+    for bi in range(bsz):
+        row = flat[bi]
+        tracker.consider_sample_minmax(
+            key,
+            float(row.min().item()),
+            float(row.max().item()),
+            batch_offset + bi,
+        )
+
+
+def _update_ln_extremes(
+    tracker: ExtremeTracker,
+    ranges: dict[str, dict[str, float]],
+    key: str,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    batch_offset: int,
+) -> None:
+    x = hidden_states.detach()
+    bsz = int(x.shape[0])
+    for bi in range(bsz):
+        rows = x[bi]
+        if attention_mask is not None:
+            m = attention_mask[bi].to(device=rows.device).bool()
+            rows = rows[m]
+        if rows.numel() == 0:
+            continue
+        vars_t = _LN.population_var_batched(rows)
+        vmin = float(vars_t.min().item())
+        vmax = float(vars_t.max().item())
+        ranges[key]["min"] = min(ranges[key]["min"], vmin)
+        ranges[key]["max"] = max(ranges[key]["max"], vmax)
+        tracker.consider_sample_minmax(key, vmin, vmax, batch_offset + bi)
+
+
+def register_extreme_calib_hooks(
+    model,
+    ranges: dict[str, dict[str, float]],
+    tracker: ExtremeTracker,
+) -> HookState:
+    """前向时同步更新区间，并记录贡献 min/max 的 pool 内样本下标。"""
+    state = HookState()
+
+    for layer_idx in range(NUM_LAYERS):
+        layer = model.bert.encoder.layer[layer_idx]
+
+        softmax_key = slot_key(layer_idx, "Softmax")
+        attn_self = layer.attention.self
+        orig_forward = attn_self.forward
+
+        def make_softmax_patched(orig_fn, key, attn_module, bert_model):
+            @functools.wraps(orig_fn)
+            def patched_forward(
+                hidden_states,
+                attention_mask=None,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                past_key_value=None,
+                output_attentions=False,
+                **kwargs,
+            ):
+                scores = compute_masked_attention_scores(
+                    attn_module,
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                )
+                offset = int(getattr(bert_model, "_extreme_batch_offset", 0))
+                query_mask = getattr(attn_module, "_coverage_query_mask", None)
+                _update_softmax_extremes(
+                    tracker, ranges, key, scores, query_mask, offset
+                )
+                return orig_fn(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    **kwargs,
+                )
+
+            return patched_forward
+
+        attn_self.forward = make_softmax_patched(
+            orig_forward, softmax_key, attn_self, model
+        )
+        state.forward_restores.append((attn_self, orig_forward))
+
+        gelu_key = slot_key(layer_idx, "GeLU")
+        act_fn = layer.intermediate.intermediate_act_fn
+        if isinstance(act_fn, torch.nn.Module):
+
+            def make_gelu_hook(key, bert_model):
+                def hook_fn(module, inp, out):
+                    offset = int(getattr(bert_model, "_extreme_batch_offset", 0))
+                    _update_gelu_extremes(tracker, ranges, key, inp[0], offset)
+
+                return hook_fn
+
+            state.module_hooks.append(
+                act_fn.register_forward_hook(make_gelu_hook(gelu_key, model))
+            )
+        else:
+            intermediate = layer.intermediate
+            orig_inter = intermediate.forward
+
+            def make_gelu_inter(orig_fn, key, bert_model):
+                @functools.wraps(orig_fn)
+                def patched(*args, **kwargs):
+                    original_gelu = F.gelu
+
+                    def tracking_gelu(input, approximate="none"):
+                        offset = int(getattr(bert_model, "_extreme_batch_offset", 0))
+                        _update_gelu_extremes(tracker, ranges, key, input, offset)
+                        return original_gelu(input, approximate=approximate)
+
+                    F.gelu = tracking_gelu
+                    try:
+                        return orig_fn(*args, **kwargs)
+                    finally:
+                        F.gelu = original_gelu
+
+                return patched
+
+            intermediate.forward = make_gelu_inter(orig_inter, gelu_key, model)
+            state.forward_restores.append((intermediate, orig_inter))
+
+        for kind, ln_module, ln_name in (
+            ("ln1", layer.attention.output.LayerNorm, "LayerNorm1"),
+            ("ln2", layer.output.LayerNorm, "LayerNorm2"),
+        ):
+            key = slot_key(layer_idx, ln_name)
+            orig_ln = ln_module.forward
+
+            def make_ln_patched(orig_fn, key_v, ln_mod, bert_model):
+                @functools.wraps(orig_fn)
+                def patched_forward(hidden_states, *args, **kwargs):
+                    offset = int(getattr(bert_model, "_extreme_batch_offset", 0))
+                    attn_mask = getattr(ln_mod, "_eval_ln_attn_mask", None)
+                    _update_ln_extremes(
+                        tracker, ranges, key_v, hidden_states, attn_mask, offset
+                    )
+                    return orig_fn(hidden_states, *args, **kwargs)
+
+                return patched_forward
+
+            ln_module.forward = make_ln_patched(orig_ln, key, ln_module, model)
+            state.forward_restores.append((ln_module, orig_ln))
+
+    return state
+
+
+@torch.no_grad()
+def collect_pool_extremes(
+    model, tokenized_pool: Dataset, collator
+) -> tuple[set[int], dict[str, dict[str, float]]]:
+    """在过采样 pool 上前向：返回极值样本（pool 内下标）与区间。"""
+    ranges = create_empty_ranges()
+    tracker = ExtremeTracker()
+    hook_state = register_extreme_calib_hooks(model, ranges, tracker)
+    loader = DataLoader(
+        tokenized_pool,
+        batch_size=BATCH_SIZE,
+        collate_fn=collator,
+        **_dataloader_kwargs(),
+    )
+    try:
+        offset = 0
+        for batch in loader:
+            batch = _batch_to_device(batch)
+            attn_mask = batch.get("attention_mask")
+            model._extreme_batch_offset = offset
+            if attn_mask is not None:
+                _LN.attach_attention_mask_to_layernorms(model, attn_mask)
+                attach_coverage_query_mask(model, attn_mask)
+            model(**batch)
+            _LN.clear_attention_mask_on_layernorms(model)
+            clear_coverage_query_mask(model)
+            offset += int(batch["labels"].shape[0])
+    finally:
+        restore_hooks(hook_state)
+        if hasattr(model, "_extreme_batch_offset"):
+            delattr(model, "_extreme_batch_offset")
+    return tracker.extreme_sample_indices(), ranges
+
+
+def select_pool_indices_keep_extremes(
+    pool_train_indices: list[int],
+    extreme_local: set[int],
+    *,
+    calib_size: int,
+    labels: list[int],
+    valid_lens: list[int],
+    seed: int,
+) -> tuple[list[int], dict]:
+    """
+    从 pool 缩到目标大小：先保留极值样本，再用分层抽样补足。
+    返回 train 下标列表与统计 meta。
+    """
+    n_pool = len(pool_train_indices)
+    must_local = sorted(i for i in extreme_local if 0 <= i < n_pool)
+    n_extreme = len(must_local)
+
+    if n_extreme >= calib_size:
+        # 极值已覆盖目标：全部保留（可略大于 calib_size）
+        chosen_local = must_local
+    else:
+        need = calib_size - n_extreme
+        remaining_local = [i for i in range(n_pool) if i not in extreme_local]
+        if need >= len(remaining_local):
+            chosen_local = sorted(set(must_local) | set(remaining_local))
+        else:
+            rem_labels = [labels[pool_train_indices[i]] for i in remaining_local]
+            rem_lens = [valid_lens[pool_train_indices[i]] for i in remaining_local]
+            # stratified_sample_indices 返回的是 remaining_local 内的下标
+            pick = stratified_sample_indices(
+                need, rem_labels, rem_lens, seed=seed + 17
+            )
+            fill_local = [remaining_local[j] for j in pick]
+            chosen_local = sorted(set(must_local) | set(fill_local))
+
+    train_indices = [pool_train_indices[i] for i in chosen_local]
+    meta = {
+        "n_extreme_kept": n_extreme,
+        "n_fill": max(0, len(train_indices) - n_extreme),
+        "final_size": len(train_indices),
+        "exceeded_target": len(train_indices) > calib_size,
+    }
+    return train_indices, meta
+
+
+def build_calibration_indices_oversampled(
+    model,
+    tokenized_train: Dataset,
+    collator,
+    *,
+    calib_size: int,
+    seed: int,
+    oversample_ratio: float = DEFAULT_CALIB_OVERSAMPLE_RATIO,
+) -> tuple[list[int], dict, dict[str, dict[str, float]] | None]:
+    """
+    过采样 pool → 标极值 → 缩到 calib_size。
+    返回 (train_indices, meta, pool_ranges_or_None)。
+    ratio<=1 时退化为普通分层抽样（不跑极值前向）。
+    """
+    labels = _get_labels(tokenized_train)
+    valid_lens = compute_valid_lengths(tokenized_train)
+    n_train = len(tokenized_train)
+    pool_size = resolve_pool_size(calib_size, n_train, oversample_ratio)
+
+    pool_indices = stratified_sample_indices(
+        pool_size, labels, valid_lens, seed=seed
+    )
+    meta: dict = {
+        "seed": seed,
+        "calib_size": calib_size,
+        "oversample_ratio": float(oversample_ratio),
+        "pool_size": len(pool_indices),
+    }
+
+    if oversample_ratio <= 1.0 or pool_size <= calib_size:
+        meta.update(
+            {
+                "total_calib": len(pool_indices),
+                "n_extreme_kept": 0,
+                "n_fill": len(pool_indices),
+                "final_size": len(pool_indices),
+                "exceeded_target": False,
+            }
+        )
+        return pool_indices, meta, None
+
+    print(
+        f"  过采样 pool={len(pool_indices)} "
+        f"(target={calib_size}, ratio={oversample_ratio:g})，扫描极值样本…"
+    )
+    pool_ds = tokenized_train.select(pool_indices)
+    extreme_local, pool_ranges = collect_pool_extremes(model, pool_ds, collator)
+    final_indices, sel_meta = select_pool_indices_keep_extremes(
+        pool_indices,
+        extreme_local,
+        calib_size=calib_size,
+        labels=labels,
+        valid_lens=valid_lens,
+        seed=seed,
+    )
+    meta.update(sel_meta)
+    meta["total_calib"] = len(final_indices)
+    print(
+        f"  极值保留 {sel_meta['n_extreme_kept']} + 分层补足 "
+        f"{sel_meta['n_fill']} → 最终 {len(final_indices)}"
+        + ("（略大于目标）" if sel_meta["exceeded_target"] else "")
+    )
+    return final_indices, meta, pool_ranges
 
 
 def save_calib_indices(
@@ -331,52 +766,6 @@ def update_element_range(ranges: dict[str, dict[str, float]], key: str, tensor: 
     t = tensor.detach()
     ranges[key]["min"] = min(ranges[key]["min"], float(t.min().item()))
     ranges[key]["max"] = max(ranges[key]["max"], float(t.max().item()))
-
-
-def merge_ranges(
-    dst: dict[str, dict[str, float]], src: dict[str, dict[str, float]]
-) -> None:
-    for key, ref in src.items():
-        if math.isfinite(ref["min"]):
-            dst[key]["min"] = min(dst[key]["min"], ref["min"])
-        if math.isfinite(ref["max"]):
-            dst[key]["max"] = max(dst[key]["max"], ref["max"])
-
-
-def range_relative_errors(
-    calib: dict[str, dict[str, float]],
-    reference: dict[str, dict[str, float]],
-) -> dict[str, dict[str, float]]:
-    out: dict[str, dict[str, float]] = {}
-    for key in calib:
-        c, r = calib[key], reference[key]
-        errs: dict[str, float] = {}
-        for side in ("min", "max"):
-            cv, rv = c[side], r[side]
-            if not (math.isfinite(cv) and math.isfinite(rv)):
-                errs[f"rel_err_{side}"] = float("nan")
-            elif abs(rv) < 1e-12:
-                errs[f"rel_err_{side}"] = abs(cv - rv)
-            else:
-                errs[f"rel_err_{side}"] = abs(cv - rv) / abs(rv)
-        span = r["max"] - r["min"]
-        if math.isfinite(span) and span > 1e-12:
-            errs["rel_err_span"] = max(
-                abs(c["min"] - r["min"]), abs(c["max"] - r["max"])
-            ) / span
-        else:
-            errs["rel_err_span"] = float("nan")
-        out[key] = errs
-    return out
-
-
-def max_range_relative_error(
-    calib: dict[str, dict[str, float]],
-    reference: dict[str, dict[str, float]],
-) -> float:
-    errs = range_relative_errors(calib, reference)
-    vals = [v["rel_err_span"] for v in errs.values() if math.isfinite(v["rel_err_span"])]
-    return max(vals) if vals else float("nan")
 
 
 @dataclass
@@ -790,11 +1179,37 @@ def finalize_layernorm_calib_ranges(
             ln_collector.release(layer_idx, kind)
 
 
+def task_num_labels(task_name: str) -> int:
+    if task_name not in TASK_NUM_LABELS:
+        raise KeyError(f"未知任务 {task_name}，请在 TASK_NUM_LABELS 中配置")
+    return TASK_NUM_LABELS[task_name]
+
+
 def get_preprocess_fn(task_name: str, tokenizer):
-    if task_name == "sst2":
+    if task_name in ("sst2", "cola"):
 
         def fn(examples):
             return tokenizer(
+                examples["sentence"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "mnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["premise"],
+                examples["hypothesis"],
+                truncation=True,
+                max_length=MAX_SEQ_LENGTH,
+            )
+
+    elif task_name == "qnli":
+
+        def fn(examples):
+            return tokenizer(
+                examples["question"],
                 examples["sentence"],
                 truncation=True,
                 max_length=MAX_SEQ_LENGTH,
@@ -831,11 +1246,13 @@ def load_model_and_data(task_name: str):
     dataset = load_from_disk(data_path)
     if "train" not in dataset:
         raise KeyError(f"{task_name} 数据集缺少 train split")
+    if "validation" not in dataset:
+        raise KeyError(f"{task_name} 数据集缺少 validation split")
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_path,
-        num_labels=NUM_LABELS,
+        num_labels=task_num_labels(task_name),
         attn_implementation="eager",
     )
     model.to(device)
@@ -908,7 +1325,8 @@ CALIB_RANGE_TABLE_COLUMNS: list[ColumnSpec] = [
     ("nonlinear", 12, "left", None),
     ("calib_min", 10, "right", 2),
     ("calib_max", 10, "right", 2),
-    ("stat_kind", 10, "left", None),
+    ("val_min", 10, "right", 2),
+    ("val_max", 10, "right", 2),
 ]
 
 
@@ -1009,6 +1427,7 @@ def save_task_outputs(
     rows: list[dict],
     output_dir: str,
     calib_meta: dict,
+    val_ranges: dict[str, dict[str, float]] | None = None,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1017,16 +1436,18 @@ def save_task_outputs(
     for layer_idx in range(NUM_LAYERS):
         for name in NONLINEAR_NAMES:
             key = slot_key(layer_idx, name)
-            kind = "variance" if name.startswith("LayerNorm") else "element"
-            range_rows.append(
-                {
-                    "layer": layer_idx,
-                    "nonlinear": name,
-                    "calib_min": ranges[key]["min"],
-                    "calib_max": ranges[key]["max"],
-                    "stat_kind": kind,
-                }
-            )
+            row = {
+                "layer": layer_idx,
+                "nonlinear": name,
+                "calib_min": ranges[key]["min"],
+                "calib_max": ranges[key]["max"],
+                "val_min": float("nan"),
+                "val_max": float("nan"),
+            }
+            if val_ranges is not None and key in val_ranges:
+                row["val_min"] = val_ranges[key]["min"]
+                row["val_max"] = val_ranges[key]["max"]
+            range_rows.append(row)
     write_aligned_table(range_path, CALIB_RANGE_TABLE_COLUMNS, range_rows)
 
     cov_path = os.path.join(output_dir, f"{task_name}_validation_coverage.csv")
@@ -1041,105 +1462,6 @@ def save_task_outputs(
     print(f"  校验集元信息：{meta_path}")
 
 
-def load_or_compute_reference_ranges(
-    task_name: str,
-    model,
-    tokenized_train: Dataset,
-    collator,
-    output_dir: str,
-    recompute: bool,
-) -> dict[str, dict[str, float]]:
-    ref_path = os.path.join(output_dir, f"{task_name}_full_train_reference_ranges.json")
-    if not recompute and os.path.exists(ref_path):
-        with open(ref_path, encoding="utf-8") as f:
-            raw = json.load(f)
-        return {k: {"min": v["min"], "max": v["max"]} for k, v in raw.items()}
-
-    print(f"  计算 full train 参考区间（{len(tokenized_train)} 条，可能较慢）…")
-    ref = collect_calib_ranges(model, tokenized_train, collator)
-    with open(ref_path, "w", encoding="utf-8") as f:
-        json.dump(ref, f, indent=2)
-    print(f"  参考区间已缓存：{ref_path}")
-    return ref
-
-
-def run_convergence_study(
-    task_name: str,
-    model,
-    tokenized_train: Dataset,
-    tokenized_val: Dataset,
-    collator,
-    output_dir: str,
-    reference: dict[str, dict[str, float]],
-    seed: int,
-) -> None:
-    rows: list[dict] = []
-    detail_rows: list[dict] = []
-
-    for calib_n in CONVERGENCE_SIZES:
-        if calib_n >= len(tokenized_train):
-            continue
-        indices, meta = build_calibration_indices(
-            tokenized_train,
-            calib_size=calib_n,
-            seed=seed,
-        )
-        calib_ds = tokenized_train.select(indices)
-        ranges = collect_calib_ranges(model, calib_ds, collator)
-        coverage_state = collect_validation_coverage(model, tokenized_val, collator, ranges)
-        max_rel = max_range_relative_error(ranges, reference)
-        mean_cov = coverage_state.all_layers_all_slots_pct()
-
-        rows.append(
-            {
-                "task": task_name,
-                "calib_n": calib_n,
-                "calib_total_n": len(indices),
-                "seed": seed,
-                "max_rel_err_span": max_rel,
-                "mean_sample_fully_in_range_pct": mean_cov,
-            }
-        )
-
-        errs = range_relative_errors(ranges, reference)
-        for key, err in errs.items():
-            layer_str, nl = key.split("_", 1)
-            layer_idx = int(layer_str.replace("Layer", ""))
-            detail_rows.append(
-                {
-                    "task": task_name,
-                    "calib_n": calib_n,
-                    "seed": seed,
-                    "layer": layer_idx,
-                    "nonlinear": nl,
-                    "calib_min": ranges[key]["min"],
-                    "calib_max": ranges[key]["max"],
-                    "ref_min": reference[key]["min"],
-                    "ref_max": reference[key]["max"],
-                    **err,
-                }
-            )
-        print(
-            f"    n={calib_n} total={len(indices)} "
-            f"max_rel_err_span={max_rel:.4f} mean_sample_cov={mean_cov:.2f}%"
-        )
-
-    summary_path = os.path.join(output_dir, f"{task_name}_calib_convergence.csv")
-    detail_path = os.path.join(output_dir, f"{task_name}_calib_convergence_detail.csv")
-    os.makedirs(output_dir, exist_ok=True)
-    if rows:
-        with open(summary_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"  收敛摘要：{summary_path}")
-    if detail_rows:
-        with open(detail_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(detail_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(detail_rows)
-
-
 def run_stability_study(
     task_name: str,
     model,
@@ -1150,14 +1472,19 @@ def run_stability_study(
     calib_size: int,
     n_seeds: int,
     base_seed: int,
+    *,
+    oversample_ratio: float = DEFAULT_CALIB_OVERSAMPLE_RATIO,
 ) -> None:
     rows: list[dict] = []
     for i in range(n_seeds):
         seed = base_seed + i
-        indices, meta = build_calibration_indices(
+        indices, meta, _ = build_calibration_indices_oversampled(
+            model,
             tokenized_train,
+            collator,
             calib_size=calib_size,
             seed=seed,
+            oversample_ratio=oversample_ratio,
         )
         calib_ds = tokenized_train.select(indices)
         ranges = collect_calib_ranges(model, calib_ds, collator)
@@ -1168,6 +1495,7 @@ def run_stability_study(
                 "task": task_name,
                 "seed": seed,
                 "calib_total_n": len(indices),
+                "n_extreme_kept": meta.get("n_extreme_kept", 0),
                 "mean_sample_fully_in_range_pct": mean_cov,
                 **{f"width_{k}": ranges[k]["max"] - ranges[k]["min"] for k in sorted(ranges)[:4]},
             }
@@ -1188,6 +1516,7 @@ def run_stability_study(
 class CalibConfig:
     calib_size: int
     seed: int = DEFAULT_CALIB_SEED
+    oversample_ratio: float = DEFAULT_CALIB_OVERSAMPLE_RATIO
 
 
 def resolve_calib_config(task_name: str, args) -> CalibConfig:
@@ -1195,6 +1524,7 @@ def resolve_calib_config(task_name: str, args) -> CalibConfig:
     return CalibConfig(
         calib_size=args.calib_size if args.calib_size is not None else defaults["calib_size"],
         seed=args.calib_seed,
+        oversample_ratio=float(args.oversample_ratio),
     )
 
 
@@ -1202,28 +1532,6 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
     print(f"\n>>> {task_name.upper()}")
     model, tokenized_train, tokenized_val, collator = load_model_and_data(task_name)
     cfg = resolve_calib_config(task_name, args)
-
-    if args.convergence:
-        reference = load_or_compute_reference_ranges(
-            task_name,
-            model,
-            tokenized_train,
-            collator,
-            output_dir,
-            recompute=args.recompute_reference,
-        )
-        print(f"  收敛扫描：n ∈ {CONVERGENCE_SIZES}")
-        run_convergence_study(
-            task_name,
-            model,
-            tokenized_train,
-            tokenized_val,
-            collator,
-            output_dir,
-            reference,
-            seed=cfg.seed,
-        )
-        return []
 
     if args.calib_seeds > 1:
         print(f"  多 seed 稳定性：{args.calib_seeds} 次（base_seed={cfg.seed}）")
@@ -1237,13 +1545,20 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
             cfg.calib_size,
             args.calib_seeds,
             cfg.seed,
+            oversample_ratio=cfg.oversample_ratio,
         )
 
-    print(f"  校验集：分层 n={cfg.calib_size}（seed={cfg.seed}）")
-    indices, meta = build_calibration_indices(
+    print(
+        f"  校验集：目标 n={cfg.calib_size}（seed={cfg.seed}, "
+        f"oversample×{cfg.oversample_ratio:g}）"
+    )
+    indices, meta, _pool_ranges = build_calibration_indices_oversampled(
+        model,
         tokenized_train,
+        collator,
         calib_size=cfg.calib_size,
         seed=cfg.seed,
+        oversample_ratio=cfg.oversample_ratio,
     )
     idx_path = save_calib_indices(task_name, indices, meta, output_dir, cfg.seed)
     print(f"  校验集索引：{idx_path}（共 {len(indices)} 条）")
@@ -1252,6 +1567,8 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
     ranges = collect_calib_ranges(model, calib_ds, collator)
 
     print(f"  评估集（validation）样本数：{len(tokenized_val)}")
+    print("  统计验证集原始区间（与校验集同定义，便于对比）…")
+    val_ranges = collect_calib_ranges(model, tokenized_val, collator)
     coverage_state = collect_validation_coverage(model, tokenized_val, collator, ranges)
     rows = build_result_rows(
         task_name,
@@ -1266,46 +1583,69 @@ def process_task(task_name: str, output_dir: str, args) -> list[dict]:
         "indices_path": idx_path,
         "eval_split": "validation",
     }
-    save_task_outputs(task_name, ranges, rows, output_dir, calib_meta)
+    save_task_outputs(
+        task_name, ranges, rows, output_dir, calib_meta, val_ranges=val_ranges
+    )
     return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="校验集（train 分层抽样）定区间 + validation 覆盖率"
+        description=(
+            "校验集（train 分层抽样）定区间 + validation 覆盖率。"
+            "必须显式指定 --tasks，否则不运行任何数据集。"
+        )
     )
-    parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
+    parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        metavar="TASK",
+        help=(
+            "要处理的任务名（必须显式指定；省略则不运行）。"
+            f"可选：{' '.join(TASK_NAMES)}"
+        ),
+    )
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     parser.add_argument(
         "--calib-size",
         type=int,
         default=None,
-        help="分层随机样本数（默认按任务：sst2=512, mrpc/rte=400）",
+        help="分层随机样本数（默认各任务见 TASK_CALIB_DEFAULTS）",
     )
     parser.add_argument("--calib-seed", type=int, default=DEFAULT_CALIB_SEED)
+    parser.add_argument(
+        "--oversample-ratio",
+        type=float,
+        default=DEFAULT_CALIB_OVERSAMPLE_RATIO,
+        help=(
+            "先分层抽 calib_size×ratio 的 pool，前向保留各 slot min/max 样本后再缩到目标；"
+            "设为 1 关闭过采样（旧行为）"
+        ),
+    )
     parser.add_argument(
         "--calib-seeds",
         type=int,
         default=1,
         help=">1 时额外输出多 seed 稳定性 CSV",
     )
-    parser.add_argument(
-        "--convergence",
-        action="store_true",
-        help=f"扫描 n∈{CONVERGENCE_SIZES} 相对 full train 的区间收敛",
-    )
-    parser.add_argument(
-        "--recompute-reference",
-        action="store_true",
-        help="强制重算 full train 参考区间（收敛模式）",
-    )
     args = parser.parse_args()
+
+    if not args.tasks:
+        print(
+            "未指定 --tasks：默认不运行任何数据集"
+            "（避免覆盖已有校验集索引）。"
+        )
+        print(f"示例：python3 coverage_metric.py --tasks mrpc")
+        print(f"可选任务：{' '.join(TASK_NAMES)}")
+        return
 
     os.makedirs(args.output_dir, exist_ok=True)
     if USE_CUDA:
         print(f"device={device} ({torch.cuda.get_device_name(device)})")
     else:
         print(f"device={device}")
+    print(f"任务：{args.tasks}")
     print(f"输出目录：{args.output_dir}")
     print(f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 

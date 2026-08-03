@@ -1,10 +1,17 @@
 """
-HE LayerNorm 近似：参数 + 实现（来源 nolinear/layernorm.py）。
+HE LayerNorm 近似：参数 + 实现（生产路径）。
+
+参数权威来源（本文件维护，nolinear/layernorm.py 只读）：
+  - W_BUFFER / VAR_MIN_SCALE / VAR_MAX_SCALE
+  - 三档 he_invsqrt max_iters（low/mid/high；high 应对齐 eval 调好的次数）
+
+nolinear/layernorm.py 仅保留 α 与单档 max_iters 用于带 α 的误差调参；
+调完后请把 max_iters 写回本文件对应任务的 high 档。
 
 M 缩放 + he_invsqrt；不含 CKKS 编码 bookend。
-方差区间来自 nolinear/variance_out/{task}_variance.json；
-he_invsqrt 固定跑 max_iters 步（无 α；α 仅留在 nolinear/layernorm.py 调参）；
-高中低精度档由 LAYER_INV_SQRT_MAX_ITERS_BY_TASK 区分。
+方差区间来自 nolinear/variance_out/{task}_variance.json
+（calib∪validation 原始 [min,max]）；使用时再 × VAR_MIN_SCALE / VAR_MAX_SCALE。
+he_invsqrt 固定跑 max_iters 步（无 α；α 仅留在 nolinear/layernorm.py 调参）。
 
 用法：
     from layernorm_poly import HeLayerNormPolyEvaluator, layernorm_config_for_layer
@@ -31,10 +38,13 @@ LAYERNORM_POLY_FUNC_NAMES: list[str] = [
     "poly_layernorm_high",
 ]
 
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 NUM_LAYERS = 12
 
 W_BUFFER = 1
+# JSON 存原始值，使用时放宽（eval / 生产共用）
+VAR_MIN_SCALE = 0.8
+VAR_MAX_SCALE = 1.2
 
 _VARIANCE_JSON_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "nolinear", "variance_out"
@@ -42,6 +52,7 @@ _VARIANCE_JSON_DIR = os.path.join(
 
 
 # task → level → {ln1, ln2} → 12 层 he_invsqrt 迭代次数（固定步数，无 α）
+# high = nolinear/layernorm.py 调参结果；mid/low 在 high 上递减
 LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
     "mrpc": {
         "low": {
@@ -74,15 +85,58 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
     "sst2": {
         "low": {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3],
-            "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 1],
+            "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
         "mid": {
             "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 2],
+            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
         },
         "high": {
             "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 3],
+            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        },
+    },
+    # cola/qnli/mnli：初值抄 mrpc，对齐 eval 后再调
+    "cola": {
+        "low": {
+            "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3],
+            "ln2": [2, 2, 3, 3, 3, 3, 3, 2, 3, 5, 5, 1],
+        },
+        "mid": {
+            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4],
+            "ln2": [3, 3, 4, 4, 4, 4, 4, 3, 4, 6, 6, 2],
+        },
+        "high": {
+            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
+            "ln2": [4, 4, 5, 5, 5, 5, 5, 4, 5, 7, 7, 3],
+        },
+    },
+    "qnli": {
+        "low": {
+            "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4],
+            "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
+        },
+        "mid": {
+            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
+            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        },
+        "high": {
+            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
+            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        },
+    },
+    "mnli": {
+        "low": {
+            "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4],
+            "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
+        },
+        "mid": {
+            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
+            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        },
+        "high": {
+            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
+            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
         },
     },
 }
@@ -91,6 +145,10 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
 def variance_json_path(task_name: str, json_dir: str = _VARIANCE_JSON_DIR) -> str:
     return os.path.join(json_dir, f"{task_name}_variance.json")
 
+
+def scaled_var_range(var_min: float, var_max: float) -> list[float]:
+    """JSON 原始区间 → 使用区间：min×VAR_MIN_SCALE，max×VAR_MAX_SCALE。"""
+    return [float(var_min) * VAR_MIN_SCALE, float(var_max) * VAR_MAX_SCALE]
 
 def _parse_variance_json(payload: dict) -> dict[str, list[list[float]]]:
     if "ln1" in payload and "ln2" in payload:
@@ -197,7 +255,8 @@ def layernorm_config_for_layer(
         raise ValueError(f"layer_idx 非法：{layer_idx}")
 
     level_key = LAYERNORM_LEVEL_KEYS[level]
-    min_var, max_var = _var_ranges_for_task(task_name)[kind][layer_idx]
+    raw_min, raw_max = _var_ranges_for_task(task_name)[kind][layer_idx]
+    min_var, max_var = scaled_var_range(raw_min, raw_max)
     invsqrt_max_iters = layer_invsqrt_max_iters_for_task(
         task_name, kind, level_key
     )[layer_idx]
@@ -207,6 +266,8 @@ def layernorm_config_for_layer(
         "kind": kind,
         "level": level,
         "level_name": level_key,
+        "raw_min_var": float(raw_min),
+        "raw_max_var": float(raw_max),
         "min_var": float(min_var),
         "max_var": float(max_var),
         "w_buffer": W_BUFFER,

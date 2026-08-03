@@ -19,7 +19,7 @@
 接入点（预留注释已存在）：
 
 - `evolution_score.compute_f_cost(..., cost_mode="bts")`
-- `evolution_kl.py` / `evolution_acc.py` 中同类 TODO：`optimize_bootstrap(task_name, scheme)`
+- `evolution_kl.py` / `evolution_score.py` 中同类 TODO：`optimize_bootstrap(task_name, scheme)`
 
 **不要**在未实现求解器前静默把 bts 当成 depth；接口应显式区分。
 

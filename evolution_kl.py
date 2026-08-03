@@ -2,11 +2,11 @@
 多目标进化搜索 POLY_SCHEMES 的 Pareto 前沿（Output KL vs C_bts）。
 
 目标：
-  f_output_kl = KL(p_baseline ‖ p_poly)（验证集平均，越小越好；严格比较，无容差）
+  f_output_kl = KL(p_baseline ‖ p_poly)（校验集平均，越小越好；严格比较，无容差）
   f_cost      = ceil(深度和 / COST_DEPTH_DIVISOR)（越小越好；严格比较，无容差）
 
-评估集：进化搜索默认使用全部验证集；可用 --eval-samples N 抽样子集加速。
-        Pareto 解最终汇报固定使用全部验证集。
+评估集：进化搜索默认使用全部校验集（calib）；可用 --eval-samples N 抽样子集加速。
+        Pareto 解最终分别在全部校验集与全部验证集上汇报，写出两个 CSV。
 输出 CSV：精简列（无 task/rank_hint/oor_*）；非有限 KL 搜索期不入 archive。
 """
 from __future__ import annotations
@@ -36,10 +36,14 @@ from evolution_infer import (
     save_search_timings,
 )
 from gelu_poly import gelu_level_allowed
-from poly_model_inference import fmt_metric_delta
-
+from poly_model_inference import (
+    CALIB_INDICES_DIR,
+    CALIB_SEED,
+    fmt_metric_delta,
+)
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte","sst2"]
+#TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["cola", "qnli", "mnli"]
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
@@ -51,7 +55,8 @@ TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 200
 RANDOM_SEED = 42
-EVAL_SAMPLE_SIZE: int | None = None  # None = 全部验证集
+EVAL_SAMPLE_SIZE: int | None = None  # None = 全部校验集
+SEARCH_EVAL_SPLIT = "calib"
 
 PROGRESS_EVERY = 10
 # ==================================================
@@ -525,7 +530,7 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="多目标进化（Output KL vs C_bts）"
+        description="多目标进化（Output KL vs C_bts；搜索用校验集）"
     )
     parser.add_argument("--tasks", nargs="+", default=TASK_NAMES)
     parser.add_argument("--pop", type=int, default=POPULATION_SIZE)
@@ -535,12 +540,26 @@ def main() -> None:
         "--eval-samples",
         type=int,
         default=EVAL_SAMPLE_SIZE,
-        help="进化搜索用验证集抽样条数；默认全部验证集",
+        help="进化搜索用校验集抽样条数；默认全部校验集",
     )
     parser.add_argument(
         "--eval-full",
         action="store_true",
-        help="进化搜索使用全部验证集（默认已是；保留兼容）",
+        help="进化搜索使用全部校验集（默认已是；保留兼容）",
+    )
+    parser.add_argument(
+        "--calib-seed",
+        type=int,
+        default=CALIB_SEED,
+        help=(
+            f"读取 {{task}}_calib_indices_seed{{seed}}.json "
+            f"（默认 {CALIB_SEED}）"
+        ),
+    )
+    parser.add_argument(
+        "--calib-indices-dir",
+        default=CALIB_INDICES_DIR,
+        help="calib 索引 JSON 目录（coverage_metric 输出，只读）",
     )
     parser.add_argument(
         "--cost-mode",
@@ -558,22 +577,35 @@ def main() -> None:
     )
     print(
         f"device={device}, pop={args.pop}, gens={args.gens}, seed={args.seed}, "
+        f"search_split={SEARCH_EVAL_SPLIT}, "
         f"eval={'full' if eval_samples is None else eval_samples}, "
         f"cost_mode={args.cost_mode}"
     )
+    print(
+        f"  calib indices: seed={args.calib_seed} "
+        f"dir={args.calib_indices_dir}（只读，不重建）"
+    )
 
     task_timings: list[tuple[str, float]] = []
+    eval_common = dict(
+        seed=args.seed,
+        calib_seed=args.calib_seed,
+        calib_indices_dir=args.calib_indices_dir,
+    )
 
     for task_name in args.tasks:
-        print(f"\n>>> {task_name.upper()}：加载模型与评估集...")
+        print(f"\n>>> {task_name.upper()}：加载模型与校验集...")
         try:
             scheme_eval = SchemeEvaluator(
-                task_name, eval_samples=eval_samples, seed=args.seed
+                task_name,
+                eval_samples=eval_samples,
+                eval_split=SEARCH_EVAL_SPLIT,
+                **eval_common,
             )
         except FileNotFoundError as exc:
             print(f"{task_name.upper()} 跳过：{exc}")
             continue
-        print(f"  评估集：{scheme_eval.eval_desc}")
+        print(f"  搜索评估集：{scheme_eval.eval_desc}")
         allowed_table = build_allowed_levels_table()
         print_eval_sanity(task_name, scheme_eval, allowed_table)
 
@@ -592,15 +624,27 @@ def main() -> None:
             f"  搜索用时：{format_elapsed(search_elapsed_s)} ({search_elapsed_s:.2f}s)"
         )
 
-        print(f"\n>>> {task_name.upper()}：Pareto 全验证集汇报...")
-        report_eval = SchemeEvaluator(
-            task_name, eval_samples=None, seed=args.seed
-        )
-        enrich_pareto_report(task_name, archive, report_eval)
-
-        out_path = os.path.join(args.output_dir, f"{task_name}_pareto_kl.csv")
-        save_pareto_csv(task_name, archive, out_path)
-        print(f"已保存：{out_path}")
+        for report_split, suffix in (
+            ("calib", "calib"),
+            ("validation", "validation"),
+        ):
+            print(f"\n>>> {task_name.upper()}：Pareto {report_split} 汇报...")
+            try:
+                report_eval = SchemeEvaluator(
+                    task_name,
+                    eval_samples=None,
+                    eval_split=report_split,
+                    **eval_common,
+                )
+            except FileNotFoundError as exc:
+                print(f"  跳过 {report_split} 汇报：{exc}")
+                continue
+            enrich_pareto_report(task_name, archive, report_eval)
+            out_path = os.path.join(
+                args.output_dir, f"{task_name}_pareto_kl_{suffix}.csv"
+            )
+            save_pareto_csv(task_name, archive, out_path)
+            print(f"已保存：{out_path}")
 
     if task_timings:
         timings_path = save_search_timings(args.output_dir, task_timings)

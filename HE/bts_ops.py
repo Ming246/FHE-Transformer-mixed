@@ -1,5 +1,5 @@
 """
-Bootstrapping 最优放置（实验模块，阶段 C 为主；A/B 为粗粒度对照）。
+Bootstrapping 最优放置（与 ``thor_encoder_linear_core`` / ``slot_*_he`` 同构）。
 
 阶段 C（默认）：
   - Softmax / GeLU / LN 微事件；函数内部可 bts
@@ -9,14 +9,28 @@ Bootstrapping 最优放置（实验模块，阶段 C 为主；A/B 为粗粒度�
 
 阶段 D：``run_phase_d_audit`` 自洽性检查（深度守恒、CT 链、join/DP）。
 
+非线性 depth：完全由 ``cost.*_poly_depth`` + 各任务/层/档配置拆解
+（aSOR iters、exp_div、Cheb 次数、invsqrt iters），**不**写死某任务或某档。
+线性 CT 条数：由 ``SlotCtGeometry.from_thor_config`` 从 slot 布局推导。
+
 不修改 cost.py；非线性 kind 的 depth 之和仍 = cost.*_poly_depth。
 """
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, ".."))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from cost import (
     BOOTSTRAP_DEPTH_BUDGET,
+    LAYERNORM_DEPTH_OVERHEAD,
     NUM_LAYERS,
     SOFTMAX_DEPTH_BASE,
     SOFTMAX_EXP_SQUARE_DEPTH,
@@ -29,7 +43,11 @@ from cost import (
     validate_scheme,
 )
 from gelu_poly import gelu_config_for_layer
-from layernorm_poly import count_he_invsqrt_iters, layernorm_config_for_layer
+from layernorm_poly import (
+    TASK_NAMES as LAYERNORM_TASK_NAMES,
+    count_he_invsqrt_iters,
+    layernorm_config_for_layer,
+)
 from nolinear.gelu_chebyshev import cheb_he_depth_ps_tree, gelu_he_depth_breakdown
 from softmax_poly import (
     LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK,
@@ -40,25 +58,107 @@ from softmax_poly import (
 )
 
 # ---------------------------------------------------------------------------
-# 实数路径 CT（占位：固定 BERT-base / 对照 THOR 工程布局）
-#
-# TODO(linear-ct)：全部线性段的密文数量与深度表可能不准确。
-#   - 当前 CT_HIDDEN=8 来自 THOR 对角 matmul 友好打包（槽位利用率低），
-#     并非 128×768÷32768 的容量下界（稠密打包约 3～4 CT）。
-#   - 后续：按 THOR 已发表论文的思想做「本土化」线性层模型——
-#     打包/旋转/副本规则可配置，支持 hidden/ffn/seq/heads 等规模自由变换，
-#     而非写死 base；再据此重标定 CT_* 与 DEPTH_*。非线性 bts DP 可复用。
+# Slot CT 几何（对齐 thor_encoder_linear_core.ThorConfig）
 # ---------------------------------------------------------------------------
 
-CT_HIDDEN = 8
-CT_ROTATED = 128  # hidden×16 或 Q×16 / softmax 出口复制
-CT_ATT_SCORE = 8
-CT_FFN = 16
-# Softmax Stockmeyer 段活密文峰值启发式：每路 ~8 个中间项 × 8 score CT
-CT_SOFTMAX_STOCKMEYER_PEAK = CT_ATT_SCORE * 8
+
+@dataclass(frozen=True)
+class SlotCtGeometry:
+    """
+    与 slot 流水线一致的密文条数。
+
+    bert_base 例：hidden/score=8, qkv_out=4, q_copies=64, pc_rot/alpha=128, ffn=16。
+    """
+
+    ct_hidden: int  # n_input_packs：残差 / LN / input_lower
+    ct_qkv_out: int  # n_out_packed_qkv：Q/K/V/Context 打包输出
+    ct_att_score: int  # score / Softmax 入口（= n_input_packs）
+    ct_pc_rot: int  # n_in_slot：PC-MM baby-step 旋转副本
+    ct_q_copies: int  # head_dim：make_copies_real(Q)
+    ct_alpha_copies: int  # seq_len：make_copies(alpha)
+    ct_ffn: int  # 2 × (seq_len/ff_pack)：FC1 block_diag_2 两路
+    # Stockmeyer(deg15) 活密文峰值启发式：每 score-CT 约 8 个中间项
+    stockmeyer_live_factor: int = 8
+
+    @classmethod
+    def from_thor_config(cls, cfg: object) -> SlotCtGeometry:
+        ff_out = int(cfg.seq_len) // int(cfg.ff_pack)
+        return cls(
+            ct_hidden=int(cfg.n_input_packs),
+            ct_qkv_out=int(cfg.n_out_packed_qkv),
+            ct_att_score=int(cfg.n_input_packs),
+            ct_pc_rot=int(cfg.n_in_slot),
+            ct_q_copies=int(cfg.head_dim),
+            ct_alpha_copies=int(cfg.seq_len),
+            ct_ffn=2 * ff_out,
+        )
+
+
+def default_slot_geometry() -> SlotCtGeometry:
+    from thor_encoder_linear_core import bert_base
+
+    cfg = bert_base()
+    cfg.validate()
+    return SlotCtGeometry.from_thor_config(cfg)
+
+
+def _softmax_copy_targets(ct_score: int, ct_alpha: int) -> tuple[int, ...]:
+    """ct_score → … → ct_alpha 的 2 幂膨胀台阶（depth=0；乘法在 copy_mask）。"""
+    if ct_alpha < ct_score:
+        raise ValueError(f"ct_alpha={ct_alpha} < ct_score={ct_score}")
+    if ct_alpha == ct_score:
+        return ()
+    targets: list[int] = []
+    t = ct_score * 2
+    while t < ct_alpha:
+        targets.append(t)
+        t *= 2
+    targets.append(ct_alpha)
+    return tuple(targets)
+
+
+# 模块级活动几何（build / audit 入口会 set）；默认 = bert_base
+_GEOM: SlotCtGeometry = default_slot_geometry()
+
+
+def set_slot_geometry(geom: SlotCtGeometry | None = None) -> SlotCtGeometry:
+    """设置活动 CT 几何；``None`` → bert_base。返回当前几何。"""
+    global _GEOM
+    global CT_HIDDEN, CT_QKV_OUT, CT_ROTATED, CT_ATT_SCORE, CT_Q_COPIES, CT_ALPHA
+    global CT_FFN, CT_SOFTMAX_STOCKMEYER_PEAK, SOFTMAX_COPY_TARGETS
+    _GEOM = default_slot_geometry() if geom is None else geom
+    CT_HIDDEN = _GEOM.ct_hidden
+    CT_QKV_OUT = _GEOM.ct_qkv_out
+    CT_ROTATED = _GEOM.ct_pc_rot
+    CT_ATT_SCORE = _GEOM.ct_att_score
+    CT_Q_COPIES = _GEOM.ct_q_copies
+    CT_ALPHA = _GEOM.ct_alpha_copies
+    CT_FFN = _GEOM.ct_ffn
+    CT_SOFTMAX_STOCKMEYER_PEAK = (
+        CT_ATT_SCORE * _GEOM.stockmeyer_live_factor
+    )
+    SOFTMAX_COPY_TARGETS = _softmax_copy_targets(CT_ATT_SCORE, CT_ALPHA)
+    return _GEOM
+
+
+def active_geometry() -> SlotCtGeometry:
+    return _GEOM
+
+
+# 兼容旧名：只读别名（随 set_slot_geometry 更新的是 _GEOM；下方常量用于文档/默认 bert_base）
+CT_HIDDEN = _GEOM.ct_hidden
+CT_QKV_OUT = _GEOM.ct_qkv_out
+CT_ROTATED = _GEOM.ct_pc_rot
+CT_ATT_SCORE = _GEOM.ct_att_score
+CT_Q_COPIES = _GEOM.ct_q_copies
+CT_ALPHA = _GEOM.ct_alpha_copies
+CT_FFN = _GEOM.ct_ffn
+CT_SOFTMAX_STOCKMEYER_PEAK = CT_ATT_SCORE * _GEOM.stockmeyer_live_factor
+SOFTMAX_COPY_TARGETS = _softmax_copy_targets(CT_ATT_SCORE, CT_ALPHA)
 
 # ---------------------------------------------------------------------------
-# 线性深度（THOR 注释占位；与上 TODO 一并重标定）
+# 线性乘法深度（占位；非线性已与 cost/slot_*_he 精确对齐）
+# TODO(linear-depth)：按 PC-MM / fig5 CC 实际 ct×ct 链重标定
 # ---------------------------------------------------------------------------
 
 DEPTH_QKV = 2
@@ -69,24 +169,26 @@ DEPTH_ATT_CONTEXT = 1
 DEPTH_ATT_DENSE = 3
 DEPTH_FF_DENSE = 2
 
-# Softmax 通路（非多项式；对照 THOR pt_ct_mult / make_copies）
-DEPTH_SOFTMAX_ATTN_MASK = 1  # exp 后 attention_mask：pt×ct
-DEPTH_SOFTMAX_COPY = 1  # 8→128：mask+rotsum，与 make_copies 同为 1 层
+# Softmax 通路（非多项式；对照 slot_softmax_he mask / make_copies）
+DEPTH_SOFTMAX_ATTN_MASK = 1  # exp 后 key-mask：pt×ct
+DEPTH_SOFTMAX_COPY = 1  # alpha 复制膨胀的 mask+rotsum
 
-# Goldschmidt 单次迭代 HE 乘法深度（与 cost 中 ×2 一致）
+# Goldschmidt / aSOR 单次迭代 HE 乘法深度（与 cost 中 ×2 一致）
 GOLDSCHMIDT_ITER_DEPTH = 2
 
-# Softmax 复制：8→16→32→64→128（CT 分阶；总乘法深度 = DEPTH_SOFTMAX_COPY）
-SOFTMAX_COPY_TARGETS = (16, 32, 64, CT_ROTATED)
-
-# LN prep 拆成 3 步（与 overhead=3 一致）
-LAYERNORM_PREP_STEPS = 3
+# LN prep 步数（与 cost.LAYERNORM_DEPTH_OVERHEAD 一致）
+LAYERNORM_PREP_STEPS = LAYERNORM_DEPTH_OVERHEAD
 
 # 旁路 remaining 槽（DP 状态；spine 上 bootstrap 不刷新旁路）
 SLOT_RESID = 0  # 残差输入（attn / FF 复用同一槽）
 SLOT_V = 1  # Softmax 期间停泊的 V
 N_SLOTS = 2
 SLOT_UNSET = -1
+
+# 默认审计任务：与 softmax/LN 配置表一致
+DEFAULT_AUDIT_TASKS: tuple[str, ...] = tuple(
+    t for t in LAYERNORM_TASK_NAMES if t in LAYER_EXP_DIV_BY_TASK
+)
 
 
 @dataclass(frozen=True)
@@ -325,22 +427,23 @@ def _append_softmax_copy_chain(
     layer_idx: int,
 ) -> None:
     """
-    8→128 复制通路：先 pt×ct mask（depth=DEPTH_SOFTMAX_COPY），再分阶膨胀（depth=0）。
-    对照 THOR ``make_copies`` / softmax 出口 rotsum；多项式深度不含此段。
+    score→alpha 复制通路：先 pt×ct mask（depth=DEPTH_SOFTMAX_COPY），再分阶膨胀（depth=0）。
+    对齐 ``make_copies`` / Softmax 出口；多项式深度不含此段。
     """
+    g = active_geometry()
     events.append(
         _ev(
             prefix,
             "softmax_copy_mask",
             DEPTH_SOFTMAX_COPY,
-            CT_ATT_SCORE,
-            CT_ATT_SCORE,
+            g.ct_att_score,
+            g.ct_att_score,
             layer_idx,
             "pathway",
         )
     )
-    ct = CT_ATT_SCORE
-    for target in SOFTMAX_COPY_TARGETS:
+    ct = g.ct_att_score
+    for target in _softmax_copy_targets(g.ct_att_score, g.ct_alpha_copies):
         events.append(
             _ev(
                 prefix,
@@ -364,16 +467,18 @@ def _append_softmax_exp_events(
     """
     thor exp：Stockmeyer(deg15, depth=4) + δ1 平方(depth=1)；之和 = SOFTMAX_DEPTH_BASE。
     """
+    g = active_geometry()
+    peak = g.ct_att_score * g.stockmeyer_live_factor
     events.append(
         _ev(
             prefix,
             "softmax_exp_stockmeyer",
             SOFTMAX_EXP_STOCKMEYER_DEPTH,
-            CT_ATT_SCORE,
-            CT_ATT_SCORE,
+            g.ct_att_score,
+            g.ct_att_score,
             layer_idx,
             "softmax",
-            ct_peak=CT_SOFTMAX_STOCKMEYER_PEAK,
+            ct_peak=peak,
         )
     )
     events.append(
@@ -381,8 +486,8 @@ def _append_softmax_exp_events(
             prefix,
             "softmax_exp_square_0",
             SOFTMAX_EXP_SQUARE_DEPTH,
-            CT_ATT_SCORE,
-            CT_ATT_SCORE,
+            g.ct_att_score,
+            g.ct_att_score,
             layer_idx,
             "softmax",
         )
@@ -396,7 +501,8 @@ def _append_softmax_events(
     task_name: str,
     level: int,
 ) -> None:
-    """阶段 B：exp(Stockmeyer+square) → aSOR_σ → δ2 归一化轮 → 复制膨胀（8→128）。"""
+    """阶段 B：exp(Stockmeyer+square) → aSOR_σ → δ2 归一化轮 → 复制膨胀。"""
+    g = active_geometry()
     iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
         task_name, layer_idx, level
     )
@@ -405,9 +511,9 @@ def _append_softmax_events(
         _ev(
             prefix,
             "softmax_asor_sigma",
-            iters_sigma * 2,
-            CT_ATT_SCORE,
-            CT_ATT_SCORE,
+            iters_sigma * GOLDSCHMIDT_ITER_DEPTH,
+            g.ct_att_score,
+            g.ct_att_score,
             layer_idx,
             "softmax",
             join=True,
@@ -418,9 +524,9 @@ def _append_softmax_events(
             _ev(
                 prefix,
                 f"softmax_norm_r{r}",
-                iters_sum_sq[r] * 2,
-                CT_ATT_SCORE,
-                CT_ATT_SCORE,
+                iters_sum_sq[r] * GOLDSCHMIDT_ITER_DEPTH,
+                g.ct_att_score,
+                g.ct_att_score,
                 layer_idx,
                 "softmax",
                 join=True,
@@ -431,8 +537,8 @@ def _append_softmax_events(
             prefix,
             "softmax_copy_expand",
             0,
-            CT_ATT_SCORE,
-            CT_ROTATED,
+            g.ct_att_score,
+            g.ct_alpha_copies,
             layer_idx,
             "softmax",
         )
@@ -447,6 +553,7 @@ def _append_softmax_events_c(
     level: int,
 ) -> None:
     """阶段 C：exp(Stockmeyer+square) + attn mask + 逐次 aSOR + 分阶复制链。"""
+    g = active_geometry()
     iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
         task_name, layer_idx, level
     )
@@ -456,8 +563,8 @@ def _append_softmax_events_c(
             prefix,
             "softmax_attn_mask",
             DEPTH_SOFTMAX_ATTN_MASK,
-            CT_ATT_SCORE,
-            CT_ATT_SCORE,
+            g.ct_att_score,
+            g.ct_att_score,
             layer_idx,
             "pathway",
         )
@@ -468,21 +575,21 @@ def _append_softmax_events_c(
                 prefix,
                 f"softmax_asor_sigma_i{i}",
                 GOLDSCHMIDT_ITER_DEPTH,
-                CT_ATT_SCORE,
-                CT_ATT_SCORE,
+                g.ct_att_score,
+                g.ct_att_score,
                 layer_idx,
                 "softmax",
             )
         )
     for r in range(rounds):
-        for g in range(iters_sum_sq[r]):
+        for gi in range(iters_sum_sq[r]):
             events.append(
                 _ev(
                     prefix,
-                    f"softmax_norm_r{r}_asor{g}",
+                    f"softmax_norm_r{r}_asor{gi}",
                     GOLDSCHMIDT_ITER_DEPTH,
-                    CT_ATT_SCORE,
-                    CT_ATT_SCORE,
+                    g.ct_att_score,
+                    g.ct_att_score,
                     layer_idx,
                     "softmax",
                 )
@@ -497,6 +604,7 @@ def _append_gelu_events(
     level: int,
 ) -> None:
     """阶段 B：Cheb 复合 f1→f2→×x（深度来自 gelu_he_depth_breakdown）。"""
+    g = active_geometry()
     cfg = gelu_config_for_layer(layer_idx, level)
     if cfg["kind"] == "composite":
         bd = gelu_he_depth_breakdown(cfg["d1"], cfg["d2"], eval_method="ps_tree")
@@ -507,15 +615,15 @@ def _append_gelu_events(
         f1_d, f2_d = int(bd["y_eval"]), 0
         recon_d = int(bd["gelu_reconstruct"])
 
-    peak = CT_FFN * 2  # 阶段 B 启发式
+    peak = g.ct_ffn * 2
     if f1_d > 0:
         events.append(
             _ev(
                 prefix,
                 "gelu_f1",
                 f1_d,
-                CT_FFN,
-                CT_FFN,
+                g.ct_ffn,
+                g.ct_ffn,
                 layer_idx,
                 "gelu",
                 join=True,
@@ -528,8 +636,8 @@ def _append_gelu_events(
                 prefix,
                 "gelu_f2",
                 f2_d,
-                CT_FFN,
-                CT_FFN,
+                g.ct_ffn,
+                g.ct_ffn,
                 layer_idx,
                 "gelu",
                 join=True,
@@ -541,8 +649,8 @@ def _append_gelu_events(
             prefix,
             "gelu_reconstruct",
             recon_d,
-            CT_FFN,
-            CT_FFN,
+            g.ct_ffn,
+            g.ct_ffn,
             layer_idx,
             "gelu",
         )
@@ -565,6 +673,7 @@ def _append_gelu_events_c(
     level: int,
 ) -> None:
     """阶段 C：Cheb PS-tree 逐层 + combine + 还原。"""
+    g = active_geometry()
     cfg = gelu_config_for_layer(layer_idx, level)
     if cfg["kind"] == "composite":
         _append_cheb_ps_tree_events(
@@ -573,7 +682,7 @@ def _append_gelu_events_c(
             "gelu_f1",
             int(cfg["d1"]),
             cfg["f1_cheb_coeffs"],
-            CT_FFN,
+            g.ct_ffn,
             layer_idx,
             "gelu",
         )
@@ -583,7 +692,7 @@ def _append_gelu_events_c(
             "gelu_f2",
             int(cfg["d2"]),
             cfg["f2_cheb_coeffs"],
-            CT_FFN,
+            g.ct_ffn,
             layer_idx,
             "gelu",
         )
@@ -594,7 +703,7 @@ def _append_gelu_events_c(
             "gelu_y",
             int(cfg["degree"]),
             cfg["f_cheb_coeffs"],
-            CT_FFN,
+            g.ct_ffn,
             layer_idx,
             "gelu",
         )
@@ -603,8 +712,8 @@ def _append_gelu_events_c(
             prefix,
             "gelu_reconstruct",
             1,
-            CT_FFN,
-            CT_FFN,
+            g.ct_ffn,
+            g.ct_ffn,
             layer_idx,
             "gelu",
         )
@@ -628,7 +737,8 @@ def _append_layernorm_events(
     kind: str,
     level: int,
 ) -> None:
-    """阶段 B：统计 prep（depth=3）+ 逐次 invsqrt（每 iter depth=1）。"""
+    """阶段 B：统计 prep（depth=OVERHEAD）+ 逐次 invsqrt（每 iter depth=1）。"""
+    g = active_geometry()
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
     iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
     slot = kind  # ln1 | ln2
@@ -636,9 +746,9 @@ def _append_layernorm_events(
         _ev(
             prefix,
             f"{slot}_prep",
-            3,
-            CT_HIDDEN,
-            CT_HIDDEN,
+            LAYERNORM_PREP_STEPS,
+            g.ct_hidden,
+            g.ct_hidden,
             layer_idx,
             kind,
             join=True,
@@ -650,8 +760,8 @@ def _append_layernorm_events(
                 prefix,
                 f"{slot}_invsqrt_{i}",
                 1,
-                CT_HIDDEN,
-                CT_HIDDEN,
+                g.ct_hidden,
+                g.ct_hidden,
                 layer_idx,
                 kind,
                 join=(i > 0),
@@ -678,7 +788,8 @@ def _append_layernorm_events_c(
     kind: str,
     level: int,
 ) -> None:
-    """阶段 C：prep 三步 + invsqrt 逐步（join 对齐接入）。"""
+    """阶段 C：prep 逐步 + invsqrt 逐步。"""
+    g = active_geometry()
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
     iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
     slot = kind
@@ -688,11 +799,11 @@ def _append_layernorm_events_c(
                 prefix,
                 f"{slot}_prep_s{s}",
                 1,
-                CT_HIDDEN,
-                CT_HIDDEN,
+                g.ct_hidden,
+                g.ct_hidden,
                 layer_idx,
                 kind,
-                ct_peak=CT_HIDDEN * (s + 1),
+                ct_peak=g.ct_hidden * (s + 1),
             )
         )
     for i in range(iters):
@@ -701,8 +812,8 @@ def _append_layernorm_events_c(
                 prefix,
                 f"{slot}_invsqrt_{i}",
                 1,
-                CT_HIDDEN,
-                CT_HIDDEN,
+                g.ct_hidden,
+                g.ct_hidden,
                 layer_idx,
                 kind,
             )
@@ -725,86 +836,80 @@ def build_bootstrap_events(
     scheme: list[int],
     *,
     phase: str = "C",
+    geom: SlotCtGeometry | None = None,
 ) -> list[Event]:
     """
-    展开事件序列。
-    phase A：非线性整段粗事件；B：阶段 B 微展开；C（默认）：微事件 + 通路 depth。
-    各 phase 均含残差 / V 旁路 fork–join（按实际 remaining 对齐）。
+    展开事件序列（CT 几何对齐 ``thor_encoder_linear_core`` slot 布局）。
+
+    phase A：非线性整段粗事件；B：微展开；C（默认）：微事件 + Softmax 通路 depth。
+    ``geom``：``None`` 时用当前活动几何（默认 bert_base）。
     """
+    if geom is not None:
+        set_slot_geometry(geom)
+    g = active_geometry()
+
     _validate_scheme_poly_only(scheme, task_name)
     events: list[Event] = []
     ph = phase.upper()
     if ph not in ("A", "B", "C"):
         raise ValueError(f"phase 须为 A/B/C，收到 {phase!r}")
 
+    H, Q, S = g.ct_hidden, g.ct_qkv_out, g.ct_att_score
+    R, Qc, A, F = g.ct_pc_rot, g.ct_q_copies, g.ct_alpha_copies, g.ct_ffn
+
     for layer_idx in range(NUM_LAYERS):
         p = f"L{layer_idx}"
 
-        # 残差输入：Attention 块入口停泊（THOR: add(x, dense_out)）
+        # --- Attention ---
         events.append(
             _ev(
-                p,
-                "fork_resid_attn",
-                0,
-                CT_HIDDEN,
-                CT_HIDDEN,
-                layer_idx,
-                "bridge",
-                save_slot=SLOT_RESID,
+                p, "fork_resid_attn", 0, H, H, layer_idx, "bridge", save_slot=SLOT_RESID
             )
         )
-        events.append(
-            _ev(p, "bridge_rot_qkv", 0, CT_HIDDEN, CT_ROTATED, layer_idx, "bridge")
-        )
+        # input_lower → PC baby-step 旋转副本
+        events.append(_ev(p, "bridge_rot_qkv", 0, H, R, layer_idx, "bridge"))
+        # Q/K/V PC-MM → n_out_packed_qkv；V 停泊
         events.append(
             _ev(
                 p,
                 "linear_qkv",
                 DEPTH_QKV,
-                CT_ROTATED,
-                CT_HIDDEN,
+                R,
+                Q,
                 layer_idx,
                 "linear",
-                save_slot=SLOT_V,  # V 停泊；K 的 transpose 深度用 join_offset 表示
+                save_slot=SLOT_V,
             )
         )
-        # K transpose 不走 spine 深度（与 Q 并行）；仅保留 CT 注释事件
         events.append(
-            _ev(
-                p,
-                "linear_transpose_k",
-                0,
-                CT_HIDDEN,
-                CT_HIDDEN,
-                layer_idx,
-                "linear",
-            )
+            _ev(p, "linear_transpose_k", 0, Q, Q, layer_idx, "linear")
         )
+        # make_copies_real(Q): qkv_out → head_dim
         events.append(
             _ev(
                 p,
                 "linear_make_copies",
                 DEPTH_MAKE_COPIES,
-                CT_HIDDEN,
-                CT_ROTATED,
+                Q,
+                Qc,
                 layer_idx,
                 "linear",
             )
         )
-        # Q*K：ct×ct 前对齐；side = QKV_rem - transpose（= K）；不刷 V 槽（K≠V）
+        # Score：Q copies × K；side=V 槽用 join_offset 表示 K 的 transpose 深度
         events.append(
             _ev(
                 p,
                 "linear_att_score",
                 DEPTH_ATT_SCORE,
-                CT_ROTATED,
-                CT_ATT_SCORE,
+                Qc,
+                S,
                 layer_idx,
                 "linear",
                 join=True,
                 join_slot=SLOT_V,
                 join_offset=DEPTH_TRANSPOSE_K,
-                join_ct=CT_HIDDEN,
+                join_ct=Q,
                 refresh_side=False,
             )
         )
@@ -813,50 +918,40 @@ def build_bootstrap_events(
         if ph == "A":
             sm_depth = _nonlinear_depth(task_name, layer_idx, "softmax", sm_level)
             events.append(
-                _ev(
-                    p,
-                    "softmax",
-                    sm_depth,
-                    CT_ATT_SCORE,
-                    CT_ROTATED,
-                    layer_idx,
-                    "softmax",
-                )
+                _ev(p, "softmax", sm_depth, S, A, layer_idx, "softmax")
             )
         elif ph == "B":
             _append_softmax_events(events, p, layer_idx, task_name, sm_level)
         else:
             _append_softmax_events_c(events, p, layer_idx, task_name, sm_level)
 
-        # Softmax * V：ct×ct；深度不足时两侧 bts 并刷新 V 槽
+        # Context：alpha_copies × V → qkv_out
         events.append(
             _ev(
                 p,
                 "linear_att_context",
                 DEPTH_ATT_CONTEXT,
-                CT_ROTATED,
-                CT_HIDDEN,
+                A,
+                Q,
                 layer_idx,
                 "linear",
                 join=True,
                 join_slot=SLOT_V,
                 join_offset=0,
-                join_ct=CT_HIDDEN,
+                join_ct=Q,
                 refresh_side=True,
             )
         )
+        # ctx → input_lower layout（置换，不计乘深度）
         events.append(
-            _ev(p, "bridge_rot_attn_dense", 0, CT_HIDDEN, CT_ROTATED, layer_idx, "bridge")
+            _ev(p, "bridge_ctx_to_lower", 0, Q, H, layer_idx, "bridge")
+        )
+        events.append(
+            _ev(p, "bridge_rot_attn_dense", 0, H, R, layer_idx, "bridge")
         )
         events.append(
             _ev(
-                p,
-                "linear_attn_dense",
-                DEPTH_ATT_DENSE,
-                CT_ROTATED,
-                CT_HIDDEN,
-                layer_idx,
-                "linear",
+                p, "linear_attn_dense", DEPTH_ATT_DENSE, R, H, layer_idx, "linear"
             )
         )
         events.append(
@@ -864,13 +959,13 @@ def build_bootstrap_events(
                 p,
                 "join_resid_attn",
                 0,
-                CT_HIDDEN,
-                CT_HIDDEN,
+                H,
+                H,
                 layer_idx,
                 "bridge",
                 join=True,
                 join_slot=SLOT_RESID,
-                join_ct=CT_HIDDEN,
+                join_ct=H,
                 refresh_side=True,
             )
         )
@@ -878,9 +973,7 @@ def build_bootstrap_events(
         ln1_level = _slot_level(scheme, layer_idx, "ln1")
         if ph == "A":
             ln1_depth = _nonlinear_depth(task_name, layer_idx, "ln1", ln1_level)
-            events.append(
-                _ev(p, "ln1", ln1_depth, CT_HIDDEN, CT_HIDDEN, layer_idx, "ln1")
-            )
+            events.append(_ev(p, "ln1", ln1_depth, H, H, layer_idx, "ln1"))
         elif ph == "B":
             _append_layernorm_events(
                 events, p, layer_idx, task_name, "ln1", ln1_level
@@ -890,65 +983,42 @@ def build_bootstrap_events(
                 events, p, layer_idx, task_name, "ln1", ln1_level
             )
 
-        # FF 残差入口
+        # --- FFN ---
         events.append(
             _ev(
-                p,
-                "fork_resid_ff",
-                0,
-                CT_HIDDEN,
-                CT_HIDDEN,
-                layer_idx,
-                "bridge",
-                save_slot=SLOT_RESID,
+                p, "fork_resid_ff", 0, H, H, layer_idx, "bridge", save_slot=SLOT_RESID
             )
         )
+        events.append(_ev(p, "bridge_rot_ff1", 0, H, R, layer_idx, "bridge"))
         events.append(
-            _ev(p, "bridge_rot_ff1", 0, CT_HIDDEN, CT_ROTATED, layer_idx, "bridge")
-        )
-        events.append(
-            _ev(
-                p, "linear_ff_dense1", DEPTH_FF_DENSE, CT_ROTATED, CT_FFN, layer_idx, "linear"
-            )
+            _ev(p, "linear_ff_dense1", DEPTH_FF_DENSE, R, F, layer_idx, "linear")
         )
 
         gelu_level = _slot_level(scheme, layer_idx, "gelu")
         if ph == "A":
             gelu_depth = _nonlinear_depth(task_name, layer_idx, "gelu", gelu_level)
-            events.append(
-                _ev(p, "gelu", gelu_depth, CT_FFN, CT_FFN, layer_idx, "gelu")
-            )
+            events.append(_ev(p, "gelu", gelu_depth, F, F, layer_idx, "gelu"))
         elif ph == "B":
             _append_gelu_events(events, p, layer_idx, gelu_level)
         else:
             _append_gelu_events_c(events, p, layer_idx, gelu_level)
 
+        events.append(_ev(p, "bridge_rot_ff2", 0, F, R, layer_idx, "bridge"))
         events.append(
-            _ev(p, "bridge_rot_ff2", 0, CT_FFN, CT_ROTATED, layer_idx, "bridge")
-        )
-        events.append(
-            _ev(
-                p,
-                "linear_ff_dense2",
-                DEPTH_FF_DENSE,
-                CT_ROTATED,
-                CT_HIDDEN,
-                layer_idx,
-                "linear",
-            )
+            _ev(p, "linear_ff_dense2", DEPTH_FF_DENSE, R, H, layer_idx, "linear")
         )
         events.append(
             _ev(
                 p,
                 "join_resid_ff",
                 0,
-                CT_HIDDEN,
-                CT_HIDDEN,
+                H,
+                H,
                 layer_idx,
                 "bridge",
                 join=True,
                 join_slot=SLOT_RESID,
-                join_ct=CT_HIDDEN,
+                join_ct=H,
                 refresh_side=True,
             )
         )
@@ -956,9 +1026,7 @@ def build_bootstrap_events(
         ln2_level = _slot_level(scheme, layer_idx, "ln2")
         if ph == "A":
             ln2_depth = _nonlinear_depth(task_name, layer_idx, "ln2", ln2_level)
-            events.append(
-                _ev(p, "ln2", ln2_depth, CT_HIDDEN, CT_HIDDEN, layer_idx, "ln2")
-            )
+            events.append(_ev(p, "ln2", ln2_depth, H, H, layer_idx, "ln2"))
         elif ph == "B":
             _append_layernorm_events(
                 events, p, layer_idx, task_name, "ln2", ln2_level
@@ -1291,8 +1359,11 @@ def optimize_bootstrap(
     budget: int = BOOTSTRAP_DEPTH_BUDGET,
     initial_level: int | None = None,
     phase: str = "C",
+    geom: SlotCtGeometry | None = None,
 ) -> BootstrapResult:
-    events = build_bootstrap_events(task_name, scheme, phase=phase)
+    events = build_bootstrap_events(
+        task_name, scheme, phase=phase, geom=geom
+    )
     return optimize_bootstrap_events(
         events, budget=budget, initial_level=initial_level
     )
@@ -1305,6 +1376,7 @@ def compute_scheme_bts(
     budget: int = BOOTSTRAP_DEPTH_BUDGET,
     initial_level: int | None = None,
     phase: str = "C",
+    geom: SlotCtGeometry | None = None,
 ) -> int:
     return optimize_bootstrap(
         task_name,
@@ -1312,6 +1384,7 @@ def compute_scheme_bts(
         budget=budget,
         initial_level=initial_level,
         phase=phase,
+        geom=geom,
     ).bts_count
 
 
@@ -1359,34 +1432,37 @@ def audit_nonlinear_depth_splits(
 
 def run_phase_d_audit(
     *,
-    tasks: tuple[str, ...] = ("mrpc", "rte", "sst2"),
+    tasks: tuple[str, ...] | None = None,
     levels: tuple[int, ...] = (0, 1, 2),
     budget: int = BOOTSTRAP_DEPTH_BUDGET,
+    geom: SlotCtGeometry | None = None,
 ) -> list[str]:
     """
     阶段 D 自洽审计。返回错误列表（空 = 通过）。
 
-    检查：CT 链、非线性 depth 守恒、pathway 每层 +2、
-    fork/join 配对、join 事件 join_ct、单调性（low≤mid≤high）、
-    Softmax×V 双侧 bootstrap 单元、placement 与 DP 一致。
+    默认对 ``DEFAULT_AUDIT_TASKS``（全部已配置 Softmax/LN 的任务）× 三档检查。
     """
+    if tasks is None:
+        tasks = DEFAULT_AUDIT_TASKS
+    if geom is not None:
+        set_slot_geometry(geom)
+    g = active_geometry()
     errors: list[str] = []
 
-    # --- 单元：Softmax×V 双侧 bootstrap ---
+    # --- 单元：Softmax×V（alpha × V）双侧 bootstrap ---
     ev = Event(
         name="ut.att_context",
         depth=1,
-        ct_in=CT_ROTATED,
-        ct_out=CT_HIDDEN,
+        ct_in=g.ct_alpha_copies,
+        ct_out=g.ct_qkv_out,
         join_slot=SLOT_V,
-        join_ct=CT_HIDDEN,
+        join_ct=g.ct_qkv_out,
         refresh_side=True,
     )
-    # spine rem=5, V rem=0 → join 后 rem=0 → mid boot 两侧
     add, r, mid, ns = _transition_event(
         5, (SLOT_UNSET, 0), ev, budget, bootstrap_first=False
     )
-    expect_mid_ct = CT_ROTATED + CT_HIDDEN
+    expect_mid_ct = g.ct_alpha_copies + g.ct_qkv_out
     if add != expect_mid_ct or mid != 1 or r != budget - 1:
         errors.append(
             f"Softmax×V mid-boot 单元失败: add={add} mid={mid} r={r} "
@@ -1395,41 +1471,40 @@ def run_phase_d_audit(
     if ns[1] != budget:
         errors.append(f"Softmax×V mid-boot 未刷新 V 槽: {ns[1]} != {budget}")
 
-    # Q×K 双侧计费但不刷 V
+    # Q×K：q_copies × K；双侧计费但不刷 V
     ev_qk = Event(
         name="ut.att_score",
         depth=1,
-        ct_in=CT_ROTATED,
-        ct_out=CT_ATT_SCORE,
+        ct_in=g.ct_q_copies,
+        ct_out=g.ct_att_score,
         join_slot=SLOT_V,
         join_offset=DEPTH_TRANSPOSE_K,
-        join_ct=CT_HIDDEN,
+        join_ct=g.ct_qkv_out,
         refresh_side=False,
     )
     add, r, mid, ns = _transition_event(
         0, (SLOT_UNSET, 2), ev_qk, budget, bootstrap_first=False
     )
-    # side = max(0, 2-1)=1; rem=min(0,1)=0 → mid boot；不刷 V
-    if add != CT_ROTATED + CT_HIDDEN or ns[1] != 2:
+    if add != g.ct_q_copies + g.ct_qkv_out or ns[1] != 2:
         errors.append(
             f"Q×K mid-boot 单元失败: add={add} V_slot={ns[1]} "
-            f"(应 add={CT_ROTATED + CT_HIDDEN}, V 保持 2)"
+            f"(应 add={g.ct_q_copies + g.ct_qkv_out}, V 保持 2)"
         )
 
     # 残差 join：bootstrap_first 刷新 resid
     ev_res = Event(
         name="ut.join_resid",
         depth=0,
-        ct_in=CT_HIDDEN,
-        ct_out=CT_HIDDEN,
+        ct_in=g.ct_hidden,
+        ct_out=g.ct_hidden,
         join_slot=SLOT_RESID,
-        join_ct=CT_HIDDEN,
+        join_ct=g.ct_hidden,
         refresh_side=True,
     )
     add, r, mid, ns = _transition_event(
         3, (1, SLOT_UNSET), ev_res, budget, bootstrap_first=True
     )
-    if add != 2 * CT_HIDDEN or r != budget or ns[0] != budget:
+    if add != 2 * g.ct_hidden or r != budget or ns[0] != budget:
         errors.append(
             f"残差 bootstrap_first 单元失败: add={add} r={r} resid={ns[0]}"
         )
@@ -1540,23 +1615,45 @@ def print_bootstrap_result(result: BootstrapResult, *, max_placements: int = 40)
 
 
 if __name__ == "__main__":
-    print("bts_ops 阶段 D 自洽审计 + C smoke")
+    print("bts_ops 阶段 D 自洽审计 + C smoke（全任务 × 三档）")
     print("=" * 56)
+    g = active_geometry()
+    print(
+        f"CT 几何 (bert_base): hidden={g.ct_hidden} qkv={g.ct_qkv_out} "
+        f"score={g.ct_att_score} q_copies={g.ct_q_copies} "
+        f"alpha={g.ct_alpha_copies} pc_rot={g.ct_pc_rot} ffn={g.ct_ffn}"
+    )
+    print(f"审计任务: {DEFAULT_AUDIT_TASKS}")
     d_errs = run_phase_d_audit()
     if d_errs:
         print(f"阶段 D FAILED ({len(d_errs)}):")
-        for e in d_errs[:20]:
+        for e in d_errs[:40]:
             print(" ", e)
-    else:
-        print("阶段 D: 全部检查通过")
+        raise SystemExit(1)
+    print("阶段 D: 全部检查通过")
 
-    task = "mrpc"
-    print()
+    # 非线性深度拆解样例（任务×档可变）
+    print("\n--- Softmax/GeLU/LN depth 拆解（mrpc L0）---")
+    for level, name in enumerate(("low", "mid", "high")):
+        it_s, it_sq, rounds, tot = _softmax_params("mrpc", 0, level)
+        print(
+            f"  softmax[{name}]: base={SOFTMAX_DEPTH_BASE} "
+            f"+ σ×{GOLDSCHMIDT_ITER_DEPTH}×{it_s} "
+            f"+ Σy²{it_sq} → total={tot}"
+        )
+        gd = gelu_poly_depth(0, level)
+        print(f"  gelu[{name}]: depth_he={gd}")
+        for kind in ("ln1", "ln2"):
+            ld = layernorm_poly_depth("mrpc", 0, kind, level)
+            print(f"  {kind}[{name}]: {ld} (= iters+{LAYERNORM_PREP_STEPS})")
+
+    print("\n--- scheme bts (mrpc) ---")
     for label, level in [("all_low", 0), ("all_mid", 1), ("all_high", 2)]:
-        r = optimize_bootstrap(task, scheme_all(level), phase="C")
+        r = optimize_bootstrap("mrpc", scheme_all(level), phase="C")
         print(f"[{label}] {r.summary()}")
         join_pl = [
-            p for p in r.placements
+            p
+            for p in r.placements
             if "att_context" in p.event_name
             or "att_score" in p.event_name
             or "join_resid" in p.event_name
