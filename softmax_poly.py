@@ -36,7 +36,9 @@ MAX_SUM_SQ_ROUNDS = 2
 
 # thor_softmax 全局常量
 THOR_DELTA1 = 2.0
-# x_scaled = x / delta1 / delta2 / THOR_INPUT_SCALE
+# Production KEY bake: ``1/(√d · THOR_INPUT_SCALE · δ1 · δ2)`` with √d=8
+# for BERT-base; Softmax entry is then already in poly domain (no runtime /).
+# Reference / isolated tests may still do: x_scaled = x / delta1 / delta2 / THOR_INPUT_SCALE
 THOR_INPUT_SCALE = 8.0
 SIGMA_E0_DIVISOR = 1.5
 
@@ -104,6 +106,36 @@ LAYER_EXP_DIV_BY_TASK: dict[str, list[float]] = {
     "qnli": [2.0, 2.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
     "mnli": [2.0, 2.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0],
 }
+
+
+def k_key_encode_scale(task: str, layer_idx: int) -> float:
+    """
+    DualRail KEY W+bias encode scale ``1/(√d · THOR_INPUT_SCALE · δ1 · δ2)``.
+
+    BERT-base ``√d = √64 = 8`` (attention temperature, normally ``QKᵀ/√d``);
+    ``THOR_INPUT_SCALE = 8`` (exp poly domain); ``δ1·δ2`` per-layer so Softmax
+    entry skips ``mult_scalar``.  Numerically ``1/(64·δ1·δ2)``.
+    """
+    d2 = float(LAYER_EXP_DIV_BY_TASK[task][layer_idx])
+    return 1.0 / (64.0 * float(THOR_DELTA1) * d2)
+
+
+def score_hf_decode_bake(task: str, layer_idx: int) -> float:
+    """
+    DualRail score packs → HF ``att_score`` (pre-exp logits).
+
+    KEY bake already includes ``/√d`` and ``/THOR_INPUT_SCALE·δ1·δ2``.  DualRail
+    island amplitude vs HF needs decode ``×(THOR_INPUT_SCALE·δ1·δ2)`` (= ``8·δ1·δ2``
+    for base); the ``√d`` factor is accounted for in the island geometry /
+    KEY bake pairing (not a second ``×√d`` here).
+
+    Softmax/exp (``exp_input_prescaled=True``) consumes island packs as-is:
+    that amplitude already equals the poly domain ``x/(δ1·δ2·THOR_INPUT_SCALE)``
+    with ``x`` at HF (post-``/√d``) scale.
+    """
+    d2 = float(LAYER_EXP_DIV_BY_TASK[task][layer_idx])
+    return float(THOR_INPUT_SCALE) * float(THOR_DELTA1) * d2
+
 
 # ---------------------------------------------------------------------------
 # aSOR 迭代上限：task → level → 12 层

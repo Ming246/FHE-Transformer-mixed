@@ -1,0 +1,25 @@
+{
+    "name": "wsm_experiment",
+    "image": "huggingface/transformers-pytorch-gpu",
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "remoteUser": "root",
+    "containerEnv": {
+      "PYTHONUNBUFFERED": "1"
+    },
+    "runArgs": [
+      "--name",
+      "wsm_experiment",
+      "--gpus",
+      "all"
+    ],
+    "shutdownAction": "none",
+    "customizations": {
+      "vscode": {
+        "settings": {
+          "python.defaultInterpreterPath": "/usr/bin/python3"
+        }
+      }
+    }
+  }
+  

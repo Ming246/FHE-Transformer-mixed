@@ -171,8 +171,13 @@ REL_ERR_DENOM_MIN = 1e-4  # |y_ref| 低于此值不参与相对误差
 
 
 
-# Stockmeyer(4) + δ1 square(1)；aSOR 每步按 ×2 计深度（与旧 Goldschmidt 占位一致）
+# Stockmeyer(4) + δ1 square(1)；aSOR 每步 HE rem=1（与 cost.SOFTMAX_ASOR_ITER_DEPTH 一致）
 SOFTMAX_DEPTH_BASE = 5
+try:
+    from cost import SOFTMAX_ASOR_ITER_DEPTH as _ASOR_D
+except ImportError:  # pragma: no cover
+    _ASOR_D = 1
+SOFTMAX_ASOR_ITER_DEPTH = int(_ASOR_D)
 _THOR_P = torch.tensor(THOR_EXP_POLY_COEFFS, dtype=torch.float32)
 # =============================================================================
 
@@ -448,11 +453,12 @@ def thor_eps2_from_en(en: float, seq_len: int = MAX_SEQ_LENGTH) -> float:
 def softmax_layer_depth_asor(
     delta2: float, iters_sigma: int, iters_sum_sq: list[int]
 ) -> int:
-    """单层深度：base + aSOR_σ×2 + Σ(各轮 aSOR_Σy²×2)。"""
+    """单层深度：base + aSOR_σ×d + Σ(各轮 aSOR_Σy²×d)；d=SOFTMAX_ASOR_ITER_DEPTH。"""
+    d = SOFTMAX_ASOR_ITER_DEPTH
     return (
         SOFTMAX_DEPTH_BASE
-        + int(iters_sigma) * 2
-        + sum(int(x) for x in iters_sum_sq) * 2
+        + int(iters_sigma) * d
+        + sum(int(x) for x in iters_sum_sq) * d
     )
 
 

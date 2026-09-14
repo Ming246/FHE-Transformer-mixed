@@ -27,11 +27,11 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 | `2.FineTuning_bert.py` | BERT 微调 |
 | `3.Infer_Fintuned.py` | 原始微调模型推理 |
 | `sensitive_score.py` / `_1` / `_2` | Taylor 型敏感度（阶数/形式不同）；句对任务须传 `token_type_ids` |
-| `cost.py` | 方案 **乘法深度** 估算（占位）；目标为最优 bootstrap 下的 bts（见 `docs/HE_BOOTSTRAP_COST.md`） |
+| `cost.py` | 方案 cost：深度和 + DualRail DP **bts**（`compute_f_cost` / `compute_scheme_bts`） |
 | `docs/HE_BOOTSTRAP_COST.md` | **Bootstrap / bts cost** 交接简报（新 agent 优先读） |
 | `ILP_loss_depth.py` | 固定 cost 预算下的 ILP 档位分配 |
-| `evolution_score.py` | NSGA-II：\(\sum S\)（校验集敏感度）vs depth；校验集深度过滤后写 calib/validation CSV |
-| `evolution_kl.py` | NSGA-II：Output KL（校验集搜索）vs depth；最终 calib + validation 双 CSV |
+| `evolution_score.py` | NSGA-II：\(\sum S\) vs **bts**（默认；`--cost-mode depth` 仍可用） |
+| `evolution_kl.py` | NSGA-II：Output KL vs **bts**（默认） |
 | `poly_model_inference.py` | 按 48 维方案替换 Softmax/LN/GeLU 并评估验证集/校验集 |
 | `gelu_poly.py` / `softmax_poly.py` / `layernorm_poly.py` | 推理时多项式实现与 per-layer 配置 |
 | `nolinear/` | 非线性近似 **离线评估** 与 Remez/Chebyshev 拟合 |
@@ -64,13 +64,15 @@ GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；So
 
 - **GeLU**：来自 `gelu_poly` 的 `depth_he`（Chebyshev PS-tree + 还原 +1）
 - **Softmax**（`cost.softmax_poly_depth` / aSOR）：
-  - `SOFTMAX_DEPTH_BASE(=5) + asor_σ×2 + Σ_r asor_Σy²_r×2`
+  - `SOFTMAX_DEPTH_BASE(=5) + asor_σ×SOFTMAX_ASOR_ITER_DEPTH + Σ_r asor_Σy²_r×SOFTMAX_ASOR_ITER_DEPTH`
+  - `SOFTMAX_ASOR_ITER_DEPTH=1`（HE `he_asor_ct` DeltaCt 路径实测每轮 rem−1；明文 `kn*b*b_temp` 概念深度仍为 2）
   - BASE = Stockmeyer(deg15 密路径 4) + δ1 平方 1
   - Σy² 轮数 \(n_2=\lceil\log_2(\delta_2)\rceil\)（`LAYER_EXP_DIV`）；第 1/2 轮 iters 来自 `LAYER_ASOR_MAX_ITERS_SUM_SQ(_2)_BY_TASK`
   - **未用轮次**（\(\delta_2=2\) 时第 2 轮）表项为 **0**，且不计入深度
 - **LayerNorm**：`invsqrt_max_iters + 3`（生产路径固定步数，无 α；`layernorm_poly` / `cost.py`）
-- 进化 \(f_\mathrm{cost}=\lceil\mathrm{depth}/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)（默认除数 **5**）
-- **TODO / 进行中**：完整 cost = 给定方案下 **最优 bootstrapping 放置** 的 bts 次数；`BOOTSTRAP_DEPTH_BUDGET` 默认 15。简报见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)。
+- 进化默认 \(f_\mathrm{cost}=\) DualRail DP 总 bts（`HE/thor/bts_ops.optimize_bootstrap`，budget **14**，与 `plan_mock` 相同）
+- `--cost-mode depth` 仍可用：\(\lceil\mathrm{depth}/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)
+- 简报见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)
 
 ### 非线性近似要点
 
@@ -108,8 +110,8 @@ GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；So
 
 | 脚本 | \(f_1\) | \(f_2\) | 输出 |
 |------|---------|---------|------|
-| `evolution_score.py` | \(\sum S\)（校验集 CSV） | depth（±容差支配） | `*_pareto_calib.csv` / `*_pareto_validation.csv`（同深度仅留最小 KL） |
-| `evolution_kl.py` | Output KL（校验集搜索） | \(\lceil depth/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)（严格） | `*_pareto_kl_calib.csv` / `*_pareto_kl_validation.csv` |
+| `evolution_score.py` | \(\sum S\)（校验集 CSV） | bts（默认）或 depth | `*_pareto_calib.csv` / `*_pareto_validation.csv`（同 f_cost 仅留最小 KL） |
+| `evolution_kl.py` | Output KL（校验集搜索） | bts（默认）或 depth | `*_pareto_kl_calib.csv` / `*_pareto_kl_validation.csv` |
 
 句对任务（MRPC/RTE）推理/敏感度须保留并传入 **`token_type_ids`**（勿在 `set_format` 时丢掉）。
 
@@ -166,7 +168,7 @@ docker exec wsm_experiment bash -lc "cd /workspace/nolinear && python3 layernorm
 
 ## 已知限制 / TODO
 
-- `cost.py` / `evolution_*.py`：`cost_mode=bts` 仍为 TODO → 见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)
+- `cost.py` `cost_mode=bts` 已接 DualRail DP（budget=14）；主线 `BOOTSTRAP_DEPTH_BUDGET=15` 仅深度占位遗留
 - LayerNorm eval：深层误差依赖 `[min_var, max_var]` 是否与方差 JSON 一致
 - ILP 假设 cost 可 per-position 累加；与真实 HE bootstrap cost 不一致时需换建模
 

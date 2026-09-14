@@ -125,6 +125,8 @@ def log2_ceil(n: int) -> int:
 # 复合：f1(t) 与 f2(u) 串行（u 为 f1 密文输出），深度相加。
 
 GELU_HE_RECONSTRUCT_DEPTH = 1
+# Liberate: ∑ c_k T_k uses mult_scalar(rescale=False) then one rescale.
+GELU_HE_CHEB_COMBO_RESCALE = 1
 
 
 def cheb_he_depth_ps_tree(degree: int) -> int:
@@ -137,14 +139,26 @@ def cheb_he_depth_clenshaw(degree: int) -> int:
     return max(0, degree)
 
 
+def _domain_is_unit_depth(domain: tuple[float, float], *, tol: float = 1e-12) -> bool:
+    a, b = float(domain[0]), float(domain[1])
+    return abs(a + 1.0) <= tol and abs(b - 1.0) <= tol
+
+
 def gelu_he_depth_breakdown(
-    degree_or_d1: int, d2: int | None = None, *, eval_method: str = "ps_tree"
-) -> dict[str, int]:
+    degree_or_d1: int,
+    d2: int | None = None,
+    *,
+    eval_method: str = "ps_tree",
+    f2_domain: tuple[float, float] | None = None,
+):
     """
     返回 HE 乘法深度明细（total 为 ILP/cost 应用值）。
 
-    single: total = depth(y) + 1
-    composite: total = depth(f1) + depth(f2) + 1
+    PS-tree（生产）：每段 ⌈log₂ deg⌉（T_k 树）+ 1（系数组合 rescale）；
+    f2 定义域非 [-1,1] 时再 +1（affine_to_z）；最后 reconstruct +1。
+
+    single: total = depth(y) + combo + reconstruct
+    composite: f1 + [f2_affine] + f2 + 2·combo + reconstruct
     """
     if eval_method not in ("ps_tree", "clenshaw"):
         raise ValueError(f"eval_method 应为 ps_tree|clenshaw，收到 {eval_method!r}")
@@ -153,21 +167,34 @@ def gelu_he_depth_breakdown(
         if eval_method == "ps_tree"
         else cheb_he_depth_clenshaw
     )
+    combo = GELU_HE_CHEB_COMBO_RESCALE if eval_method == "ps_tree" else 0
     if d2 is None:
         y_dep = cheb_depth(degree_or_d1)
         return {
             "y_eval": y_dep,
+            "cheb_combo_rescale": combo,
             "gelu_reconstruct": GELU_HE_RECONSTRUCT_DEPTH,
-            "total": y_dep + GELU_HE_RECONSTRUCT_DEPTH,
+            "total": y_dep + combo + GELU_HE_RECONSTRUCT_DEPTH,
             "eval_method": eval_method,
         }
     f1_dep = cheb_depth(degree_or_d1)
     f2_dep = cheb_depth(d2)
+    f2_aff = 0
+    if f2_domain is not None and not _domain_is_unit_depth(f2_domain):
+        f2_aff = 1
     return {
         "f1_eval": f1_dep,
+        "f2_affine": f2_aff,
         "f2_eval": f2_dep,
+        "cheb_combo_rescale": 2 * combo,
         "gelu_reconstruct": GELU_HE_RECONSTRUCT_DEPTH,
-        "total": f1_dep + f2_dep + GELU_HE_RECONSTRUCT_DEPTH,
+        "total": (
+            f1_dep
+            + f2_aff
+            + f2_dep
+            + 2 * combo
+            + GELU_HE_RECONSTRUCT_DEPTH
+        ),
         "eval_method": eval_method,
     }
 
@@ -662,7 +689,9 @@ def fit_composite_minimax(
     gerr_ps = _eval_gelu_error(C, y_hat_ps)
 
     x_extra_lo, x_extra_hi = extra_eval_x
-    he = gelu_he_depth_breakdown(d1, d2, eval_method="ps_tree")
+    he = gelu_he_depth_breakdown(
+        d1, d2, eval_method="ps_tree", f2_domain=domain_u
+    )
     he_cl = gelu_he_depth_breakdown(d1, d2, eval_method="clenshaw")
     legacy = paterson_stockmeyer_depth(d1) + paterson_stockmeyer_depth(d2)
     max_cheb = max(float(np.max(np.abs(c1))), float(np.max(np.abs(c2))))

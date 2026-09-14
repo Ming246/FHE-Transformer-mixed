@@ -228,6 +228,8 @@ def thor_exp_slots(
     x_packs: list[np.ndarray],
     mask_packs: list[np.ndarray],
     params: SoftmaxHeParams,
+    *,
+    exp_input_prescaled: bool = True,
 ) -> list[np.ndarray]:
     """Stockmeyer exp 多项式 + δ1 平方；再 × mask。"""
     d1 = float(params.delta1)
@@ -235,14 +237,18 @@ def thor_exp_slots(
     n1 = _check_power_of_two("delta1", d1)
     scale = math.exp(params.shift / d2 / d1)
     inv_scale = 1.0 / scale
-    inv_in = 1.0 / (d1 * d2 * THOR_INPUT_SCALE)
+    if not exp_input_prescaled:
+        inv_in = 1.0 / (d1 * d2 * THOR_INPUT_SCALE)
 
     out: list[np.ndarray] = []
     for x, m in zip(x_packs, mask_packs):
         x = np.asarray(x, dtype=np.float64)
         m = np.asarray(m, dtype=np.float64)
         x_work = pt_mult(m, x)
-        x_scaled = pt_mult(np.full_like(x_work, inv_in), x_work)
+        if exp_input_prescaled:
+            x_scaled = x_work
+        else:
+            x_scaled = pt_mult(np.full_like(x_work, inv_in), x_work)
         # 与 THOR he_exp1 一致：字面量是降幂，Stockmeyer 要升幂 → reverse
         # （本仓库 Horner 不 reverse，与 reverse+Stockmeyer 为同一多项式）
         coeffs_asc = tuple(reversed(params.exp_coeffs))
@@ -288,6 +294,8 @@ def slot_softmax_he(
     mask_packs: list[np.ndarray],
     cfg: ThorConfig,
     params: SoftmaxHeParams,
+    *,
+    exp_input_prescaled: bool = True,
 ) -> list[np.ndarray]:
     """
     HE 同构 Softmax：layout 不变，返回与 ``score_packs`` 同形状的概率 packs。
@@ -303,7 +311,9 @@ def slot_softmax_he(
             f"delta2={d2} 对应 {n2} 轮 Σy²，超过 MAX_SUM_SQ_ROUNDS={MAX_SUM_SQ_ROUNDS}"
         )
 
-    exp_packs = thor_exp_slots(score_packs, mask_packs, params)
+    exp_packs = thor_exp_slots(
+        score_packs, mask_packs, params, exp_input_prescaled=exp_input_prescaled
+    )
     sigma = sum_over_keys(exp_packs, cfg)
     inv_sigma, en = asor_inverse_slots(
         sigma, params.e0_sigma, params.asor_max_iters_sigma

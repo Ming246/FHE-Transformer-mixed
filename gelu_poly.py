@@ -106,6 +106,17 @@ def _normalize_scheme(item: dict) -> dict:
                 "f2_domain": tuple(float(x) for x in p["f2_domain"]),
             }
         )
+        # Liberate PS-tree depth (combo rescale + f2 affine); JSON ``depth`` may lag.
+        from nolinear.gelu_chebyshev import gelu_he_depth_breakdown
+
+        bd = gelu_he_depth_breakdown(
+            cfg["d1"],
+            cfg["d2"],
+            eval_method="ps_tree",
+            f2_domain=cfg["f2_domain"],
+        )
+        cfg["depth_he"] = int(bd["total"])
+        cfg["depth_he_breakdown"] = bd
     else:
         cfg.update(
             {
@@ -114,6 +125,11 @@ def _normalize_scheme(item: dict) -> dict:
                 "f_domain": tuple(float(x) for x in p["f_domain"]),
             }
         )
+        from nolinear.gelu_chebyshev import gelu_he_depth_breakdown
+
+        bd = gelu_he_depth_breakdown(cfg["degree"], eval_method="ps_tree")
+        cfg["depth_he"] = int(bd["total"])
+        cfg["depth_he_breakdown"] = bd
     return cfg
 
 
@@ -133,6 +149,18 @@ def gelu_scale_for_layer(layer_idx: int) -> float:
     if layer_idx in _GELU_LAYER_SCHEME and 2 in _GELU_LAYER_SCHEME[layer_idx]:
         return float(_GELU_LAYER_SCHEME[layer_idx][2][0])
     raise KeyError(f"layer {layer_idx} 无 high 档配置")
+
+
+# THOR / HE encode scale (FC1): see ``gelu_ff1_encode_scale``.
+# KEY encode / score decode: ``softmax_poly.k_key_encode_scale`` /
+# ``softmax_poly.score_hf_decode_bake`` (``1/(64·δ1·δ2)`` per layer).
+
+from softmax_poly import k_key_encode_scale, score_hf_decode_bake  # noqa: F401
+
+
+def gelu_ff1_encode_scale(layer_idx: int) -> float:
+    """FC1 W/bias encode scale ``1/C`` for layer ``layer_idx``."""
+    return 1.0 / gelu_scale_for_layer(layer_idx)
 
 
 @torch.jit.script

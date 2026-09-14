@@ -12,16 +12,9 @@
 
 | 组件 | 现状 |
 |------|------|
-| `cost.py` | 仅累加各 slot **乘法深度**（占位） |
-| `evolution_*.py` 的 `cost_mode="bts"` | TODO，仍回退 depth |
-| 完整 cost | 应为「最优 bootstrap 分配下的 bts 次数」（见 `cost.py` 文末 TODO） |
-
-接入点（预留注释已存在）：
-
-- `evolution_score.compute_f_cost(..., cost_mode="bts")`
-- `evolution_kl.py` / `evolution_score.py` 中同类 TODO：`optimize_bootstrap(task_name, scheme)`
-
-**不要**在未实现求解器前静默把 bts 当成 depth；接口应显式区分。
+| `cost.py` | `compute_scheme_cost` = 深度和；`compute_scheme_bts` / `compute_f_cost(mode=bts)` = DualRail DP 总 bts（budget=14） |
+| `evolution_*.py` | 默认 `--cost-mode bts`；`--cost-mode depth` 仍可用 |
+| 求解器 | `HE/thor/bts_ops.optimize_bootstrap`（与 `plan_mock` + rem_guard 同一套） |
 
 ---
 
@@ -71,7 +64,7 @@ GeLU 有层组档位约束：`gelu_poly.gelu_level_allowed`。
 | 算子 | 深度来源 |
 |------|----------|
 | GeLU | `gelu_poly.gelu_config_for_layer` → `depth_he`（Chebyshev / PS-tree + 还原 +1） |
-| Softmax | `5 + asor_σ×2 + Σ_r asor_Σy²_r×2`（Stockmeyer 4 + δ1 square 1 + aSOR；Σy² 轮数 \(=\lceil\log_2\delta_2\rceil\)，未用轮填 0） |
+| Softmax | `5 + asor×SOFTMAX_ASOR_ITER_DEPTH(=1) + Σy² asor×1`（HE DeltaCt 实测；Stockmeyer 4 + δ1 square 1；Σy² 轮数 \(=\lceil\log_2\delta_2\rceil\)，未用轮填 0） |
 | LayerNorm | `count_he_invsqrt_iters(...) + 3` |
 
 API：`compute_scheme_cost(task, scheme)` → 深度和；`detailed=True` 得 per-slot 明细。
@@ -128,6 +121,26 @@ FF: 实8→复打包+旋转(64) → dense1 → (2,8) → [打包 bootstrap×8]
 | A | 非线性整段粗事件 + fork/join（无通路 depth） |
 | B | 粗微段 + fork/join（无通路 depth） |
 | C | 微事件 + 通路 depth + fork/join（正式 bts） |
+
+### 路线 B（选定）：HE 驱动 Plan（反推）
+
+**原则**：以真实 Liberate HE 前向为唯一深度真值；`bts_ops` DP 只消费测量结果，不再手写 `DEPTH_*` 常量去「猜」HE 会烧多少。
+
+| 步骤 | 工具 |
+|------|------|
+| 1. 单层 HE 剖面 | `smoke_thor_repro --bootstrap hardcode --probe-levels --depth-profile-out /tmp/L{n}.json` |
+| 2. 合并多层 | `python3 HE/thor/he_depth_profile.py merge /tmp/L0.json /tmp/L1.json -o merged.json` |
+| 3. 生成 overrides | `he_depth_profile.build_depth_overrides()` → `{event_suffix: Δrem}` |
+| 4. 重跑 DP | `optimize_bootstrap(task, scheme, depth_overrides=...)` |
+| 5. 验收 | `plan_mock` + `rem_guard`；`simulate` 不得出现无 placement 的 reactive boot |
+
+实现：`HE/thor/he_depth_profile.py`（`DepthProfileRecorder` 挂 `BootstrapHook.refresh` + `LevelProbe`）。
+
+**注意**：
+
+- 剖面用 **`hardcode`**（反应式 HE boot），避免错误 plan 扭曲测量。
+- 每层 / 每种 LN2 入口（`ln2_prep_s0` vs `join_resid_ff`）须 **分别剖面** 后再 merge。
+- 禁止再靠 `_inject_*` / `_align_*` 事后补 placement；那些是路线 A 遗留，路线 B 稳定后应删除。
 
 **线性复数打包（8→4）**：THOR 用虚部塞另一半实数据以减半 CT。本仓库 **后续只用实数线性**，不做该减半；因所有方案共用同一线性，相对 bts 比较本质不变，但绝对 CT 数按「实数路径」计。
 
@@ -242,3 +255,34 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 - `evolution_score.py` / `evolution_kl.py` — `f_cost` 消费方  
 
 新窗口接手后：先读本文 + `AGENTS.md`，再打开用户提供的 **THOR** 树，最后改 `cost.py`。
+
+---
+
+## 微事件划分备忘（进行中，2026-08）
+
+> **状态**：Softmax / Attention 前端微事件仍在划分；LN 收尾等尚未切完。以下为已达成共识、待全量划分后再落地的设计方向。
+
+### 微事件语义（主路）
+
+- 每个微事件 = 主路 `{inputs, outputs, depth}`，其中 **`depth = rem(inputs) − rem(outputs)`**（等价于同一代表 CT 的 `level_calc` 升高量）。
+- 事件内默认：所有输入 CT 同 rem，所有输出 CT 同 rem。
+- bts 站点刷新的就是该事件的 **inputs**（段首 `before` refresh）；不必再单独列 `refresh_cts`。
+- 旁路 CT 的乘法 depth **不**进入微事件 depth 账本。
+
+### 旁路：HE 对齐 vs plan 可行性
+
+- **HE 运行时**：旁路与主路 ct×ct / 会合前，统一 `align_bypass_to_main`（`softmax_he_ct.py`）——旁路比主路更耗尽（rem 更小）则先 bts 旁路再 `level_up`，**不烧主路 rem**。
+- **plan / DP**：`bts_count` **不计**旁路条数（`join_ct`）；旁路不单独做 bootstrap 放置优化。
+- plan 仍保留 **`save_slot` / `join_slot` / `clear_slot` / `refresh_side`**，用途是 **槽位生命周期 + 会合前可行性**，不是第二张旁路计算图：
+  - `save_slot`：主路 CT 停泊（RESID / V / AUX）；
+  - `join_slot`：该事件需要旁路已 save 且 rem 足够；
+  - `refresh_side`：若 `side_rem < spine_rem`，plan **假定**会合前把旁路槽刷回 `budget`（恢复 rem），**不计入 bts 目标**；
+  - `clear_slot`：时分复用结束（如 Softmax exit 后清 AUX）。
+- **「浅」= rem 更小**（`level_calc` 更大、密文更耗尽）。`_transition_event` 在 `side_rem < spine_rem` 且 `refresh_side=False` 时判不可行；`refresh_side=True` 则乐观设 `slots[join]=budget` 后继续。
+- **LN `*_post_invsqrt` 的 min(spine, AUX)** 是主路语义例外；微事件未划到 LN 前暂不展开；全量划分后再讨论 plan 是否仍需旁路 min 规则。
+
+### 待划分完成后
+
+1. 微事件 registry：`{name, inputs, outputs, depth}` + 可选 `slot_ops`；
+2. 评估能否把 `join_slot`/`refresh_side` 收成更薄的 slot 注解，旁路对齐完全下沉 HE；
+3. Route B probe 按事件边界自动校验 `depth = Δrem`。

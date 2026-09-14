@@ -3,7 +3,7 @@
 
 目标（均越小越好）：
   f_loss = Σ_j S_{j,k_j}   （敏感度得分和；默认读校验集上算出的 CSV）
-  f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)（C_bts 未实现前为 depth 占位）
+  f_cost = DualRail DP 总 bts（``cost_mode=bts``，默认）；或 ceil(深度和 / 除数)
 
 支配关系（x1 支配 x2）：
   x1 在所有目标上都不比 x2 差，且在至少一个目标上严格更好。
@@ -17,7 +17,7 @@ Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿。
 
 推理汇报（默认开启）：
   1) 全量校验集评估 archive
-  2) 按 total_depth 过滤：排除 OOR / 非有限 KL；同深度只保留 KL 最小方案
+  2) 按 f_cost 过滤：排除 OOR / 非有限 KL；同 cost 只保留 KL 最小方案
   3) 写出 {task}_pareto_calib.csv（仅过滤后解）
   4) 再在全量验证集上评估过滤后解，写出 {task}_pareto_validation.csv
 """
@@ -35,18 +35,17 @@ from dataclasses import dataclass, field
 from cost import (
     NUM_LAYERS,
     SCHEME_LEN,
+    compute_f_cost,
     compute_scheme_cost,
-    depth_f_cost_label,
-    depth_sum_to_f_cost,
+    f_cost_label,
     scheme_index,
-    validate_scheme,
 )
 from gelu_poly import gelu_level_allowed
 from evolution_infer import format_elapsed, save_search_timings
 from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc", "rte","sst2", "cola", "qnli", "mnli"]
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
 POLY_LEVELS = (0, 1, 2)
 EVOLUTION_RESULTS_ROOT = "./results/evolution_results/"
@@ -81,7 +80,7 @@ ARCHIVE_MAX_SIZE = 300
 RANDOM_SEED = 42
 
 # loss 目标单一相对容差；由 τ 导出严格 / 不差阈值
-LOSS_REL_TOL = 0.02
+LOSS_REL_TOL = 0.05
 LOSS_STRICT_RATIO = 1.0 - LOSS_REL_TOL
 LOSS_NOT_WORSE_RATIO = 1.0 + LOSS_REL_TOL
 
@@ -212,21 +211,6 @@ def compute_f_loss(
     return total
 
 
-def compute_f_cost(task_name: str, scheme: list[int], *, cost_mode: str) -> int:
-    """
-    f_cost = C_bts(scheme)。
-
-    cost_mode='depth'：ceil(深度和 / COST_DEPTH_DIVISOR)。
-    cost_mode='bts'  ：预留，当前仍回退 depth 映射，待 bts 求解器接入。
-    """
-    validate_scheme(scheme, task_name)
-    if cost_mode == "bts":
-        # TODO: return int(optimize_bootstrap(task_name, scheme))
-        pass
-    depth = int(compute_scheme_cost(task_name, scheme))
-    return depth_sum_to_f_cost(depth)
-
-
 @dataclass
 class Individual:
     scheme: list[int]
@@ -286,6 +270,7 @@ def evaluate_individual(
 ) -> Individual:
     ind.f_loss = compute_f_loss(ind.scheme, s_mat)
     ind.f_cost = compute_f_cost(task_name, ind.scheme, cost_mode=cost_mode)
+    ind.total_depth = int(compute_scheme_cost(task_name, ind.scheme))
     return ind
 
 
@@ -486,7 +471,7 @@ def run_evolution(
     *,
     population_size: int = POPULATION_SIZE,
     num_generations: int = NUM_GENERATIONS,
-    cost_mode: str = "depth",
+    cost_mode: str = "bts",
     seed: int = RANDOM_SEED,
     sensitive_dir: str = SENSITIVE_OUTPUT_DIR,
 ) -> tuple[list[Individual], Archive]:
@@ -538,32 +523,32 @@ def _finite_or_inf(x: float) -> float:
     return float(x) if math.isfinite(x) else float("inf")
 
 
-def filter_pareto_depth_min_kl(items: list[Individual]) -> list[Individual]:
+def filter_pareto_cost_min_kl(items: list[Individual]) -> list[Individual]:
     """
     校验集评估后筛选：
       · 丢弃 oor_count != 0 或非有限 output_kl
-      · 同一 total_depth：只保留 KL 最小者（并列看 f_loss）
-    结果按 (total_depth, output_kl) 排序。
+      · 同一 f_cost（bts 或 depth 映射）：只保留 KL 最小者（并列看 f_loss）
+    结果按 (f_cost, output_kl) 排序。
     """
     clean = [
         ind
         for ind in items
         if int(ind.oor_count) == 0 and math.isfinite(ind.output_kl)
     ]
-    by_depth: dict[int, list[Individual]] = defaultdict(list)
+    by_cost: dict[int, list[Individual]] = defaultdict(list)
     for ind in clean:
-        by_depth[int(ind.total_depth)].append(ind)
+        by_cost[int(ind.f_cost)].append(ind)
 
     selected: list[Individual] = []
-    for depth in sorted(by_depth):
+    for cost in sorted(by_cost):
         best = min(
-            by_depth[depth],
+            by_cost[cost],
             key=lambda x: (_finite_or_inf(x.output_kl), x.f_loss),
         )
         selected.append(best)
 
     selected.sort(
-        key=lambda x: (int(x.total_depth), _finite_or_inf(x.output_kl))
+        key=lambda x: (int(x.f_cost), _finite_or_inf(x.output_kl))
     )
     return selected
 
@@ -581,11 +566,10 @@ def save_pareto_csv(
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     mrpc = task_name == "mrpc"
-    header = ["f_loss", "f_cost"]
+    header = ["f_loss", "f_cost", "total_depth"]
     if with_inference:
         header.extend(
             [
-                "total_depth",
                 "accuracy_delta",
                 "loss_delta",
                 "output_kl",
@@ -599,11 +583,10 @@ def save_pareto_csv(
         writer = csv.writer(f)
         writer.writerow(header)
         for ind in items:
-            row: list = [f"{ind.f_loss:.8e}", ind.f_cost]
+            row: list = [f"{ind.f_loss:.8e}", ind.f_cost, ind.total_depth]
             if with_inference:
                 row.extend(
                     [
-                        ind.total_depth,
                         fmt_metric_delta(ind.accuracy_delta),
                         f"{ind.loss_delta:.8f}",
                         f"{ind.output_kl:.8f}",
@@ -656,8 +639,8 @@ def main() -> None:
     parser.add_argument(
         "--cost-mode",
         choices=("depth", "bts"),
-        default="depth",
-        help=f"depth={depth_f_cost_label()}; bts=预留（未接入时同 depth 映射）",
+        default="bts",
+        help="bts=DualRail DP 总次数（默认）；depth=ceil(深度和/除数)",
     )
     parser.add_argument(
         "--sensitive-dir",
@@ -703,7 +686,8 @@ def main() -> None:
     print("多目标进化搜索（ΣS 来自校验集敏感度；汇报：校验集过滤 → 验证集）")
     print(
         f"pop={args.pop}, gens={args.gens}, seed={args.seed}, "
-        f"cost_mode={args.cost_mode}, sensitive_dir={args.sensitive_dir}"
+        f"cost_mode={args.cost_mode} ({f_cost_label(args.cost_mode)}), "
+        f"sensitive_dir={args.sensitive_dir}"
     )
     print(f"output_dir={args.output_dir}")
     if with_inference:
@@ -749,7 +733,7 @@ def main() -> None:
                 out_path,
                 with_inference=False,
             )
-            print(f"已保存：{out_path}  (无推理，未做深度筛选)")
+            print(f"已保存：{out_path}  (无推理，未做 f_cost 筛选)")
             continue
 
         from evolution_infer import enrich_pareto_report
@@ -766,11 +750,11 @@ def main() -> None:
         enrich_pareto_report(task_name, archive, calib_eval)
 
         full_n = len(archive.items)
-        filtered = filter_pareto_depth_min_kl(archive.sorted_items())
+        filtered = filter_pareto_cost_min_kl(archive.sorted_items())
         archive.items = filtered
         print(
-            f"  深度过滤：{full_n} → {len(filtered)} "
-            f"（同 total_depth 仅留 KL 最小；已排除 OOR）"
+            f"  f_cost 过滤：{full_n} → {len(filtered)} "
+            f"（同 f_cost 仅留 KL 最小；已排除 OOR）"
         )
 
         out_calib = os.path.join(

@@ -3,7 +3,7 @@
 
 目标：
   f_output_kl = KL(p_baseline ‖ p_poly)（校验集平均，越小越好；严格比较，无容差）
-  f_cost      = ceil(深度和 / COST_DEPTH_DIVISOR)（越小越好；严格比较，无容差）
+  f_cost      = DualRail DP 总 bts（默认）；或 ceil(深度和 / 除数)（越小越好；严格比较）
 
 评估集：进化搜索默认使用全部校验集（calib）；可用 --eval-samples N 抽样子集加速。
         Pareto 解最终分别在全部校验集与全部验证集上汇报，写出两个 CSV。
@@ -22,10 +22,9 @@ from dataclasses import dataclass, field
 from cost import (
     NUM_LAYERS,
     SCHEME_LEN,
+    compute_f_cost,
     compute_scheme_cost,
-    depth_f_cost_label,
-    depth_sum_to_f_cost,
-    validate_scheme as validate_cost_scheme,
+    f_cost_label,
 )
 from evolution_infer import (
     SchemeEvaluator,
@@ -42,8 +41,8 @@ from poly_model_inference import (
     fmt_metric_delta,
 )
 # ===================== 配置区 =====================
-#TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+#TASK_NAMES = ["cola", "qnli", "mnli"]
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
@@ -136,15 +135,6 @@ def init_population_strategy(
         population.append(random_legal_scheme(rng, allowed_table))
     rng.shuffle(population)
     return population
-
-
-def compute_f_cost(task_name: str, scheme: list[int], *, cost_mode: str) -> int:
-    validate_cost_scheme(scheme, task_name)
-    if cost_mode == "bts":
-        # TODO: return int(optimize_bootstrap(task_name, scheme))
-        pass
-    depth = int(compute_scheme_cost(task_name, scheme))
-    return depth_sum_to_f_cost(depth)
 
 
 @dataclass
@@ -564,7 +554,8 @@ def main() -> None:
     parser.add_argument(
         "--cost-mode",
         choices=("depth", "bts"),
-        default="depth",
+        default="bts",
+        help="bts=DualRail DP 总次数（默认）；depth=ceil(深度和/除数)",
     )
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
     args = parser.parse_args()
@@ -573,7 +564,8 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(
-        f"多目标进化（Output KL 越小越好；cost={depth_f_cost_label()} 严格越小越好）"
+        f"多目标进化（Output KL 越小越好；"
+        f"cost={f_cost_label(args.cost_mode)} 严格越小越好）"
     )
     print(
         f"device={device}, pop={args.pop}, gens={args.gens}, seed={args.seed}, "
