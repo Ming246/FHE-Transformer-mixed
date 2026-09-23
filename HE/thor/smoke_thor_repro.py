@@ -1206,7 +1206,7 @@ def main() -> int:
         flush=True,
     )
 
-    # DualRail linear: same patches as smoke_att_score / smoke_att_context.
+    # DualRail linear: QKV / score / context / FF patches.
     from functools import partial
 
     from linear_eval import (  # noqa: WPS433

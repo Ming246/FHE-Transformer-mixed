@@ -3,7 +3,11 @@ POLY_SCHEMES 方案 cost。
 
 方案数组：长度 48 = 12 层 × (softmax, ln1, gelu, ln2)，元素 0/1/2=多项式档位，3=原始函数（深度=0）。
 
-- ``compute_scheme_cost``：乘法深度之和（占位 / 汇报列 ``total_depth``）
+- ``compute_scheme_cost`` / ``total_depth``：微事件图上 **真实消耗的乘法深度和**
+  \(\sum_e e.\mathrm{depth}\)（``build_bootstrap_events``，默认 phase C）。
+  不含 bootstrap 后 level-up 扔掉的剩余深度。
+  Softmax / GeLU / LayerNorm 分项也按事件 ``kind`` 从同一张图聚合
+  （Softmax 含 pathway；**不**再用旧 ``*_poly_depth`` 占位公式）。
 - ``compute_scheme_bts`` / ``compute_f_cost(..., cost_mode='bts')``：
   DualRail DP（``HE/thor/bts_ops.optimize_bootstrap``）给出的 **CT 加权 bts**。
   与 ``plan_mock`` + rem_guard 用的是同一求解器；budget 默认 14。
@@ -22,7 +26,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
@@ -121,6 +125,94 @@ def _scheme_bts_cached(
             phase=phase,
         )
     )
+
+
+@lru_cache(maxsize=4096)
+def _scheme_event_depth_breakdown_cached(
+    task_name: str,
+    scheme: tuple[int, ...],
+    phase: str,
+) -> tuple[int, int, int, int, int, int, tuple[tuple[int, str, int, int], ...]]:
+    """
+    从 ``build_bootstrap_events`` 聚合深度（唯一真源）。
+
+    Returns:
+      total, softmax(+pathway), gelu, layernorm(ln1+ln2),
+      pathway_only, linearish(linear+bridge),
+      layers: ((layer_idx, kind, level, depth), ...) for softmax/ln1/gelu/ln2
+    """
+    bts_ops = _thor_bts_ops()
+    events = bts_ops.build_bootstrap_events(
+        task_name, list(scheme), phase=phase
+    )
+
+    by_layer_kind: dict[tuple[int, str], int] = {}
+    by_kind: dict[str, int] = {}
+    total = 0
+    for e in events:
+        d = int(e.depth)
+        total += d
+        k = str(e.kind or "")
+        by_kind[k] = by_kind.get(k, 0) + d
+        if e.layer_idx is not None and int(e.layer_idx) >= 0 and k:
+            key = (int(e.layer_idx), k)
+            by_layer_kind[key] = by_layer_kind.get(key, 0) + d
+
+    # Softmax 块 = 多项式/aSOR(kind=softmax) + 通路(kind=pathway)
+    softmax_core = int(by_kind.get("softmax", 0))
+    pathway = int(by_kind.get("pathway", 0))
+    softmax_block = softmax_core + pathway
+    gelu = int(by_kind.get("gelu", 0))
+    layernorm = int(by_kind.get("ln1", 0)) + int(by_kind.get("ln2", 0))
+    linearish = (
+        int(by_kind.get("linear", 0))
+        + int(by_kind.get("bridge", 0))
+    )
+
+    layers: list[tuple[int, str, int, int]] = []
+    for layer_idx in range(NUM_LAYERS):
+        for kind in ("softmax", "ln1", "gelu", "ln2"):
+            level = int(scheme[scheme_index(layer_idx, kind)])
+            if kind == "softmax":
+                # 与事件图一致：该层 Softmax 非线性 + 其 pathway
+                depth = int(by_layer_kind.get((layer_idx, "softmax"), 0)) + int(
+                    by_layer_kind.get((layer_idx, "pathway"), 0)
+                )
+            else:
+                depth = int(by_layer_kind.get((layer_idx, kind), 0))
+            layers.append((layer_idx, kind, level, depth))
+
+    return (
+        total,
+        softmax_block,
+        gelu,
+        layernorm,
+        pathway,
+        linearish,
+        tuple(layers),
+    )
+
+
+def compute_event_work_depth(
+    task_name: str,
+    scheme: list[int],
+    *,
+    phase: str = "C",
+) -> int:
+    """方案在 HE 微事件图上真正消耗的乘法深度（档位仅 0/1/2）。"""
+    validate_scheme(scheme, task_name)
+    for idx, level in enumerate(scheme):
+        if level not in (0, 1, 2):
+            raise ValueError(
+                f"{task_name} 事件深度仅允许档位 0/1/2，"
+                f"下标 {idx} 为 {level}（不支持 original）"
+            )
+    if task_name not in LAYER_EXP_DIV_BY_TASK:
+        raise KeyError(f"未知任务：{task_name}")
+    total, *_rest = _scheme_event_depth_breakdown_cached(
+        task_name, tuple(int(x) for x in scheme), phase
+    )
+    return int(total)
 
 
 def compute_scheme_bts(
@@ -267,16 +359,23 @@ class LayerCostItem:
 class SchemeCostResult:
     task_name: str
     total_depth: int
-    softmax_depth: int
+    softmax_depth: int  # kind=softmax + pathway（事件图 Softmax 块）
     gelu_depth: int
     layernorm_depth: int
-    layers: list[LayerCostItem]
+    pathway_depth: int = 0  # Softmax 通路子集（含于 softmax_depth）
+    linear_depth: int = 0  # linear + bridge
+    layers: list[LayerCostItem] = field(default_factory=list)
 
     def summary(self) -> str:
+        nonlinear = (
+            self.softmax_depth + self.gelu_depth + self.layernorm_depth
+        )
         return (
-            f"total={self.total_depth} "
-            f"(softmax={self.softmax_depth}, gelu={self.gelu_depth}, "
-            f"layernorm={self.layernorm_depth})"
+            f"total_depth={self.total_depth} (event work) "
+            f"nonlinear={nonlinear} "
+            f"(softmax={self.softmax_depth}[pathway={self.pathway_depth}], "
+            f"gelu={self.gelu_depth}, layernorm={self.layernorm_depth}) "
+            f"linear+bridge={self.linear_depth}"
         )
 
 
@@ -285,48 +384,57 @@ def compute_scheme_cost(
     scheme: list[int],
     *,
     detailed: bool = False,
+    phase: str = "C",
 ) -> int | SchemeCostResult:
     """
-    输入 POLY_SCHEMES 方案，返回当前 cost（深度之和）。
+    输入 POLY_SCHEMES 方案。
 
-    detailed=True 时返回 SchemeCostResult，含逐层明细。
+    所有深度一律来自 ``HE/thor/bts_ops.build_bootstrap_events``（默认 phase C）：
+      - ``total_depth``：Σ event.depth（真实消耗，不含 bootstrap discard）
+      - 非线性分项：按事件 ``kind`` 聚合（Softmax 含 pathway）
+      - ``layers``：逐层逐 slot 的事件深度和
+
+    不再使用 ``softmax_poly_depth`` / ``layernorm_poly_depth`` 等旧占位公式。
     """
     validate_scheme(scheme, task_name)
+    for idx, level in enumerate(scheme):
+        if level not in (0, 1, 2):
+            raise ValueError(
+                f"{task_name} 事件深度仅允许档位 0/1/2，"
+                f"下标 {idx} 为 {level}（不支持 original）"
+            )
     if task_name not in LAYER_EXP_DIV_BY_TASK:
         raise KeyError(f"未知任务：{task_name}")
 
-    items: list[LayerCostItem] = []
-    softmax_total = 0
-    gelu_total = 0
-    layernorm_total = 0
+    (
+        total,
+        softmax_block,
+        gelu,
+        layernorm,
+        pathway,
+        linearish,
+        layer_rows,
+    ) = _scheme_event_depth_breakdown_cached(
+        task_name, tuple(int(x) for x in scheme), phase
+    )
 
-    for layer_idx in range(NUM_LAYERS):
-        for kind in ("softmax", "ln1", "gelu", "ln2"):
-            level = scheme[scheme_index(layer_idx, kind)]
-            if level == SCHEME_ORIGINAL:
-                depth = 0
-            elif kind == "softmax":
-                depth = softmax_poly_depth(task_name, layer_idx, level)
-                softmax_total += depth
-            elif kind == "gelu":
-                depth = gelu_poly_depth(layer_idx, level)
-                gelu_total += depth
-            else:
-                depth = layernorm_poly_depth(task_name, layer_idx, kind, level)
-                layernorm_total += depth
+    if not detailed:
+        return int(total)
 
-            items.append(LayerCostItem(layer_idx, kind, level, depth))
-
-    result = SchemeCostResult(
+    items = [
+        LayerCostItem(layer_idx, kind, level, depth)
+        for layer_idx, kind, level, depth in layer_rows
+    ]
+    return SchemeCostResult(
         task_name=task_name,
-        total_depth=softmax_total + gelu_total + layernorm_total,
-        softmax_depth=softmax_total,
-        gelu_depth=gelu_total,
-        layernorm_depth=layernorm_total,
+        total_depth=int(total),
+        softmax_depth=int(softmax_block),
+        gelu_depth=int(gelu),
+        layernorm_depth=int(layernorm),
+        pathway_depth=int(pathway),
+        linear_depth=int(linearish),
         layers=items,
     )
-    return result if detailed else result.total_depth
-
 
 def print_scheme_cost(task_name: str, scheme: list[int]) -> SchemeCostResult:
     """打印方案 cost 明细。"""
@@ -340,7 +448,7 @@ def print_scheme_cost(task_name: str, scheme: list[int]) -> SchemeCostResult:
         print(f"  bts：{bts}  ({f_cost_label('bts')})")
     except (ValueError, KeyError, RuntimeError) as exc:
         print(f"  bts：不可用（{exc}）")
-    print(f"  {'层':>4} {'类型':<8} {'档位':>4} {'深度':>6}")
+    print(f"  {'层':>4} {'类型':<8} {'档位':>4} {'slot深度':>8}")
     print("  " + "-" * 28)
     for item in result.layers:
         if item.depth == 0 and item.level == SCHEME_ORIGINAL:
@@ -372,7 +480,7 @@ if __name__ == "__main__":
                 out.append(lv)
         return out
 
-    print("POLY_SCHEMES cost（深度和 + DualRail DP bts）")
+    print("POLY_SCHEMES cost（事件深度和 + DualRail DP bts）")
     print("=" * 56)
     for task in TASK_NAMES:
         print_scheme_cost(task, _all_high())

@@ -41,15 +41,15 @@ from poly_model_inference import (
     fmt_metric_delta,
 )
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc", "rte"]
 #TASK_NAMES = ["cola", "qnli", "mnli"]
 POLY_LEVELS = (0, 1, 2)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
-POPULATION_SIZE = 120
-NUM_GENERATIONS = 300
+POPULATION_SIZE = 200
+NUM_GENERATIONS = 400
 CROSSOVER_RATE = 0.9
-MUTATION_RATE = 1.0 / SCHEME_LEN
+MUTATION_RATE = 1.2 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 200

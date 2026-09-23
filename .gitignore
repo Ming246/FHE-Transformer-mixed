@@ -54,7 +54,6 @@ thirdparty/
 **/thirdparty/
 
 # ---- Build artifacts (CMake / CUDA / local HE tests) ----
-HE/heongpu/build/
 **/CMakeFiles/
 **/CMakeCache.txt
 **/cmake_install.cmake
