@@ -67,7 +67,7 @@ from layernorm_poly import (  # noqa: E402
 
 # ===================== 配置 =====================
 #TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc"]
 LOCAL_DATA_ROOT = "../glue_datasets/"
 FINETUNED_MODEL_ROOT = "../finetuned_weight/"
 
@@ -112,18 +112,18 @@ LAYER_INV_SQRT_ALPHA_BY_TASK: dict[str, dict[str, list[float]]] = {
 
 # 单档 max_iters（带 α）；调完后同步到 layernorm_poly 的 high 档
 LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, list[int]]] = {
-    # "mrpc": {
-    #     "ln1": [4,4,4,4,4,4,4,4,4,4,5,5],
-    #     "ln2": [4,4,6,5,5,5,5,5,5,7,7,4],# mrpc 0.00005
-    # },
-    # "rte": {
-    #     "ln1": [4,4,4,4,4,4,4,4,4,4,5,6],
-    #     "ln2":[4,4,6,5,5,5,5,5,5,7,7,4],
-    # },
-    # "sst2": {
-    #     "ln1": [4,4,4,4,4,4,4,4,4,5,5,5],
-    #     "ln2": [4,4,6,5,5,5,5,5,5,7,7,4],
-    # },
+    "mrpc": {
+        "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3],
+        "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],# mrpc 0.00005
+    },
+    "rte": {
+        "ln1": [4,4,4,4,4,4,4,4,4,4,5,6],
+        "ln2":[4,4,6,5,5,5,5,5,5,7,7,4],
+    },
+    "sst2": {
+        "ln1": [4,4,4,4,4,4,4,4,4,5,5,5],
+        "ln2": [4,4,6,5,5,5,5,5,5,7,7,4],
+    },
     # cola/qnli/mnli：初值抄 mrpc，跑通后按误差表再调
     "cola": {
         "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
@@ -141,12 +141,12 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, list[int]]] = {
 }
 LAYER_ENABLE = [True, True, True, True, True, True, 
                 True, True, True, True, True, True]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln1"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln1"]]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln2"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln2"]]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln1"]  = [x-2 for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln1"]]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln2"]  = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln2"]]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln1"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln1"]]
-LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln2"] = [x-2 for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln2"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln1"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln1"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln2"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["cola"]["ln2"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln1"]  = [x-2 for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln1"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln2"]  = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["qnli"]["ln2"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln1"] = [x-2  for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln1"]]
+# LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln2"] = [x-2 for x in LAYER_INV_SQRT_MAX_ITERS_BY_TASK["mnli"]["ln2"]]
 
 # =============================================================================
 

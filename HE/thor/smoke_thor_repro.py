@@ -30,6 +30,7 @@ import os
 import pickle
 import sys
 import time
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -263,21 +264,39 @@ def _plain_layer_refs(model_plain, batch, attention_mask, device):
     return refs
 
 
-def _poly_layer_refs(model_poly, batch, attention_mask, device):
+def _poly_layer_refs(
+    model_poly,
+    batch,
+    attention_mask,
+    device,
+    hidden0=None,
+    start_layer: int = 0,
+):
     """
     Dense poly intermediates (same site keys as ``_plain_layer_refs``).
 
     Requires ``install_eager_attention_poly_patch`` + ``apply_polynomial_scheme``
     so GeLU/LN modules and ``_poly_softmax_fn`` are set. Softmax uses the poly
     evaluator (``_plain_layer_refs`` hardcodes ``F.softmax``).
+
+    ``hidden0`` skips the embedding and starts the walk at ``start_layer``.
+    Earlier slots in the returned list stay ``None``.
     """
-    refs = []
+    refs = [None] * 12
     with torch.no_grad():
-        hs = model_poly.bert.embeddings(
-            input_ids=batch["input_ids"],
-            token_type_ids=batch.get("token_type_ids"),
-        )
-        for layer_idx in range(12):
+        if hidden0 is None:
+            hs = model_poly.bert.embeddings(
+                input_ids=batch["input_ids"],
+                token_type_ids=batch.get("token_type_ids"),
+            )
+            start = 0
+        else:
+            dtype = next(model_poly.parameters()).dtype
+            hs = torch.as_tensor(hidden0, dtype=dtype, device=device)
+            if hs.ndim == 2:
+                hs = hs.unsqueeze(0)
+            start = int(start_layer)
+        for layer_idx in range(start, 12):
             layer = model_poly.bert.encoder.layer[layer_idx]
             attention_m = layer.attention.self
             bert_output_m = layer.attention.output
@@ -329,23 +348,21 @@ def _poly_layer_refs(model_poly, batch, attention_mask, device):
             ln2_in = dense2_out + ln1_out
             ln2_out = layer.output.LayerNorm(ln2_in)
 
-            refs.append(
-                {
-                    "x": hs.cpu().numpy().squeeze(),
-                    "q": q.cpu().numpy().squeeze(),
-                    "att_score": attention_scores.cpu().numpy().squeeze(),
-                    "sftmx_in": sftmx_in.cpu().numpy().squeeze(),
-                    "sftmx_out": sftmx_out.cpu().numpy().squeeze(),
-                    "att_context": att_context.cpu().numpy().squeeze(),
-                    "ln1_in": ln1_in.cpu().numpy().squeeze(),
-                    "ln1_out": ln1_out.cpu().numpy().squeeze(),
-                    "gelu_in": gelu_in.cpu().numpy().squeeze(),
-                    "gelu_out": gelu_out.cpu().numpy().squeeze(),
-                    "dense2_out": dense2_out.cpu().numpy().squeeze(),
-                    "ln2_in": ln2_in.cpu().numpy().squeeze(),
-                    "ln2_out": ln2_out.cpu().numpy().squeeze(),
-                }
-            )
+            refs[layer_idx] = {
+                "x": hs.cpu().numpy().squeeze(),
+                "q": q.cpu().numpy().squeeze(),
+                "att_score": attention_scores.cpu().numpy().squeeze(),
+                "sftmx_in": sftmx_in.cpu().numpy().squeeze(),
+                "sftmx_out": sftmx_out.cpu().numpy().squeeze(),
+                "att_context": att_context.cpu().numpy().squeeze(),
+                "ln1_in": ln1_in.cpu().numpy().squeeze(),
+                "ln1_out": ln1_out.cpu().numpy().squeeze(),
+                "gelu_in": gelu_in.cpu().numpy().squeeze(),
+                "gelu_out": gelu_out.cpu().numpy().squeeze(),
+                "dense2_out": dense2_out.cpu().numpy().squeeze(),
+                "ln2_in": ln2_in.cpu().numpy().squeeze(),
+                "ln2_out": ln2_out.cpu().numpy().squeeze(),
+            }
             hs = ln2_out
     return refs
 
@@ -392,7 +409,29 @@ def _forward_layer(
     def _he_rem(cts) -> int:
         return int(engine.num_levels) - int(list(cts)[0].level_calc)
 
+    def _chain_touch(site: str, cts) -> None:
+        try:
+            from chain_bts_mock_probe import active_chain_probe
+        except ImportError:
+            from .chain_bts_mock_probe import active_chain_probe  # type: ignore
+        probe = active_chain_probe(engine)
+        if probe is None:
+            return
+        try:
+            probe.touch(site, cts)
+        except Exception as exc:
+            raise RuntimeError(f"chain probe failed at {site!r}") from exc
+
     def _probe(site: str, cts, *, note: str = "") -> None:
+        if getattr(engine, "_mag_sk", None) is not None:
+            from mag_probe import report as _mag_report
+
+            _mag_note = ""
+            if site in ("after_att_score", "after_bts_score"):
+                _mag_note = "score_slots=plain/(8*δ1*δ2)"
+            elif site in ("after_ff_dense1", "after_ff_dense1_pre_gelu"):
+                _mag_note = "gelu_in slots are x/C"
+            _mag_report(engine, site, cts, note=_mag_note)
         if level_probe is not None:
             level_probe.record_first(site, cts, note=note)
             if level_probe.should_stop(site):
@@ -513,6 +552,7 @@ def _forward_layer(
         l_k_cplx, q_copies, bootstrap=False, scale=1, rescale=False
     )
     _probe("after_att_score", sftmx_in)
+    _chain_touch("sftmx_in", sftmx_in)
     # Q/K linear done — free DualRail PT tiles before Softmax peak CTs.
     _drop_he_weight_keys(
         thor_attention,
@@ -539,7 +579,6 @@ def _forward_layer(
                     list(sftmx_in),
                     bts_hook,
                     _sev,
-                    scale_after=0.5,
                 )
             )
             break
@@ -549,6 +588,7 @@ def _forward_layer(
         x=sftmx_in, attention_mask=thor_attention_mask, rescale=False, debug=False, sk=None
     )
     _probe("after_softmax", sftmx_out)
+    _chain_touch("sftmx_out", sftmx_out)
 
     # Plan site ``linear_att_context`` before：刷 128 α（主路 inputs；V 旁路见下）。
     _ctx_ev = f"{prefix}.linear_att_context"
@@ -584,6 +624,7 @@ def _forward_layer(
         v_cplx, sftmx_out_rescale, rescale=False
     )
     _probe("after_att_context", att_context)
+    _chain_touch("att_context", att_context)
     _drop_he_weight_keys(
         thor_attention,
         ("value.weight", "value.bias"),
@@ -633,6 +674,7 @@ def _forward_layer(
         )
     dense_output = thor_attention.dense(att_context_rots)
     _probe("after_attn_dense", dense_output)
+    _chain_touch("dense_output", dense_output)
     _drop_he_weight_keys(
         thor_attention,
         ("dense.weight", "dense.bias"),
@@ -647,6 +689,7 @@ def _forward_layer(
     ln1_in = x_out_sum
     ln1_out = thor_attention.layernorm(x=ln1_in, sk=None)
     _probe("after_ln1", ln1_out)
+    _chain_touch("ln1_out", ln1_out)
     # Attn LayerNorm linear done; free γ/β before FF weights hit GPU.
     _drop_he_weight_keys(
         thor_attention,
@@ -669,7 +712,6 @@ def _forward_layer(
                 ln1_out,
                 bts_hook,
                 _ff_rot_ev,
-                scale_after=0.5,
             )
         )
     _probe("after_bts_bridge_rot_ff1", ln1_out)
@@ -705,6 +747,7 @@ def _forward_layer(
 
     gelu_in_wo_bs = thor_ff.dense1(l)
     _probe("after_ff_dense1", gelu_in_wo_bs[0])
+    _chain_touch("gelu_in_wo_bs", gelu_in_wo_bs)
     _drop_he_weight_keys(
         thor_ff,
         ("dense1.weight", "dense1.bias"),
@@ -714,6 +757,7 @@ def _forward_layer(
 
     gelu_out = thor_ff.gelu(x=gelu_in_wo_bs)
     _probe("after_gelu", gelu_out[0])
+    _chain_touch("gelu_out", gelu_out)
 
     # Plan site ``linear_ff_dense2`` before：DualRail 刷 GeLU 出口 (2,8)。
     _ff_d2_ev = f"{prefix}.linear_ff_dense2"
@@ -733,6 +777,7 @@ def _forward_layer(
 
     dense2_out = thor_ff.dense2(gelu_out)
     _probe("after_ff_dense2", dense2_out)
+    _chain_touch("dense2_out", dense2_out)
     _drop_he_weight_keys(
         thor_ff,
         ("dense2.weight", "dense2.bias"),
@@ -743,9 +788,16 @@ def _forward_layer(
         ri = align_bypass_to_main(engine, dense2_out[i], ln1_out[i])
         ln2_in[i] = engine.add(ri, dense2_out[i])
     # LN2 DualRail / scale hooks 在 ``he_layernorm_poly``（``ln2_scale`` 起）
+    if getattr(engine, "_mag_ln_audit", False) and int(layer_idx) == int(
+        getattr(engine, "_mag_layer", -1)
+    ):
+        from mag_probe import audit_ln2_entry
+
+        audit_ln2_entry(engine, gelu_out, dense2_out, ln2_in)
 
     ln2_out = thor_ff.layernorm(x=ln2_in, sk=None)
     _probe("after_ln2", ln2_out)
+    _chain_touch("ln2_out", ln2_out)
     # No level_up(→21): next layer / plan decides rem; do not burn CT for old W@21.
 
     _drop_he_weight_keys(
@@ -862,6 +914,319 @@ def _he_vs_plain_score_packs(
     return err_gate, corr, g_ls
 
 
+def _he_vs_poly_layer_entry(
+    engine,
+    sk,
+    x8,
+    ref_x: np.ndarray,
+) -> tuple[float, float, float, float, float]:
+    """
+    Decrypt 8-real layer entry packs → (seq, hidden), compare to poly ``x``.
+
+    Returns (max|err| after LS, corr, rel err@gain1, err@gain1, ls_gain).
+    """
+    _he = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _he not in sys.path:
+        sys.path.insert(0, _he)
+    from slot_decode import decode_input_from_lower_diagonals
+    from thor_encoder_linear_core import bert_base
+
+    cfg = bert_base()
+    vecs = [
+        np.asarray(engine.decrode(x8[i], sk, is_real=True), dtype=np.float64)
+        for i in range(8)
+    ]
+    he_mat = decode_input_from_lower_diagonals(vecs, cfg)
+    ref = np.asarray(ref_x, dtype=np.float64).squeeze()
+    if ref.ndim == 3:
+        ref = ref.squeeze(0)
+    cur = he_mat.ravel()
+    ref_flat = ref.ravel()
+    n = min(len(cur), len(ref_flat))
+    cur, ref_flat = cur[:n], ref_flat[:n]
+    denom = float(np.dot(cur, cur))
+    if denom > 1e-30:
+        g_ls = float(np.dot(cur, ref_flat) / denom)
+        err = float(np.max(np.abs(cur * g_ls - ref_flat)))
+    else:
+        g_ls = float("nan")
+        err = float("nan")
+    err_g1 = float(np.max(np.abs(cur - ref_flat)))
+    try:
+        from bts_site_pack_probe import compare_real_vectors
+    except ImportError:
+        from .bts_site_pack_probe import compare_real_vectors  # type: ignore
+    st = compare_real_vectors(cur, ref_flat)
+    rel = st["rel_max"]
+    if np.std(cur) < 1e-15 or np.std(ref_flat) < 1e-15:
+        corr = float("nan")
+    else:
+        corr = float(np.corrcoef(cur, ref_flat)[0, 1])
+    return err, corr, rel, err_g1, g_ls
+
+
+class HePlainDiag(NamedTuple):
+    """DualRail slice: HE decrypt vs dense poly plain (same convention as smoke)."""
+
+    abs_err_ls: float
+    corr: float
+    ls_gain: float
+    abs_err_g1: float
+    max_abs_plain: float
+    max_abs_he: float
+    rmse_g1: float
+    rel_max_g1: float
+    rel_mean_g1: float
+    rel_max_ls: float
+    rel_mean_ls: float
+
+    @property
+    def rel_err_g1(self) -> float:
+        """Alias: per-slot rel max (|pre|≥MIN_ABS_PRE_FOR_REL), vs poly ref."""
+        return self.rel_max_g1
+
+    @property
+    def rel_err_ls(self) -> float:
+        return self.rel_max_ls
+
+
+class PlainErrorStats(NamedTuple):
+    """Element-wise HE vs poly plain (dense vectors, gain=1 and LS-calibrated)."""
+
+    max_abs_g1: float
+    max_rel_g1: float
+    mean_abs_g1: float
+    mean_rel_g1: float
+    max_abs_ls: float
+    max_rel_ls: float
+    mean_abs_ls: float
+    mean_rel_ls: float
+    max_abs_plain: float
+    mean_abs_plain: float
+    max_abs_he: float
+    mean_abs_he: float
+    corr: float
+    ls_gain: float
+    n_elem: int
+
+
+def _vectors_error_stats(cur: np.ndarray, ref: np.ndarray) -> PlainErrorStats:
+    cur = np.asarray(cur, dtype=np.float64).ravel()
+    ref = np.asarray(ref, dtype=np.float64).ravel()
+    n = min(len(cur), len(ref))
+    cur, ref = cur[:n], ref[:n]
+    denom = float(np.dot(cur, cur))
+    if denom > 1e-30:
+        g_ls = float(np.dot(cur, ref) / denom)
+        cur_ls = cur * g_ls
+    else:
+        g_ls = float("nan")
+        cur_ls = cur
+    try:
+        from bts_site_pack_probe import compare_real_vectors
+    except ImportError:
+        from .bts_site_pack_probe import compare_real_vectors  # type: ignore
+    st_g1 = compare_real_vectors(cur, ref)
+    st_ls = compare_real_vectors(cur_ls, ref)
+    abs_g1 = np.abs(cur - ref)
+    abs_ls = np.abs(cur_ls - ref)
+    corr = (
+        float(np.corrcoef(cur, ref)[0, 1])
+        if np.std(cur) > 1e-15 and np.std(ref) > 1e-15
+        else float("nan")
+    )
+    return PlainErrorStats(
+        max_abs_g1=st_g1["max_abs_err"],
+        max_rel_g1=st_g1["rel_max"],
+        mean_abs_g1=st_g1["mean_abs_err"],
+        mean_rel_g1=st_g1["rel_mean"],
+        max_abs_ls=st_ls["max_abs_err"],
+        max_rel_ls=st_ls["rel_max"],
+        mean_abs_ls=st_ls["mean_abs_err"],
+        mean_rel_ls=st_ls["rel_mean"],
+        max_abs_plain=float(np.max(np.abs(ref))),
+        mean_abs_plain=float(np.mean(np.abs(ref))),
+        max_abs_he=float(np.max(np.abs(cur))),
+        mean_abs_he=float(np.mean(np.abs(cur))),
+        corr=corr,
+        ls_gain=g_ls,
+        n_elem=int(n),
+    )
+
+
+def _sftmx_he_plain_vectors(
+    engine,
+    sk,
+    he_ct,
+    att_score_hf: np.ndarray,
+    *,
+    task: str,
+    layer_idx: int,
+    rest_div: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    import sys
+    from pathlib import Path
+
+    he_root = str(Path(__file__).resolve().parents[1])
+    repo_root = str(Path(__file__).resolve().parents[2])
+    for p in (he_root, repo_root):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    from thor_encoder_linear_core import bert_base
+    from linear_eval import decode_score_packs  # noqa: WPS433
+    from softmax_poly import score_hf_decode_bake  # noqa: WPS433
+
+    cfg = bert_base()
+    if isinstance(he_ct, np.ndarray) and he_ct.ndim > 1:
+        he_ct = he_ct[0]
+    packs = [
+        np.asarray(engine.decrode(he_ct[i], sk, is_real=True), dtype=np.float64).ravel()
+        for i in range(8)
+    ]
+    bake = score_hf_decode_bake(task, layer_idx)
+    he_dense = decode_score_packs(packs, cfg) * bake
+    scores_hf = np.asarray(att_score_hf, dtype=np.float64)
+    if scores_hf.ndim == 4:
+        scores_hf = scores_hf.squeeze(0)
+    ref = np.transpose(scores_hf, (0, 2, 1))
+    return he_dense.ravel(), ref.ravel()
+
+
+def _hidden8_he_plain_vectors(
+    engine,
+    sk,
+    he_ct,
+    plain: np.ndarray,
+    *,
+    name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    _he = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _he not in sys.path:
+        sys.path.insert(0, _he)
+    from slot_decode import decode_input_from_lower_diagonals, merge_heads
+    from thor_encoder_linear_core import bert_base
+
+    cfg = bert_base()
+    if isinstance(he_ct, np.ndarray) and he_ct.ndim > 1:
+        he_ct = he_ct[0]
+    vecs = [
+        np.asarray(engine.decrode(he_ct[i], sk, is_real=True), dtype=np.float64)
+        for i in range(8)
+    ]
+    he_mat = decode_input_from_lower_diagonals(vecs, cfg).ravel()
+    p = np.asarray(plain, dtype=np.float64)
+    if p.ndim == 4:
+        p = p.squeeze(0)
+    if p.ndim == 3 and name == "att_context":
+        p = merge_heads(p, cfg)
+    ref = np.squeeze(p)
+    if ref.ndim == 2:
+        ref = ref.ravel()
+    else:
+        ref = ref.ravel()
+    n = min(len(he_mat), len(ref))
+    return he_mat[:n], ref[:n]
+
+
+def _he_ct_npacks(he_ct) -> int:
+    if isinstance(he_ct, np.ndarray):
+        return int(he_ct.shape[0]) if he_ct.ndim >= 1 else 1
+    return len(he_ct)
+
+
+def _he_vs_plain_diag_stats(
+    engine,
+    sk,
+    he_ct,
+    plain: np.ndarray,
+    *,
+    name: str,
+    task: str,
+    layer_idx: int,
+    rest_div: float = 1.0,
+) -> PlainErrorStats:
+    """Same slice convention as ``_he_vs_plain_diag``, stats over slice elements."""
+    # Rebuild cur/ref vectors (mirror _he_vs_plain_diag body).
+    if isinstance(he_ct, np.ndarray) and he_ct.ndim > 1:
+        he_ct = he_ct[0]
+    dec = engine.decrode(he_ct[0], sk, is_real=True)
+    current = dec[2**11 * 0 : 2**11 * 1][_H_INDICES[0]]
+    g = plain
+    if g.ndim == 3:
+        g = g[0].T
+    elif name in ("gelu_in", "gelu_out", "gelu_in_wo_bs"):
+        g = np.vsplit(g.T, 24)[0]
+    else:
+        g = np.vsplit(g.T, 6)[0]
+    ref = ld(g, 0)
+    cur = np.asarray(current, dtype=np.float64).ravel()
+    if name == "sftmx_in":
+        import sys
+        from pathlib import Path
+
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from softmax_poly import score_hf_decode_bake  # noqa: WPS433
+
+        bake = score_hf_decode_bake(task, layer_idx)
+        cur = cur[:40] * bake
+        ref = ref[:40]
+    elif name == "ln2_in":
+        cur = cur / 2.0
+    n = min(len(cur), len(ref))
+    return _vectors_error_stats(cur[:n], ref[:n])
+
+
+def he_plain_dense_error_stats(
+    engine,
+    sk,
+    he_ct,
+    plain: np.ndarray,
+    *,
+    name: str,
+    task: str,
+    layer_idx: int,
+    rest_div: float = 1.0,
+) -> PlainErrorStats:
+    if name == "sftmx_in":
+        cur, ref = _sftmx_he_plain_vectors(
+            engine,
+            sk,
+            he_ct,
+            plain,
+            task=task,
+            layer_idx=layer_idx,
+            rest_div=rest_div,
+        )
+    elif name == "att_context" or _he_ct_npacks(he_ct) != 8:
+        return _he_vs_plain_diag_stats(
+            engine,
+            sk,
+            he_ct,
+            plain,
+            name=name,
+            task=task,
+            layer_idx=layer_idx,
+            rest_div=rest_div,
+        )
+    else:
+        cur, ref = _hidden8_he_plain_vectors(
+            engine, sk, he_ct, plain, name=name
+        )
+    stats = _vectors_error_stats(cur, ref)
+    print(
+        f"    [AUDIT] {name} dense n={stats.n_elem} "
+        f"max_abs_g1={stats.max_abs_g1:.6e} max_rel_g1={stats.max_rel_g1:.6e} "
+        f"mean_abs_g1={stats.mean_abs_g1:.6e} mean_rel_g1={stats.mean_rel_g1:.6e} "
+        f"max_abs_ls={stats.max_abs_ls:.6e} max_rel_ls={stats.max_rel_ls:.6e} "
+        f"mean_abs_ls={stats.mean_abs_ls:.6e} mean_rel_ls={stats.mean_rel_ls:.6e} "
+        f"max|plain|={stats.max_abs_plain:.6g} corr={stats.corr:.6f}",
+        flush=True,
+    )
+    return stats
+
+
 def _he_vs_plain_diag(
     engine,
     sk,
@@ -876,11 +1241,9 @@ def _he_vs_plain_diag(
     head: int = 0,
     rest_div: float = 8.0,
     post_dualrail_bs: bool = False,
-) -> tuple[float, float, float]:
+) -> HePlainDiag:
     """
     Compare one DualRail diagonal slice (notebook plot convention).
-
-    Returns (max|err| after scale + LS gain, corr, ls_gain).
 
     ``sftmx_in`` should be compared to plain **pre-mask** ``att_score`` (see
     ``name_map``): HE applies the attention mask inside Softmax, not as
@@ -933,20 +1296,49 @@ def _he_vs_plain_diag(
     else:
         g_ls = float("nan")
         cur_cal = cur
-    err = float(np.max(np.abs(cur_cal - ref)))
-    err_g1 = float(np.max(np.abs(cur - ref)))
+    try:
+        from bts_site_pack_probe import compare_real_vectors
+    except ImportError:
+        from .bts_site_pack_probe import compare_real_vectors  # type: ignore
+    st_g1 = compare_real_vectors(cur, ref)
+    st_ls = compare_real_vectors(cur_cal, ref)
+    err = st_ls["max_abs_err"]
+    err_g1 = st_g1["max_abs_err"]
+    rmse_g1 = st_g1["rmse"]
+    max_ref = st_g1["max_abs_pre"]
+    max_he = st_g1["max_abs_post"]
     if np.std(cur) < 1e-15 or np.std(ref) < 1e-15:
         corr = float("nan")
     else:
         corr = float(np.corrcoef(cur, ref)[0, 1])
+    diag = HePlainDiag(
+        abs_err_ls=err,
+        corr=corr,
+        ls_gain=g_ls,
+        abs_err_g1=err_g1,
+        max_abs_plain=max_ref,
+        max_abs_he=max_he,
+        rmse_g1=rmse_g1,
+        rel_max_g1=st_g1["rel_max"],
+        rel_mean_g1=st_g1["rel_mean"],
+        rel_max_ls=st_ls["rel_max"],
+        rel_mean_ls=st_ls["rel_mean"],
+    )
+    print(
+        f"    [METRICS] {name} max|plain|={max_ref:.6g} max|he|={max_he:.6g} "
+        f"abs_g1={err_g1:.6e} rel_g1_max={diag.rel_max_g1:.6e} rel_g1_mean={diag.rel_mean_g1:.6e} "
+        f"abs_ls={err:.6e} rel_ls_max={diag.rel_max_ls:.6e} rel_ls_mean={diag.rel_mean_ls:.6e} "
+        f"rmse_g1={rmse_g1:.6e} corr={corr:.6f} ls_gain={g_ls:.6g}",
+        flush=True,
+    )
     if name == "sftmx_in":
         print(
-            f"    [sftmx_in diag] max|HE×scale|={float(np.max(np.abs(cur))):.4g}  "
-            f"max|ref|={float(np.max(np.abs(ref))):.4g}  "
+            f"    [sftmx_in diag] max|HE×scale|={max_he:.4g}  "
+            f"max|ref|={max_ref:.4g}  "
             f"err@gain1={err_g1:.3e}  post_bs_div2={post_dualrail_bs}",
             flush=True,
         )
-    return err, corr, g_ls
+    return diag
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -969,8 +1361,8 @@ def main() -> int:
     ap.add_argument(
         "--gelu-level",
         type=int,
-        default=2,
-        help="repo GeLU scheme level 0/1/2 when --gelu cheb",
+        default=1,
+        help="repo GeLU scheme level 0/1 when --gelu cheb",
     )
     ap.add_argument(
         "--ln",
@@ -981,8 +1373,8 @@ def main() -> int:
     ap.add_argument(
         "--ln-level",
         type=int,
-        default=2,
-        help="repo LN scheme level 0/1/2 when --ln poly",
+        default=1,
+        help="repo LN scheme level 0/1 when --ln poly",
     )
     ap.add_argument(
         "--softmax",
@@ -993,8 +1385,8 @@ def main() -> int:
     ap.add_argument(
         "--softmax-level",
         type=int,
-        default=2,
-        help="repo Softmax scheme level 0/1/2 when --softmax poly",
+        default=1,
+        help="repo Softmax scheme level 0/1 when --softmax poly",
     )
     ap.add_argument(
         "--bootstrap",
@@ -1013,6 +1405,11 @@ def main() -> int:
         "--plan-discard",
         action="store_true",
         help="after plan bts, short-chain level_up discard (off until DEPTH_* calibrated)",
+    )
+    ap.add_argument(
+        "--probe-bts-err",
+        action="store_true",
+        help="decrypt before/after every engine.bootstrap; print max|Δ| (diag)",
     )
     ap.add_argument(
         "--encrypt-level",
@@ -1126,7 +1523,8 @@ def main() -> int:
 
         land = args.mock_land_level
         if land is None:
-            # Always land rem=budget; DualRail unpack ×½ supplies real_pack −1.
+            # Always land rem=budget at mock kernel; postscale / DualRail
+            # unpack×(½·INV) supplies the −1 so effective rem=budget−1.
             mock_info = install_mock_bootstrap(
                 engine, sk, pk, rem_after=int(_BUDGET)
             )
@@ -1138,6 +1536,15 @@ def main() -> int:
             f"  bootstrap MOCK: decrypt→encodecrypt @ level_calc="
             f"{mock_info['land_level']} "
             f"(rem≈{mock_info.get('rem_after', int(engine.num_levels)-int(mock_info['land_level']))})",
+            flush=True,
+        )
+
+    if args.probe_bts_err:
+        from bts_decrypt_probe import install_bts_decrypt_probe
+
+        install_bts_decrypt_probe(engine, sk)
+        print(
+            "  [bts err] probe ON: decrypt before/after every engine.bootstrap",
             flush=True,
         )
 
@@ -1277,13 +1684,13 @@ def main() -> int:
     from gelu_poly import gelu_level_allowed
     from cost import NUM_LAYERS
     bts_hook = BootstrapHook(engine, mode="always")
-    # Build 48-d scheme from CLI poly levels (thor slots still get high=2).
-    sm_lv = int(args.softmax_level) if args.softmax == "poly" else 2
-    ln_lv = int(args.ln_level) if args.ln == "poly" else 2
-    ge_lv = int(args.gelu_level) if args.gelu == "cheb" else 2
+    # Build 48-d scheme from CLI poly levels (非 poly 时默认 high=1)。
+    sm_lv = int(args.softmax_level) if args.softmax == "poly" else 1
+    ln_lv = int(args.ln_level) if args.ln == "poly" else 1
+    ge_lv = int(args.gelu_level) if args.gelu == "cheb" else 1
     scheme = []
     for li in range(NUM_LAYERS):
-        g_lv = ge_lv if gelu_level_allowed(li, ge_lv) else 2
+        g_lv = ge_lv if gelu_level_allowed(li, ge_lv) else 1
         scheme.extend([sm_lv, ln_lv, g_lv, ln_lv])
     assert len(scheme) == 48
     # L0 入口：HE probe rem = num_levels − level_calc 须等于 DP initial_rem。
@@ -1623,7 +2030,7 @@ def main() -> int:
                     rest_div=float(args.rest_div),
                 )
             else:
-                err, corr, gain_ls = _he_vs_plain_diag(
+                d = _he_vs_plain_diag(
                     engine,
                     sk,
                     exc.cts,
@@ -1634,14 +2041,14 @@ def main() -> int:
                     rest_div=float(args.rest_div),
                     post_dualrail_bs=post_bs,
                 )
-            status = "OK" if err < args.tol else "BAD"
+            status = "OK" if d.abs_err_ls < args.tol else "BAD"
             print(
-                f"  [{status}] {early_name} @{exc.site}: max|err|={err:.3e}  "
-                f"corr={corr:.4f}  ls_gain={gain_ls:.4g}  tol={args.tol}",
+                f"  [{status}] {early_name} @{exc.site}: max|err|={d.abs_err_ls:.3e}  "
+                f"corr={d.corr:.4f}  ls_gain={d.ls_gain:.4g}  tol={args.tol}",
                 flush=True,
             )
-            print("PASS" if err < args.tol else "FAIL")
-            return 0 if err < args.tol else 2
+            print("PASS" if d.abs_err_ls < args.tol else "FAIL")
+            return 0 if d.abs_err_ls < args.tol else 2
         return 0
     print(f"  HE layer done ({time.time() - t1:.1f}s)", flush=True)
     if depth_recorder is not None and level_probe is not None:
@@ -1676,6 +2083,8 @@ def main() -> int:
             print(f"    {ev}: {n}", flush=True)
 
     pref = plain_refs[layer_idx]
+    ok = True
+
     # Map HE names → poly ref keys（与 poly_model_inference 中间量同名）
     name_map = {
         # HE score CT is pre-mask; poly sftmx_in includes additive mask.
@@ -1693,7 +2102,6 @@ def main() -> int:
         "q": "q",
     }
 
-    ok = True
     cheb_params = getattr(thor_ff, "_gelu_cheb_params", None)
     for name in args.check:
         he = he_vars[name]
@@ -1759,7 +2167,7 @@ def main() -> int:
                     rest_div=float(args.rest_div),
                 )
             else:
-                err, corr, gain_ls = _he_vs_plain_diag(
+                d = _he_vs_plain_diag(
                     engine,
                     sk,
                     he,
@@ -1770,6 +2178,7 @@ def main() -> int:
                     rest_div=float(args.rest_div),
                     post_dualrail_bs=False,
                 )
+                err, corr, gain_ls = d.abs_err_ls, d.corr, d.ls_gain
         status = "OK" if err < args.tol else "BAD"
         if err >= args.tol:
             ok = False

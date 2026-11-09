@@ -1,7 +1,7 @@
 """
 计算 BERT 各非线性输出位置的一阶 Taylor 型敏感度 S_l（三档近似误差）。
 
-对每个位置 l、精度档 k∈{low,mid,high}，在校验集（calib）上：
+对每个位置 l、精度档 k∈{low,high}，在校验集（calib）上：
 
   S_{l,j}^{(k)} = g_{l,j}·Δy_{l,j}^{(k)}
   S_l^{(k)}     = |Σ_j S_{l,j}^{(k)}|
@@ -47,8 +47,8 @@ from softmax_poly import (
 )
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-#TASK_NAMES = ["cola", "qnli", "mnli"]
+#TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
@@ -64,7 +64,7 @@ TASK_NUM_LABELS: dict[str, int] = {
     "mnli": 3,
 }
 BATCH_SIZE = 1
-NUM_PRECISION_LEVELS = 3
+NUM_PRECISION_LEVELS = 2  # 0=low, 1=high
 MAX_CALIB_SAMPLES = None
 
 CALIB_SEED = 42
@@ -460,7 +460,7 @@ def compute_sensitivity_for_task(
     print(f"{'=' * 60}")
     print(
         "S = |Σ_j g_j·Δy_j|；"
-        "Δy = y_poly − y_exact；三档 low/mid/high"
+        "Δy = y_poly − y_exact；两档 low/high"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(finetuned_model_path)
@@ -565,11 +565,11 @@ def print_scores(task_name: str, scores: dict[str, float], sample_count: int) ->
 
 
 def save_scores_csv(task_name: str, scores: dict[str, float]) -> str:
-    """宽表：每 (layer, kind) 一行，列为 S_low / S_mid / S_high（48 行/任务）。"""
+    """宽表：每 (layer, kind) 一行，列为 S_low / S_high（48 行/任务）。"""
     os.makedirs(SENSITIVE_OUTPUT_DIR, exist_ok=True)
     path = os.path.join(SENSITIVE_OUTPUT_DIR, f"{task_name}_sensitivity.csv")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("layer_idx,kind,S_low,S_mid,S_high\n")
+        f.write("layer_idx,kind,S_low,S_high\n")
         for layer_idx in range(NUM_LAYERS):
             for kind in SCHEME_KINDS_PER_LAYER:
                 s = [
@@ -578,7 +578,7 @@ def save_scores_csv(task_name: str, scores: dict[str, float]) -> str:
                 ]
                 f.write(
                     f"{layer_idx},{kind},"
-                    f"{s[0]:.10e},{s[1]:.10e},{s[2]:.10e}\n"
+                    f"{s[0]:.10e},{s[1]:.10e}\n"
                 )
     return path
 
@@ -603,7 +603,7 @@ def main():
 
     total_elapsed = time.perf_counter() - t_all
     print(f"\n{'=' * 60}")
-    print("三任务完成（CSV 宽表 48 行/任务：layer × softmax|ln1|gelu|ln2 × S_low|S_mid|S_high）")
+    print("任务完成（CSV 宽表 48 行/任务：layer × softmax|ln1|gelu|ln2 × S_low|S_high）")
     print(f"{'=' * 60}")
     for task_name in TASK_NAMES:
         top = sorted(all_results[task_name].items(), key=lambda x: x[1], reverse=True)[:5]

@@ -63,9 +63,9 @@ GeLU 有层组档位约束：`gelu_poly.gelu_level_allowed`。
 
 | 算子 | 深度来源 |
 |------|----------|
-| GeLU | `gelu_poly.gelu_config_for_layer` → `depth_he`（Chebyshev / PS-tree + 还原 +1） |
-| Softmax | `5 + asor×SOFTMAX_ASOR_ITER_DEPTH(=1) + Σy² asor×1`（HE DeltaCt 实测；Stockmeyer 4 + δ1 square 1；Σy² 轮数 \(=\lceil\log_2\delta_2\rceil\)，未用轮填 0） |
-| LayerNorm | `count_he_invsqrt_iters(...) + 3` |
+| GeLU | `gelu_he_depth` ← `depth_he`（Chebyshev / PS-tree + 还原 +1） |
+| Softmax | `softmax_he_depth`：`5 + asor×1 + Σy² asor×1`（不含 pathway；每轮 aSOR rem=1） |
+| LayerNorm | `layernorm_he_depth`：scale+var+enc_one + 2×iters + post |
 
 API：`compute_scheme_cost(task, scheme)` → 深度和；`detailed=True` 得 per-slot 明细。
 
@@ -108,19 +108,18 @@ FF: 实8→复打包+旋转(64) → dense1 → (2,8) → [打包 bootstrap×8]
 | FF dense1 / GeLU | **16** | **16** |
 | 线性深度 | 见 THOR 注释 l→l+2 等 | `bts_ops` 常量表（QKV=2, dense=3,…） |
 
-实验实现：`bts_ops.py`（**阶段 C 默认**）。档位仅 0/1/2。段深 > `BOOTSTRAP_DEPTH_BUDGET` 时由 `_consume_depth` 中途 bts。
+实验实现：`bts_ops.py`（**仅 phase C**）。档位仅 0/1（low/high）。段深 > `BOOTSTRAP_DEPTH_BUDGET` 时由 `_consume_depth` 中途 bts。
 
 **对齐（join）**：按两路实际 remaining，`rem ← min(spine, side)`（深侧 level_up）。旁路 fork 保存残差与 V；spine bootstrap 不刷新旁路。ct×ct（Q·K、Softmax·V）深度不足时按 **spine+side CT** 计 bts；Softmax·V / 残差可 `refresh_side` 刷旁路槽，Q·K 不刷 V（K≠V）。
 
-**Softmax 深度拆分**：`cost.softmax_poly_depth` 只管多项式；通路另计 `attn_mask`（pt×ct=1）+ `copy`（mask+rotsum=1，对照 THOR `make_copies`）。
+**Softmax 深度拆分**：`cost.softmax_he_depth` 只管 core（exp+aSOR）；pathway 另计 `attn_mask` / Σy² apply / `dualrail_exit` 等（见微事件 `kind=pathway`）。
 
 **阶段 D**：`run_phase_d_audit()` — 深度守恒、CT 链、fork/join、双侧 bootstrap 单元、low≤mid≤high 单调性。
 
 | 阶段 | 内容 |
 |------|------|
-| A | 非线性整段粗事件 + fork/join（无通路 depth） |
-| B | 粗微段 + fork/join（无通路 depth） |
-| C | 微事件 + 通路 depth + fork/join（正式 bts） |
+| C | 微事件 + Softmax pathway + fork/join（唯一正式路径；A/B 已删除） |
+| D | `run_phase_d_audit()` 自洽检查 |
 
 ### 路线 B（选定）：HE 驱动 Plan（反推）
 
@@ -197,7 +196,7 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 
 - 倒数是 **aSOR**（与 THOR `he_inv` 同形；固定 kn 更新）
 - **不是** Newton（无 `D*r` 耦合项）；生产路径已不用 Goldschmidt
-- 深度公式与 `cost.softmax_poly_depth` 对齐；eval 打印可用实际 iters（α 提前停）
+- 深度公式与 `cost.softmax_he_depth` 对齐；eval 打印可用实际 iters（α 提前停）
 - `LAYER_ASOR_MAX_ITERS_SUM_SQ2_*`：仅 \(\delta_2=4\) 的层非零，其余为 0 且不计深度
 
 ### GeLU（Chebyshev）
@@ -220,7 +219,7 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 - **不要**用 `exp`/`log` 做 InvertSqrt 初值
 - `min_var` → invsqrt 的 \(e_0\)；`max_var` → 缩放 \(M\)；二者勿混
 - 取向 B：无 CKKS 编码 bookend（mask/2、out×2 已移除）
-- 深度：`invsqrt_max_iters + 3`
+- 深度：`layernorm_he_depth` = scale(1)+var(2)+enc_one(0)+2×iters+post(2)
 
 ### 端到端明文替换推理
 

@@ -10,7 +10,7 @@ Usage (profile one layer, plan_mock = plan sites + mock refresh)::
 
   python3 HE/thor/smoke_thor_repro.py --layer 0 --bootstrap plan_mock \\
     --probe-levels --no-rem-guard --depth-profile-out /tmp/L0_depth.json \\
-    --softmax-level 2 --ln-level 2 --gelu-level 2 --gelu cheb --ln poly --softmax poly
+    --softmax-level 1 --ln-level 1 --gelu-level 1 --gelu cheb --ln poly --softmax poly
 
 Merge + build overrides::
 

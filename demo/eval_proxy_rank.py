@@ -62,7 +62,7 @@ from calibrate_alpha_s1 import (  # noqa: E402
     load_s1_matrix,
 )
 
-POLY_LEVELS = (0, 1, 2)
+POLY_LEVELS = (0, 1)
 
 
 @dataclass

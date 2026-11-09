@@ -38,10 +38,10 @@ from scipy.stats import kendalltau, spearmanr
 from cost import (
     SCHEME_LEN,
     compute_scheme_cost,
-    gelu_poly_depth,
-    layernorm_poly_depth,
+    gelu_he_depth,
+    layernorm_he_depth,
     scheme_index,
-    softmax_poly_depth,
+    softmax_he_depth,
 )
 from evolution_infer import SchemeEvaluator, device
 from evolution_score import (
@@ -129,11 +129,11 @@ def build_slot_depth_table(
         idx = scheme_index(layer_idx, kind)
         for level in allowed_table[idx]:
             if kind == "softmax":
-                depth = softmax_poly_depth(task_name, layer_idx, level)
+                depth = softmax_he_depth(task_name, layer_idx, level)
             elif kind == "gelu":
-                depth = gelu_poly_depth(layer_idx, level)
+                depth = gelu_he_depth(layer_idx, level)
             else:
-                depth = layernorm_poly_depth(task_name, layer_idx, kind, level)
+                depth = layernorm_he_depth(task_name, layer_idx, kind, level)
             table[idx][level] = int(depth)
     return table
 
@@ -1020,9 +1020,9 @@ def save_score_kl_scatter_pdf(
         )
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_xlabel(r"score_sum ($\sum S$)")
+        ax.set_xlabel(r"Sensitivity Surrogate $S(\mathbf{t})$")
         if col == 0:
-            ax.set_ylabel("output_kl")
+            ax.set_ylabel("KL Divergence")
         ax.set_title(
             f"{task_name.upper()}  (n={len(rows)}, "
             f"ρ={rho:.3f}, p={format_pvalue(float(rho_p))})"

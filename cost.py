@@ -1,25 +1,24 @@
 """
 POLY_SCHEMES 方案 cost。
 
-方案数组：长度 48 = 12 层 × (softmax, ln1, gelu, ln2)，元素 0/1/2=多项式档位，3=原始函数（深度=0）。
+方案数组：长度 48 = 12 层 × (softmax, ln1, gelu, ln2)，元素 0/1=多项式档位（low/high），3=原始函数（深度=0）。
 
 - ``compute_scheme_cost`` / ``total_depth``：微事件图上 **真实消耗的乘法深度和**
   \(\sum_e e.\mathrm{depth}\)（``build_bootstrap_events``，默认 phase C）。
   不含 bootstrap 后 level-up 扔掉的剩余深度。
   Softmax / GeLU / LayerNorm 分项也按事件 ``kind`` 从同一张图聚合
-  （Softmax 含 pathway；**不**再用旧 ``*_poly_depth`` 占位公式）。
+  （Softmax 含 pathway；分项亦可对照 ``softmax_he_depth`` / ``gelu_he_depth`` / ``layernorm_he_depth``）。
 - ``compute_scheme_bts`` / ``compute_f_cost(..., cost_mode='bts')``：
-  DualRail DP（``HE/thor/bts_ops.optimize_bootstrap``）给出的 **CT 加权 bts**。
-  与 ``plan_mock`` + rem_guard 用的是同一求解器；budget 默认 14。
+  DualRail DP 主路 placements **加上** HE 旁路 ``align_bypass`` / exp AUX
+  的实际 bootstrap 次数（``HE/thor/bts_ops.optimize_bootstrap`` 的
+  ``bts_count``；``spine_bts_count`` / ``bypass_bts_count`` 分项）。
+  放置点仍只由主路 DP 决定；budget 默认 14。
 
-深度公式（GeLU Chebyshev / HE PS-tree）：
-  取自 gelu_poly 方案配置 depth_he（含 GELU 还原 +1）
-  Softmax:        SOFTMAX_DEPTH_BASE + asor_σ×ASOR_ITER + Σ_r(asor_Σy²_r)×ASOR_ITER
-                  BASE = Stockmeyer(deg15 密路径 4) + δ1 平方 (log2(delta1)=1) = 5
-                  ASOR_ITER = 1：HE ``he_asor_ct``（DeltaCt 把 kn 记进 delta，
-                  每轮每轨仅 1 次 ct×ct；见 ``HE/thor/probe_asor_iter_depth.py``）
-                  Σy² 轮数 = ceil(log2(exp_div))；第 1/2 轮 iters 可不同
-  LayerNorm:      invsqrt_max_iters + 3（生产路径固定步数，无 α）
+深度公式（与 phase C 微事件 ``kind`` 和一致）：
+  Softmax core:   ``softmax_he_depth`` = BASE + asor_σ×1 + Σy² asor×1
+                  （pathway 另计；BASE=Stockmeyer4+δ1 square1；每轮 aSOR rem=1）
+  GeLU:          ``gelu_he_depth`` = gelu_poly depth_he（PS-tree + 还原 +1）
+  LayerNorm:      ``layernorm_he_depth`` = scale(1)+var(2)+enc_one(0)+2×iters+post(2)
 """
 from __future__ import annotations
 
@@ -49,7 +48,12 @@ SCHEME_ORIGINAL = 3
 SCHEME_SLOTS_PER_LAYER = 4
 SCHEME_LEN = NUM_LAYERS * SCHEME_SLOTS_PER_LAYER
 
-LAYERNORM_DEPTH_OVERHEAD = 3
+# HE LayerNorm 微事件深度（与 HE/thor/bts_ops phase C 一致）
+DEPTH_LN_SCALE = 1
+DEPTH_LN_VAR = 2
+DEPTH_LN_ENC_ONE = 0
+LN_INVSQRT_ITER_DEPTH = 2
+DEPTH_LN_POST_INVSQRT = 2
 
 # 进化搜索 depth 占位：f_cost = ceil(深度和 / COST_DEPTH_DIVISOR)
 COST_DEPTH_DIVISOR = 1
@@ -199,12 +203,12 @@ def compute_event_work_depth(
     *,
     phase: str = "C",
 ) -> int:
-    """方案在 HE 微事件图上真正消耗的乘法深度（档位仅 0/1/2）。"""
+    """方案在 HE 微事件图上真正消耗的乘法深度（档位仅 0/1）。"""
     validate_scheme(scheme, task_name)
     for idx, level in enumerate(scheme):
-        if level not in (0, 1, 2):
+        if level not in (0, 1):
             raise ValueError(
-                f"{task_name} 事件深度仅允许档位 0/1/2，"
+                f"{task_name} 事件深度仅允许档位 0/1，"
                 f"下标 {idx} 为 {level}（不支持 original）"
             )
     if task_name not in LAYER_EXP_DIV_BY_TASK:
@@ -222,12 +226,12 @@ def compute_scheme_bts(
     budget: int | None = None,
     phase: str = "C",
 ) -> int:
-    """最优 DualRail bootstrap 放置下的 CT 加权 bts（档位仅 0/1/2）。"""
+    """最优 DualRail bootstrap 放置下的 CT 加权 bts（档位仅 0/1）。"""
     validate_scheme(scheme, task_name)
     for idx, level in enumerate(scheme):
-        if level not in (0, 1, 2):
+        if level not in (0, 1):
             raise ValueError(
-                f"{task_name} bts cost 仅允许档位 0/1/2，"
+                f"{task_name} bts cost 仅允许档位 0/1，"
                 f"下标 {idx} 为 {level}（不支持 original）"
             )
     if task_name not in LAYER_EXP_DIV_BY_TASK:
@@ -297,19 +301,19 @@ def validate_scheme(scheme: list[int], task_name: str = "") -> None:
             f"{task_name} 方案长度应为 {SCHEME_LEN}，当前为 {len(scheme)}"
         )
     for idx, level in enumerate(scheme):
-        if level not in (0, 1, 2, SCHEME_ORIGINAL):
+        if level not in (0, 1, SCHEME_ORIGINAL):
             raise ValueError(
-                f"{task_name} 方案下标 {idx} 非法：{level}（仅允许 0/1/2/3）"
+                f"{task_name} 方案下标 {idx} 非法：{level}（仅允许 0/1/3）"
             )
 
 
-def gelu_poly_depth(layer_idx: int, level: int) -> int:
+def gelu_he_depth(layer_idx: int, level: int) -> int:
     """单层 GeLU Chebyshev 方案 HE 乘法深度；禁止档位抛错。"""
     cfg = gelu_config_for_layer(layer_idx, level)
     return int(cfg["depth_he"])
 
 
-def softmax_poly_depth(task_name: str, layer_idx: int, level: int) -> int:
+def softmax_he_depth(task_name: str, layer_idx: int, level: int) -> int:
     """单层 thor_softmax 乘法深度；level∈{0,1,2}。aSOR 固定 max_iters（无 α）。
 
     aSOR 每轮按 ``SOFTMAX_ASOR_ITER_DEPTH``（HE 实测 rem=1）计，不是明文公式的 2。
@@ -338,13 +342,19 @@ def softmax_poly_depth(task_name: str, layer_idx: int, level: int) -> int:
     )
 
 
-def layernorm_poly_depth(
+def layernorm_he_depth(
     task_name: str, layer_idx: int, kind: str, level: int
 ) -> int:
-    """单层 HE LayerNorm 乘法深度 = he_invsqrt 迭代次数 + 3。"""
+    """单层 HE LayerNorm 乘法深度（phase C 微事件和）。"""
     cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
     iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
-    return iters + LAYERNORM_DEPTH_OVERHEAD
+    return (
+        DEPTH_LN_SCALE
+        + DEPTH_LN_VAR
+        + DEPTH_LN_ENC_ONE
+        + iters * LN_INVSQRT_ITER_DEPTH
+        + DEPTH_LN_POST_INVSQRT
+    )
 
 
 @dataclass
@@ -394,13 +404,13 @@ def compute_scheme_cost(
       - 非线性分项：按事件 ``kind`` 聚合（Softmax 含 pathway）
       - ``layers``：逐层逐 slot 的事件深度和
 
-    不再使用 ``softmax_poly_depth`` / ``layernorm_poly_depth`` 等旧占位公式。
-    """
+    Softmax / GeLU / LN 分项按事件图聚合；对照 ``*_he_depth``（Softmax 不含 pathway）。
+"""
     validate_scheme(scheme, task_name)
     for idx, level in enumerate(scheme):
-        if level not in (0, 1, 2):
+        if level not in (0, 1):
             raise ValueError(
-                f"{task_name} 事件深度仅允许档位 0/1/2，"
+                f"{task_name} 事件深度仅允许档位 0/1，"
                 f"下标 {idx} 为 {level}（不支持 original）"
             )
     if task_name not in LAYER_EXP_DIV_BY_TASK:
@@ -474,9 +484,9 @@ if __name__ == "__main__":
         out: list[int] = []
         for layer_idx in range(NUM_LAYERS):
             for kind in ("softmax", "ln1", "gelu", "ln2"):
-                lv = 2
+                lv = 1
                 if kind == "gelu" and not gelu_level_allowed(layer_idx, lv):
-                    lv = 2
+                    lv = 1
                 out.append(lv)
         return out
 

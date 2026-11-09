@@ -3,7 +3,7 @@ HE LayerNorm 近似：参数 + 实现（生产路径）。
 
 参数权威来源（本文件维护，nolinear/layernorm.py 只读）：
   - W_BUFFER / VAR_MIN_SCALE / VAR_MAX_SCALE
-  - 三档 he_invsqrt max_iters（low/mid/high；high 应对齐 eval 调好的次数）
+  - 两档 he_invsqrt max_iters（0=low / 1=high；high 应对齐 eval 调好的次数）
 
 nolinear/layernorm.py 仅保留 α 与单档 max_iters 用于带 α 的误差调参；
 调完后请把 max_iters 写回本文件对应任务的 high 档。
@@ -29,12 +29,11 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-LAYERNORM_LEVEL_KEYS = ("low", "mid", "high")
+LAYERNORM_LEVEL_KEYS = ("low", "high")  # 档位 0/1；旧 mid 参数保留在 iters 表注释中
 LAYERNORM_KIND_KEYS = ("ln1", "ln2")  # ln1=attn output LN, ln2=FFN output LN
 
 LAYERNORM_POLY_FUNC_NAMES: list[str] = [
     "poly_layernorm_low",
-    "poly_layernorm_mid",
     "poly_layernorm_high",
 ]
 
@@ -52,20 +51,24 @@ _VARIANCE_JSON_DIR = os.path.join(
 
 
 # task → level → {ln1, ln2} → 12 层 he_invsqrt 迭代次数（固定步数，无 α）
-# high = nolinear/layernorm.py 调参结果；mid/low 在 high 上递减
+# mid 已注释；实验用 high = low+3 拉开档差（原 high/mid 保留注释）
 LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
     "mrpc": {
         "low": {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3],
             "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4],
+        #     "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
+        #     "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6],  # low+3
+            "ln2": [5, 5, 7, 6, 6, 6, 6, 6, 6, 6, 6, 5],
         },
     },
     "rte": {
@@ -73,13 +76,17 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 4],
             "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 5],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 5],
+        #     "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 6],
+        #     "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 6],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 7],  # low+3
+            "ln2": [5, 5, 7, 6, 6, 6, 6, 6, 6, 8, 8, 5],
         },
     },
     "sst2": {
@@ -87,28 +94,35 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3],
             "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4],
+        #     "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5],
+        #     "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6],  # low+3
+            "ln2": [5, 5, 7, 6, 6, 6, 6, 6, 6, 8, 8, 5],
         },
     },
-    # cola/qnli/mnli：初值抄 mrpc，对齐 eval 后再调
     "cola": {
         "low": {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3],
             "ln2": [2, 2, 3, 3, 3, 3, 3, 2, 3, 5, 5, 1],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4],
-            "ln2": [3, 3, 4, 4, 4, 4, 4, 3, 4, 6, 6, 2],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4],
+        #     "ln2": [3, 3, 4, 4, 4, 4, 4, 3, 4, 6, 6, 2],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
+        #     "ln2": [4, 4, 5, 5, 5, 5, 5, 4, 5, 7, 7, 3],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5],
-            "ln2": [4, 4, 5, 5, 5, 5, 5, 4, 5, 7, 7, 3],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6],  # low+3
+            "ln2": [5, 5, 6, 6, 6, 6, 6, 5, 6, 8, 8, 4],
         },
     },
     "qnli": {
@@ -116,13 +130,17 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4],
             "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
+        #     "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
+        #     "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 7],  # low+3
+            "ln2": [5, 5, 7, 6, 6, 6, 6, 6, 6, 8, 8, 5],
         },
     },
     "mnli": {
@@ -130,13 +148,17 @@ LAYER_INV_SQRT_MAX_ITERS_BY_TASK: dict[str, dict[str, dict[str, list[int]]]] = {
             "ln1": [2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 4],
             "ln2": [2, 2, 4, 3, 3, 3, 3, 3, 3, 5, 5, 2],
         },
-        "mid": {
-            "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
-            "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
-        },
+        # "mid": {
+        #     "ln1": [3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5],
+        #     "ln2": [3, 3, 5, 4, 4, 4, 4, 4, 4, 6, 6, 3],
+        # },
+        # "high": {
+        #     "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
+        #     "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+        # },
         "high": {
-            "ln1": [4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6],
-            "ln2": [4, 4, 6, 5, 5, 5, 5, 5, 5, 7, 7, 4],
+            "ln1": [5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 7],  # low+3
+            "ln2": [5, 5, 7, 6, 6, 6, 6, 6, 6, 8, 8, 5],
         },
     },
 }
@@ -387,7 +409,7 @@ def poly_layernorm_low(
     )
 
 
-def poly_layernorm_mid(
+def poly_layernorm_high(
     x: torch.Tensor,
     layer_idx: int,
     kind: str,
@@ -402,23 +424,7 @@ def poly_layernorm_mid(
     )
 
 
-def poly_layernorm_high(
-    x: torch.Tensor,
-    layer_idx: int,
-    kind: str,
-    gamma: torch.Tensor,
-    beta: torch.Tensor,
-    eps: float,
-    *,
-    task_name: str,
-) -> torch.Tensor:
-    return HeLayerNormPolyEvaluator(task_name, layer_idx, kind, 2)(
-        x, gamma, beta, eps
-    )
-
-
 LAYERNORM_POLY_FUNCS: list = [
     poly_layernorm_low,
-    poly_layernorm_mid,
     poly_layernorm_high,
 ]

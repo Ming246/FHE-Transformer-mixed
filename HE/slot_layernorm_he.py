@@ -6,9 +6,9 @@ THOR 风格：pack 求和 + ``rotsum(slot_stride)`` + head 轴 1/2/4 折叠/广�
 （仅用 rotate / add / pt×ct / ct×ct）。
 
 ``input_lower`` 中 head 0..5 与 6..11 为同一列块的重复写入；求和前 mask 掉
-h≥6，避免双计。``depth`` 与 cost：``invsqrt_max_iters + 3``。
+h≥6，避免双计。``depth`` 与 cost：``layernorm_he_depth``（每轮 inv√ 深度 2）。
 
-参数通用（min_var/max_var/iters/w_buffer）；档位只是参数组合。测试默认 high。
+参数通用（min_var/max_var/iters/w_buffer）；档位只是参数组合。测试默认 high（level=1）。
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class LayerNormHeParams:
         layer_idx: int,
         kind: str,
         *,
-        level: int = 2,
+        level: int = 1,
     ) -> "LayerNormHeParams":
         cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
         return LayerNormHeParams(

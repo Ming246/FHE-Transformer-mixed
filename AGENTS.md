@@ -52,24 +52,23 @@ docker exec wsm_experiment bash -lc "cd /workspace && python3 <script>"
 | 值 | 含义 |
 |----|------|
 | 0 | low 多项式档 |
-| 1 | mid |
-| 2 | high |
+| 1 | high 多项式档 |
 | 3 | original（精确算子，cost/深度=0） |
 
 索引：`scheme_index(layer_idx, "softmax"|"ln1"|"gelu"|"ln2")` → `layer*4 + slot`（见 `cost.py`）。
 
-GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；Softmax / LayerNorm 三档规则见各自 `*_poly.py`。
+GeLU 档位有 **层组方案**（A/B/C，`gelu_poly.gelu_level_allowed` / `_GELU_LAYER_SCHEME`）；Softmax / LayerNorm 两档规则见各自 `*_poly.py`（旧 mid 参数以注释保留）。
 
 ### Cost（当前为乘法深度占位）
 
-- **GeLU**：来自 `gelu_poly` 的 `depth_he`（Chebyshev PS-tree + 还原 +1）
-- **Softmax**（`cost.softmax_poly_depth` / aSOR）：
+- **GeLU**：`gelu_he_depth` ← `depth_he`（Chebyshev PS-tree + 还原 +1）
+- **Softmax**（`cost.softmax_he_depth` / aSOR；不含 pathway）：
   - `SOFTMAX_DEPTH_BASE(=5) + asor_σ×SOFTMAX_ASOR_ITER_DEPTH + Σ_r asor_Σy²_r×SOFTMAX_ASOR_ITER_DEPTH`
   - `SOFTMAX_ASOR_ITER_DEPTH=1`（HE `he_asor_ct` DeltaCt 路径实测每轮 rem−1；明文 `kn*b*b_temp` 概念深度仍为 2）
   - BASE = Stockmeyer(deg15 密路径 4) + δ1 平方 1
   - Σy² 轮数 \(n_2=\lceil\log_2(\delta_2)\rceil\)（`LAYER_EXP_DIV`）；第 1/2 轮 iters 来自 `LAYER_ASOR_MAX_ITERS_SUM_SQ(_2)_BY_TASK`
   - **未用轮次**（\(\delta_2=2\) 时第 2 轮）表项为 **0**，且不计入深度
-- **LayerNorm**：`invsqrt_max_iters + 3`（生产路径固定步数，无 α；`layernorm_poly` / `cost.py`）
+- **LayerNorm**：`layernorm_he_depth` = scale+var+enc_one + 2×iters + post（每轮 inv√ 深度 2）
 - 进化默认 \(f_\mathrm{cost}=\) DualRail DP 总 bts（`HE/thor/bts_ops.optimize_bootstrap`，budget **14**，与 `plan_mock` 相同）
 - `--cost-mode depth` 仍可用：\(\lceil\mathrm{depth}/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)
 - 简报见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)
@@ -79,7 +78,7 @@ GeLU 档位有 **层组约束**（A/B/C，`gelu_poly.gelu_level_allowed`）；So
 **Softmax（thor + aSOR）**
 
 - `softmax_poly.py`（生产）/ `nolinear/eval_softmax_cuda.py`（调参）：thor 多项式近似 exp，**aSOR** 求倒数（与 THOR `he_inv` 同形；固定 kn 更新，**不是** Newton，也已不再用 Goldschmidt）
-- 生产：**固定** `max_iters`（无 α）；high/mid/low 由表区分；`e0_σ=min(σ)/2`，minσ 来自 `nolinear/sigma_out/{task}_sigma.json`
+- 生产：**固定** `max_iters`（无 α）；high/low 由表区分；`e0_σ=min(σ)/2`，minσ 来自 `nolinear/sigma_out/{task}_sigma.json`
 - Eval：α + max_iters 同时限制（便于调参）；深度打印用实际 iters
 - Σy²：最多两轮（`δ2=4`）；第二轮配置在 `*_SUM_SQ2_*`，未用层填 0
 

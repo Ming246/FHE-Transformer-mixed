@@ -45,9 +45,10 @@ from evolution_infer import format_elapsed, save_search_timings
 from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte","sst2", "cola", "qnli", "mnli"]
+# TASK_NAMES = ["mrpc", "rte","sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc"]
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
-POLY_LEVELS = (0, 1, 2)
+POLY_LEVELS = (0, 1)
 EVOLUTION_RESULTS_ROOT = "./results/evolution_results/"
 
 
@@ -70,10 +71,10 @@ def evolution_output_dir(
 
 OUTPUT_DIR = evolution_output_dir(SENSITIVE_OUTPUT_DIR)
 
-POPULATION_SIZE = 200
-NUM_GENERATIONS = 400
+POPULATION_SIZE = 150
+NUM_GENERATIONS = 300
 CROSSOVER_RATE = 0.9
-MUTATION_RATE = 1.2 / SCHEME_LEN
+MUTATION_RATE = 1.0 / SCHEME_LEN
 TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 300
@@ -111,8 +112,7 @@ def load_sensitivity_matrix(
             kind = row["kind"]
             out[(layer_idx, kind)] = {
                 0: float(row["S_low"]),
-                1: float(row["S_mid"]),
-                2: float(row["S_high"]),
+                1: float(row["S_high"]),
             }
     if len(out) != SCHEME_LEN:
         raise ValueError(f"{task_name} 敏感度行数应为 {SCHEME_LEN}，当前为 {len(out)}")

@@ -333,8 +333,9 @@ class RemGuard:
                 flush=True,
             )
         if exp_after is not None:
-            # HE [bts rem] is pre-unpack land (=budget); DP after_boot includes
-            # DualRail unpack tax. Accept either.
+            # HE [bts rem]: real_pack reports pre-unpack land (=budget);
+            # direct reports post ×INV (=budget−1). DP after_boot is always
+            # budget−1. Accept HE rem_after ∈ {exp_after, budget}.
             if abs(int(rem_after) - int(exp_after)) <= self.tol or abs(
                 int(rem_after) - int(self.budget)
             ) <= self.tol:

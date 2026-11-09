@@ -17,7 +17,7 @@
 输出：
   demo/results/alpha_refined/<task>/
     {task}_alpha_<method>.csv
-    {task}_sensitivity_k.csv   （S_low/mid/high := K_*，供 evolution 当 sensitive-dir）
+    {task}_sensitivity_k.csv   （S_low/high := K_*，供 evolution 当 sensitive-dir）
     {task}_gate_summary.csv
 
 用法：
@@ -75,7 +75,7 @@ from calibrate_alpha_s1 import (  # noqa: E402
     load_s1_matrix,
 )
 
-POLY_LEVELS = (0, 1, 2)
+POLY_LEVELS = (0, 1)
 
 
 def load_kl_single(path: str) -> dict[tuple[int, str, int], float]:
@@ -224,10 +224,8 @@ def write_alpha_csv(
                 "alpha",
                 "method",
                 "S_low",
-                "S_mid",
                 "S_high",
                 "K_low",
-                "K_mid",
                 "K_high",
             ]
         )
@@ -241,11 +239,9 @@ def write_alpha_csv(
                     f"{float(alpha[i]):.10e}",
                     method,
                     f"{slot.s_low:.10e}",
-                    f"{slot.s_mid:.10e}",
                     f"{slot.s_high:.10e}",
                     f"{kl.get((layer_idx, kind, 0), float('nan')):.10e}",
                     f"{kl.get((layer_idx, kind, 1), float('nan')):.10e}",
-                    f"{kl.get((layer_idx, kind, 2), float('nan')):.10e}",
                 ]
             )
 
@@ -258,7 +254,7 @@ def write_sensitivity_from_k(
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["layer_idx", "kind", "S_low", "S_mid", "S_high"])
+        w.writerow(["layer_idx", "kind", "S_low", "S_high"])
         for layer_idx, kind in iter_positions():
             vals = []
             for level in LEVELS:
@@ -268,7 +264,7 @@ def write_sensitivity_from_k(
                 else:
                     vals.append(float(kl.get((layer_idx, kind, level), 0.0)))
             w.writerow(
-                [layer_idx, kind, f"{vals[0]:.10e}", f"{vals[1]:.10e}", f"{vals[2]:.10e}"]
+                [layer_idx, kind, f"{vals[0]:.10e}", f"{vals[1]:.10e}"]
             )
 
 

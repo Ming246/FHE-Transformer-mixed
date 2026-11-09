@@ -46,6 +46,8 @@ class BootstrapHook:
     apply_discards: bool = False
     _keep_after: dict[str, int] = field(default_factory=dict, repr=False)
     rem_guard: Any = None
+    # Events that call ``engine.bootstrap`` with no ×BTS_MSG_SCALE / ×INV.
+    bare_scale_events: set[str] = field(default_factory=set)
 
     def load_plan(self, result: Any, *, apply_discards: bool | None = None) -> None:
         """Ingest ``BootstrapResult.placements`` (+ optional ``level_discards``)."""
@@ -211,9 +213,34 @@ class BootstrapHook:
         if not do_boot:
             return cts
 
+        pre_for_probe = [seq[i] for i in idxs]
         out = list(seq)
-        for i in idxs:
-            out[i] = self.engine.bootstrap(out[i])
+        try:
+            from bts_decrypt_probe import bts_probe_label
+        except ImportError:
+            from .bts_decrypt_probe import bts_probe_label  # type: ignore
+        try:
+            from bts_prescale import BTS_MSG_SCALE, bootstrap_prescaled
+        except ImportError:
+            from .bts_prescale import BTS_MSG_SCALE, bootstrap_prescaled  # type: ignore
+        # real_pack: only ×100 here; DualRail unpack fuses ×(½·0.01).
+        # direct: ×100 → bts → ×0.01 (pays the 1 rem post tax).
+        # bare_scale_events: bootstrap only, no extra multiply.
+        bare = event_name in self.bare_scale_events
+        do_post = (not bare) and self.pack_mode(event_name) == "direct"
+        try:
+            from dualrail_bts import plan_bootstrap_kernel
+        except ImportError:
+            from .dualrail_bts import plan_bootstrap_kernel  # type: ignore
+        with bts_probe_label(self.engine, event_name):
+            with plan_bootstrap_kernel(self.engine):
+                for i in idxs:
+                    if bare:
+                        out[i] = self.engine.bootstrap(out[i])
+                    else:
+                        out[i] = bootstrap_prescaled(
+                            self.engine, out[i], postscale=do_post
+                        )
         rem_after = None
         try:
             rem_after = int(self.engine.num_levels) - int(out[idxs[0]].level_calc)
@@ -222,7 +249,9 @@ class BootstrapHook:
         if rem_before is not None and rem_after is not None:
             print(
                 f"  [bts rem] {event_name}: rem {rem_before}→{rem_after} "
-                f"pack_mode={self.pack_mode(event_name)}",
+                f"pack_mode={self.pack_mode(event_name)} "
+                f"prescale={'1' if bare else BTS_MSG_SCALE} "
+                f"postscale={'no' if bare else ('yes' if do_post else 'unpack')}",
                 flush=True,
             )
             if self.rem_guard is not None:
@@ -234,6 +263,23 @@ class BootstrapHook:
             and self.engine is not None
         ):
             self._maybe_discard(out, idxs, event_name, int(keep))
+        coll = getattr(self.engine, "_bts_site_probe", None)
+        suppressed = bool(
+            getattr(self.engine, "_bts_site_probe_suppress_hook", False)
+        )
+        pm = self.pack_mode(event_name)
+        if coll is not None and not suppressed and pm == "direct":
+            try:
+                from bts_site_pack_probe import pack_mode_for_probe
+            except ImportError:
+                from .bts_site_pack_probe import pack_mode_for_probe  # type: ignore
+            post_for_probe = [out[i] for i in idxs]
+            coll.record_direct_hook_refresh(
+                event_name,
+                pack_mode_for_probe(self, event_name),
+                pre_for_probe,
+                post_for_probe,
+            )
         if wrap_single:
             return out[0]
         return _to_object_array(out) if is_ndarray else out

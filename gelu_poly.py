@@ -6,7 +6,7 @@ GELU(x) = x * (0.5 + y(t))，t = x/C；复合 y ≈ f1(t)+f2(f1(t))，单段 y �
 
 用法：
     from gelu_poly import GeluPolyEvaluator, gelu_config_for_layer
-    y = GeluPolyEvaluator(layer_idx=0, level=2)(x)
+    y = GeluPolyEvaluator(layer_idx=0, level=1)(x)
 """
 from __future__ import annotations
 
@@ -16,15 +16,14 @@ from functools import lru_cache
 
 import torch
 
-GELU_LEVEL_KEYS = ("low", "mid", "high")
+GELU_LEVEL_KEYS = ("low", "high")  # 档位 0/1；旧 mid 方案保留在下方注释
 
 GELU_POLY_FUNC_NAMES: list[str] = [
     "poly_gelu_low",
-    "poly_gelu_mid",
     "poly_gelu_high",
 ]
 
-# 层组方案：(C, scheme_name)
+# 层组方案：(C, scheme_name)；键 0=low / 1=high
 _GROUP_A_LAYERS = frozenset({0, 1, 6, 7, 8, 11})
 _GROUP_B_LAYERS = frozenset({2, 3, 4, 5})
 _GROUP_C_LAYERS = frozenset({9, 10})
@@ -33,25 +32,24 @@ _GELU_LAYER_SCHEME: dict[int, dict[int, tuple[int, str]]] = {}
 
 for _layer in _GROUP_A_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        2: (40, "composite_15_23"),
-        1: (40, "composite_13_15"),
-        0: (40, "composite_7_15"),
+        1: (40, "composite_15_23"),  # high（旧档位键 2）
+        # mid（旧档位键 1）: (40, "composite_13_15"),
+        0: (40, "composite_7_15"),  # low
     }
 for _layer in _GROUP_B_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        2: (80, "composite_27_31"),
-        1: (80, "composite_15_23"),
-        0: (80, "composite_15_15"),
+        1: (80, "composite_27_31"),  # high（旧档位键 2）
+        # mid（旧档位键 1）: (80, "composite_15_23"),
+        0: (80, "composite_15_15"),  # low
     }
 for _layer in _GROUP_C_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        2: (160, "composite_31_31"),
-        0: (160, "composite_15_31"),
+        1: (160, "composite_31_31"),  # high（旧档位键 2）
+        0: (160, "composite_15_31"),  # low（组 C 原本无 mid）
     }
 
-GELU_FORBIDDEN_LEVELS: dict[int, frozenset[int]] = {
-    **{layer: frozenset({1}) for layer in _GROUP_C_LAYERS},
-}
+# 历史：组 C 曾禁止 mid；现仅 low/high，无额外禁止档
+GELU_FORBIDDEN_LEVELS: dict[int, frozenset[int]] = {}
 
 _CHEB_JSON_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "nolinear", "gelu"
@@ -61,8 +59,10 @@ _POLY_EVAL_DTYPE = torch.float64
 
 
 def gelu_level_allowed(layer_idx: int, level: int) -> bool:
-    """该层是否允许使用该 GeLU 档位（0/1/2 = low/mid/high）。"""
-    if level not in (0, 1, 2):
+    """该层是否允许使用该 GeLU 档位（0/1 = low/high）。"""
+    if level not in (0, 1):
+        return False
+    if level not in _GELU_LAYER_SCHEME.get(layer_idx, {}):
         return False
     return level not in GELU_FORBIDDEN_LEVELS.get(layer_idx, frozenset())
 
@@ -146,8 +146,8 @@ def gelu_config_for_layer(layer_idx: int, level: int) -> dict:
 
 def gelu_scale_for_layer(layer_idx: int) -> float:
     """该层 high 档使用的 C（兼容旧接口）。"""
-    if layer_idx in _GELU_LAYER_SCHEME and 2 in _GELU_LAYER_SCHEME[layer_idx]:
-        return float(_GELU_LAYER_SCHEME[layer_idx][2][0])
+    if layer_idx in _GELU_LAYER_SCHEME and 1 in _GELU_LAYER_SCHEME[layer_idx]:
+        return float(_GELU_LAYER_SCHEME[layer_idx][1][0])
     raise KeyError(f"layer {layer_idx} 无 high 档配置")
 
 
@@ -267,16 +267,11 @@ def poly_gelu_low(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
     return gelu_eval_from_config(x, gelu_config_for_layer(layer_idx, 0))
 
 
-def poly_gelu_mid(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    return gelu_eval_from_config(x, gelu_config_for_layer(layer_idx, 1))
-
-
 def poly_gelu_high(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    return gelu_eval_from_config(x, gelu_config_for_layer(layer_idx, 2))
+    return gelu_eval_from_config(x, gelu_config_for_layer(layer_idx, 1))
 
 
 GELU_POLY_FUNCS: list = [
     poly_gelu_low,
-    poly_gelu_mid,
     poly_gelu_high,
 ]

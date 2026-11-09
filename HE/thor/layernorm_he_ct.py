@@ -85,6 +85,14 @@ def he_invsqrt_ct(
 
             an, bn = plan_refresh_an_bn(engine, an, bn, bts_hook, event)
             _require_same_level(where=f"after {event}")
+            if (
+                getattr(engine, "_mag_ln_audit", False)
+                and bts_prefix
+                and str(bts_prefix).endswith("ln2")
+            ):
+                from mag_probe import audit_ln2_invsqrt_landed
+
+                audit_ln2_invsqrt_landed(engine, i, an, bn)
 
         kn = _he_invsqrt_kn(en)
         # bn: cm_mult(+1) → level_up(bn2) → ct×ct(+1) ⇒ Δ=2
@@ -99,6 +107,20 @@ def he_invsqrt_ct(
         an = engine.auto_ct_ct_mult(an1, an2)
 
         en = kn * en * (3.0 - kn * en) ** 2 / 4.0
+        if getattr(engine, "_mag_sk", None) is not None:
+            from mag_probe import report as _mag_report
+
+            tag = event or f"invsqrt_{i}"
+            _mag_report(engine, f"{tag}.an", an, note=f"en={en:.4e}")
+            _mag_report(engine, f"{tag}.bn", bn)
+        if (
+            getattr(engine, "_mag_ln_audit", False)
+            and bts_prefix
+            and bts_prefix.endswith("ln2")
+        ):
+            from mag_probe import audit_ln2_invsqrt
+
+            audit_ln2_invsqrt(engine, i, an, bn)
     return bn
 
 
@@ -166,15 +188,22 @@ def he_layernorm_poly(
                     list(x),
                     bts_hook,
                     scale_ev,
-                    scale_after=0.5,
                 )
             )
 
     nslots = int(engine.num_slots)
     scale = 1.0 / (max_for_denominator ** 0.5)
     mask_scale = _scale_mask(nslots, scale)
+    _ln_audit = bool(
+        getattr(engine, "_mag_ln_audit", False) and kind == "ln2"
+    )
 
     enc_l = [engine.cm_mult(ct, mask_scale) for ct in x]
+    he_scaled = None
+    if _ln_audit:
+        from mag_probe import audit_ln2_scaled
+
+        he_scaled = audit_ln2_scaled(engine, "scaled_pre_boot", enc_l)
 
     # ``{ln_prefix}_var``：段首 DualRail 刷 8×enc_l → variance
     if ln_prefix and bts_hook is not None:
@@ -188,9 +217,12 @@ def he_layernorm_poly(
                     enc_l,
                     bts_hook,
                     var_ev,
-                    scale_after=0.5,
                 )
             )
+    if _ln_audit:
+        from mag_probe import audit_ln2_scaled
+
+        he_scaled = audit_ln2_scaled(engine, "scaled_post_boot", enc_l)
 
     # Σx → lane-0, then broadcast for numerator.
     sum_x = enc_l[0]
@@ -228,6 +260,19 @@ def he_layernorm_poly(
     n_sigma_x2 = engine.mult_int_scalar(sigma_x2, n)
     variance = engine.sub(n_sigma_x2, sq_sum_x)
     variance = engine.add_scalar(variance, var_e / max_for_denominator)
+    if _ln_audit and he_scaled is not None:
+        from mag_probe import audit_ln2_variance
+
+        audit_ln2_variance(engine, variance, he_scaled)
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(
+            engine,
+            f"{ln_prefix}.variance",
+            variance,
+            note="scaled var, plain an is O(1e-2)..O(1)",
+        )
 
     # ``{ln_prefix}_enc_one``：段首直接刷 variance（单 CT）→ +enc_one
     if ln_prefix and bts_hook is not None:
@@ -340,9 +385,14 @@ def bind_layer_layernorm(
     task: str,
     layer_idx: int,
     level: int = 2,
+    level_ln2: int | None = None,
     bts_hook=None,
 ) -> tuple[LayerNormHeParams, LayerNormHeParams]:
-    """Bind ln1 + ln2 for one encoder layer."""
+    """Bind ln1 + ln2 for one encoder layer.
+
+    ``level`` applies to ln1; ``level_ln2`` defaults to ``level`` for ln2.
+    """
+    lv2 = int(level if level_ln2 is None else level_ln2)
     p1 = bind_attention_layernorm(
         thor_attention,
         task=task,
@@ -354,7 +404,7 @@ def bind_layer_layernorm(
         thor_ff,
         task=task,
         layer_idx=layer_idx,
-        level=level,
+        level=lv2,
         bts_hook=bts_hook,
     )
     return p1, p2

@@ -71,9 +71,9 @@ class SoftmaxHeParams:
         task_name: str,
         layer_idx: int,
         *,
-        level: int = 2,
+        level: int = 1,
     ) -> "SoftmaxHeParams":
-        """level: 0/1/2 = low/mid/high；正确性测试默认 high。"""
+        """level: 0/1 = low/high；正确性测试默认 high。"""
         cfg = softmax_config_for_layer(task_name, layer_idx, level)
         return SoftmaxHeParams(
             shift=float(cfg["shift"]),
@@ -124,7 +124,7 @@ def asor_inverse_slots(
     e0: float,
     max_iters: int,
 ) -> tuple[np.ndarray, float]:
-    """aSOR 求 1/denom（每步 2×ct×ct，与 cost 的 iters*2 一致）。"""
+    """aSOR 求 1/denom（每步 HE rem=1，与 ``SOFTMAX_ASOR_ITER_DEPTH`` 一致）。"""
     a = np.ones_like(denom, dtype=np.float64)
     b = np.asarray(denom, dtype=np.float64).copy()
     en = float(e0)

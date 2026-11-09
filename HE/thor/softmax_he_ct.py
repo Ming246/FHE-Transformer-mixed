@@ -53,7 +53,30 @@ def align_bypass_to_main(engine, main_ct, bypass_ct):
     main_lc = int(main_ct.level_calc)
     b_lc = int(bypass_ct.level_calc)
     if b_lc > main_lc:
-        bypass_ct = engine.bootstrap(bypass_ct)
+        try:
+            from bts_prescale import bootstrap_prescaled
+        except ImportError:
+            from .bts_prescale import bootstrap_prescaled  # type: ignore
+        try:
+            from bts_decrypt_probe import bts_probe_label
+        except ImportError:
+            from .bts_decrypt_probe import bts_probe_label  # type: ignore
+        try:
+            from bts_site_pack_probe import active_collector
+        except ImportError:
+            from .bts_site_pack_probe import active_collector  # type: ignore
+        coll = active_collector(engine)
+        pre_ct = bypass_ct
+        with bts_probe_label(engine, "align_bypass"):
+            bypass_ct = bootstrap_prescaled(engine, bypass_ct, postscale=True)
+        if coll is not None:
+            coll.record_ct_sequence(
+                "bypass.align_to_main",
+                "direct",
+                "direct_1",
+                [pre_ct],
+                [bypass_ct],
+            )
         b_lc = int(bypass_ct.level_calc)
     if b_lc < main_lc:
         bypass_ct = engine.level_up(bypass_ct, main_lc)
@@ -85,6 +108,35 @@ class _DeltaCt:
         self.delta = float(delta)
 
 
+def _asor_prepare_boot(engine, an: _DeltaCt, bn: _DeltaCt) -> tuple[_DeltaCt, _DeltaCt]:
+    """Official pre-boot lift. Logical ``ct/delta`` stays put.
+
+    Runs whenever a plan boot fires, not only when the level is exhausted.
+    ``scale_adjust > 1`` (``delta < 1/16``) clears the imaginary part, then
+    multiplies ``bn`` and ``bn.delta`` by the same integer.
+    """
+    scale_adjust = int(1.0 / (bn.delta * 4.0) / 2.0)
+    if scale_adjust > 1:
+        an = _DeltaCt(
+            engine.add(an.ciphertext, engine.conjugate(an.ciphertext)),
+            an.delta * 2.0,
+        )
+        bn = _DeltaCt(
+            engine.add(bn.ciphertext, engine.conjugate(bn.ciphertext)),
+            bn.delta * 2.0,
+        )
+        scale_adjust = int(1.0 / (bn.delta * 4.0) / 2.0)
+    else:
+        scale_adjust = 1
+    an_ct, bn_ct = engine.auto_level(an.ciphertext, bn.ciphertext)
+    bn = _DeltaCt(
+        engine.mult_int_scalar(bn_ct, scale_adjust),
+        bn.delta * scale_adjust,
+    )
+    an = _DeltaCt(an_ct, an.delta)
+    return an, bn
+
+
 def _asor_pack_bootstrap(
     engine,
     an: _DeltaCt,
@@ -93,25 +145,61 @@ def _asor_pack_bootstrap(
     bts_hook=None,
     bts_event: str | None = None,
 ) -> tuple[_DeltaCt, _DeltaCt]:
-    """DualRail pack (an, bn) → bootstrap → unpack ×½（恒等；禁止 ×16 / /1.2）。"""
-    an.ciphertext, bn.ciphertext = engine.auto_level(
-        an.ciphertext, bn.ciphertext
-    )
-    temp = engine.add(an.ciphertext, engine.imult(bn.ciphertext))
+    """Plan boot that leaves logical ``ct/delta`` unchanged.
+
+    ``×64`` / bootstrap / ``×1/64`` is a matched pair, so a message-preserving
+    kernel does not care which iteration the plan picked. Unpack divides by 2
+    because ``z+conj = 2·Re``. ``delta`` is not changed by those factors.
+    """
     if bts_hook is None or not bts_event:
         raise RuntimeError(
             "aSOR pack bootstrap requires bts_hook + bts_event (plan-only)"
         )
-    temp1 = bts_hook.refresh(bts_event, temp)
+    an, bn = _asor_prepare_boot(engine, an, bn)
+    _an_pre, _bn_pre = an.ciphertext, bn.ciphertext
+    temp = engine.add(an.ciphertext, engine.imult(bn.ciphertext))
+    _site_probe = None
+    if bts_hook.should_refresh(bts_event):
+        coll = getattr(engine, "_bts_site_probe", None)
+        if coll is not None:
+            _site_probe = coll
+    try:
+        from bts_site_pack_probe import pack_mode_for_probe, suppress_hook_site_probe
+    except ImportError:
+        from .bts_site_pack_probe import (  # type: ignore
+            pack_mode_for_probe,
+            suppress_hook_site_probe,
+        )
+    # This call only: refresh must not apply the repo-wide ×100.
+    bare = getattr(bts_hook, "bare_scale_events", None)
+    added_bare = False
+    if bare is not None and bts_event not in bare:
+        bare.add(bts_event)
+        added_bare = True
+    try:
+        temp = engine.mult_int_scalar(temp, 2**6)
+        with suppress_hook_site_probe(engine):
+            temp1 = bts_hook.refresh(bts_event, temp)
+    finally:
+        if added_bare:
+            bare.discard(bts_event)
+    # ×1/64 undoes the pre-scale. /2 undoes z+conj. One rescale.
     conj = engine.conjugate(temp1)
-    half = 0.5
-    an = _DeltaCt(
-        engine.mult_scalar(engine.add(temp1, conj), half), an.delta
-    )
+    restore = 1.0 / (2**6) / 2.0
+    an = _DeltaCt(engine.mult_scalar(engine.add(temp1, conj), restore), an.delta)
     bn = _DeltaCt(
-        engine.mult_scalar(engine.imult(engine.sub(conj, temp1)), half),
+        engine.mult_scalar(engine.imult(engine.sub(conj, temp1)), restore),
         bn.delta,
     )
+    if _site_probe is not None:
+        _site_probe.record_real_pair(
+            bts_event,
+            pack_mode_for_probe(bts_hook, bts_event),
+            _an_pre,
+            _bn_pre,
+            an.ciphertext,
+            bn.ciphertext,
+        )
     return an, bn
 
 
@@ -141,6 +229,23 @@ def he_asor_ct(
     en = float(e0)
     if en <= 0.0:
         raise ValueError(f"e0 must be > 0, got {e0}")
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _tag0 = (
+            bts_iter_event(0)
+            if bts_iter_event is not None
+            else "asor"
+        )
+        _stem = str(_tag0).rsplit("_i", 1)[0].rsplit("_asor", 1)[0]
+        _mag_report(engine, f"{_stem}.enter_num", an.ciphertext, delta=an.delta)
+        _mag_report(
+            engine,
+            f"{_stem}.enter_den",
+            bn.ciphertext,
+            delta=bn.delta,
+            note=f"e0={en:.4e}",
+        )
     max_iters = int(max_iters)
     if max_iters < 1:
         raise ValueError(f"max_iters must be ≥ 1, got {max_iters}")
@@ -200,6 +305,25 @@ def he_asor_ct(
             # strip optional ``L*.`` prefix for probe keys
             suf = str(event).split(".", 1)[-1]
             _probe_rem(rem_probe, suf, engine, an.ciphertext)
+        if getattr(engine, "_mag_sk", None) is not None:
+            from mag_probe import report as _mag_report
+
+            tag = event or f"asor_i{i}"
+            _mag_report(engine, f"{tag}.an", an.ciphertext, delta=an.delta)
+            _mag_report(engine, f"{tag}.bn", bn.ciphertext, delta=bn.delta)
+
+    if getattr(engine, "_mag_inv_audit", False) and bts_iter_event is not None:
+        from mag_probe import audit_asor_output
+
+        audit_asor_output(
+            engine,
+            str(bts_iter_event(0)),
+            denominator,
+            an.ciphertext,
+            float(an.delta),
+            float(e0),
+            int(max_iters),
+        )
 
     return an.ciphertext, an.delta, en
 
@@ -223,16 +347,39 @@ def _refresh_dualrail8(engine, packs, *, max_level_calc: int | None = None):
         flush=True,
     )
     out = list(packs)
-    for i in range(4):
-        temp = engine.cc_add(out[i], engine.imult(out[i + 4]))
-        temp = engine.bootstrap(temp)
-        # Leave at bts land; no hardcoded level_up(→16).
-        conj = engine.conjugate(temp)
-        out[i] = engine.cc_add(temp, conj)
-        out[i + 4] = engine.imult(engine.cc_sub(conj, temp))
-        # bs 后乘 0.5（耗尽时不能在 bs 前 mult_scalar）
-        out[i] = engine.mult_scalar(out[i], 0.5)
-        out[i + 4] = engine.mult_scalar(out[i + 4], 0.5)
+    try:
+        from bts_decrypt_probe import bts_probe_label
+    except ImportError:
+        from .bts_decrypt_probe import bts_probe_label  # type: ignore
+    try:
+        from bts_prescale import bootstrap_prescaled, dualrail_unpack_scale
+    except ImportError:
+        from .bts_prescale import bootstrap_prescaled, dualrail_unpack_scale  # type: ignore
+    try:
+        from bts_site_pack_probe import active_collector
+    except ImportError:
+        from .bts_site_pack_probe import active_collector  # type: ignore
+    coll = active_collector(engine)
+    pre8 = list(out) if coll is not None else None
+    s = dualrail_unpack_scale()
+    with bts_probe_label(engine, "softmax_force_refresh_packs"):
+        for i in range(4):
+            temp = engine.cc_add(out[i], engine.imult(out[i + 4]))
+            temp = bootstrap_prescaled(engine, temp, postscale=False)
+            conj = engine.conjugate(temp)
+            out[i] = engine.cc_add(temp, conj)
+            out[i + 4] = engine.imult(engine.cc_sub(conj, temp))
+            # fused ×(½·INV); 耗尽时不能在 bs 前浮点 mult_scalar
+            out[i] = engine.mult_scalar(out[i], s)
+            out[i + 4] = engine.mult_scalar(out[i + 4], s)
+    if coll is not None and pre8 is not None:
+        coll.record_ct_sequence(
+            "bypass.softmax_force_refresh_packs",
+            "real_pack",
+            "real_pack_8",
+            pre8,
+            out,
+        )
     return out
 
 
@@ -270,6 +417,20 @@ def update_inv_D_fixed(
     apply_suf = (
         str(bts_apply_event).split(".", 1)[-1] if bts_apply_event else None
     )
+    if (
+        getattr(engine, "_mag_sk", None) is not None
+        and not getattr(engine, "_mag_inv_audit", False)
+        and not getattr(engine, "_mag_ln_audit", False)
+        and bts_apply_event
+        and "sumsq_r0_apply" in str(bts_apply_event)
+        and getattr(engine, "_mag_att_score", None) is not None
+    ):
+        from mag_probe import ExpInvStop, compare_exp_inv_inputs
+
+        compare_exp_inv_inputs(
+            engine, exp_u, inv_d, d_delta=float(d_delta)
+        )
+        raise ExpInvStop("update_inv_D_fixed inputs exp_u/inv_d saved")
     # before softmax_sumsq_r*_apply
     if (
         bts_hook is not None
@@ -310,7 +471,36 @@ def update_inv_D_fixed(
     summation = exp_2u[0]
     for i in range(1, 8):
         summation = engine.cc_add(summation, exp_2u[i])
+    pre_rotsum = summation
+    # THOR ``update_inv_D``：求和后、rotsum 前必刷这一条 summation。
+    sum_ev = (
+        bts_apply_event.replace("_apply", "_sum")
+        if bts_apply_event
+        else None
+    )
+    if (
+        bts_hook is not None
+        and sum_ev
+        and bts_hook.should_refresh(sum_ev)
+    ):
+        summation = bts_hook.refresh(sum_ev, summation)
     summation = engine.rotsum(summation, interval=2**11)
+    if (
+        getattr(engine, "_mag_sk", None) is not None
+        and bts_apply_event
+        and "sumsq_r0_apply" in str(bts_apply_event)
+    ):
+        from mag_probe import compare_sumsq
+
+        compare_sumsq(
+            engine,
+            exp_u,
+            inv_list,
+            pre_rotsum,
+            k=max(int(1.0 / float(d_delta) / 2.0), 1),
+            d_delta=float(d_delta),
+            after_rotsum=summation,
+        )
     if apply_suf:
         _probe_rem(rem_probe, apply_suf, engine, summation)
 
@@ -436,6 +626,7 @@ def dualrail_softmax_exit(
     rescale: bool = False,
     bts_hook=None,
     bts_event: str | None = None,
+    bts_exp_event: str | None = None,
     rem_probe=None,
 ):
     """Native THOR DualRail exit: 8 real → 128 real α copies.
@@ -467,9 +658,17 @@ def dualrail_softmax_exit(
     exp_cplx = [None] * 4
     for i in range(4):
         packed = engine.cc_add(exp_u[i], engine.imult(exp_u[i + 4]))
+        # 可选出口 bootstrap 与 align 都在 scale_k 之前。
+        # align 在旁路更耗尽时会 ×100；scale_k 后再 ×100 会冲出 bootstrap 范围。
+        if (
+            bts_hook is not None
+            and bts_exp_event
+            and bts_hook.should_refresh(bts_exp_event)
+        ):
+            packed = bts_hook.refresh(bts_exp_event, packed)
         packed = align_bypass_to_main(engine, rotated_inv[0], packed)
-        # rem-neutral; stays level-matched with rotated_inv
-        exp_cplx[i] = engine.mult_int_scalar(packed, scale_k)
+        packed = engine.mult_int_scalar(packed, scale_k)
+        exp_cplx[i] = packed
 
     cplx_softmax1 = []
     cplx_softmax2 = []
@@ -547,6 +746,37 @@ def he_softmax_poly(
         bts_square_event=f"{bts_prefix}.softmax_exp_square_0",
         rem_probe=rem_probe,
     )
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(
+            engine,
+            f"{bts_prefix}.softmax_exp",
+            exp_cts,
+            note="plain exp pieces are ≤ σ",
+        )
+    if getattr(engine, "_mag_exp_audit", False):
+        from mag_probe import audit_score_and_exp
+
+        audit_score_and_exp(engine, packs, exp_cts)
+    try:
+        from chain_bts_mock_probe import active_chain_probe
+    except ImportError:
+        from .chain_bts_mock_probe import active_chain_probe  # type: ignore
+    _chain = active_chain_probe(engine)
+    if _chain is not None:
+        _exp_probe = [
+            exp_cts[i]
+            for i in range(len(exp_cts))
+            if hasattr(exp_cts[i], "level_calc")
+        ]
+        if len(_exp_probe) != 8:
+            _ty = [type(exp_cts[i]).__name__ for i in range(min(8, len(exp_cts)))]
+            raise RuntimeError(
+                f"softmax_exp_cts probe: expected 8 CTs, got {len(_exp_probe)} "
+                f"(types={_ty})"
+            )
+        _chain.touch("softmax_exp_cts", _exp_probe)
     mask_ev = f"{bts_prefix}.softmax_attn_mask"
     if bts_hook is not None and bts_hook.should_refresh(mask_ev):
         exp_cts = list(bts_hook.refresh(mask_ev, exp_cts))
@@ -564,6 +794,17 @@ def he_softmax_poly(
         sigma_exp = engine.cc_add(sigma_exp, exp_u[i])
     sigma_exp = engine.rotsum(sigma_exp, interval=2**11)
     _probe_rem(rem_probe, "softmax_sigma_aggregate", engine, sigma_exp)
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(
+            engine,
+            f"{bts_prefix}.softmax_sigma",
+            sigma_exp,
+            note="plain σ on val0 L8 is about 6e-5..0.1",
+        )
+    if _chain is not None:
+        _chain.touch("softmax_sigma_exp", sigma_exp)
 
     # softmax_sigma_enc_one：sigma_exp(1) → enc_one+sigma_exp(2, he_asor an/bn)
     enc_ev = f"{bts_prefix}.softmax_sigma_enc_one"
@@ -587,15 +828,43 @@ def he_softmax_poly(
         bts_iter_event=lambda i, p=bts_prefix: f"{p}.softmax_asor_sigma_i{i}",
         rem_probe=rem_probe,
     )
+    if _chain is not None:
+        _chain.touch("softmax_inv_d_sigma", inv_d)
     # σ-aSOR spine 刷了 an/bn 时，AUX 上的 exp packs 一并恢复
     new_recs = getattr(bts_hook, "records", [])[rec_n:]
+    if os.environ.get("THOR_SKIP_EXP_AUX") == "1":
+        new_recs = []
     if any(
         "softmax_asor_sigma_i" in str(getattr(r, "event_name", ""))
         and int(getattr(r, "ct_count", 0) or 0) > 0
         for r in new_recs
     ):
-        for i in range(8):
-            exp_u[i] = engine.bootstrap(exp_u[i])
+        try:
+            from bts_decrypt_probe import bts_probe_label
+        except ImportError:
+            from .bts_decrypt_probe import bts_probe_label  # type: ignore
+        try:
+            from bts_prescale import bootstrap_prescaled
+        except ImportError:
+            from .bts_prescale import bootstrap_prescaled  # type: ignore
+        try:
+            from bts_site_pack_probe import active_collector
+        except ImportError:
+            from .bts_site_pack_probe import active_collector  # type: ignore
+        coll = active_collector(engine)
+        pre_exp = list(exp_u) if coll is not None else None
+        ev = f"{bts_prefix}.bypass.softmax_exp_aux_after_sigma"
+        with bts_probe_label(engine, ev):
+            for i in range(8):
+                exp_u[i] = bootstrap_prescaled(engine, exp_u[i], postscale=True)
+        if coll is not None and pre_exp is not None:
+            coll.record_ct_sequence(
+                ev,
+                "direct",
+                "direct_8",
+                pre_exp,
+                list(exp_u),
+            )
 
     # n2 Σy² rounds (δ2=2 → 1; δ2=4 → 2), last marked final_inv.
     for r in range(n2):
@@ -618,6 +887,9 @@ def he_softmax_poly(
             bts_norm_prefix=f"{bts_prefix}.softmax_norm_r{r}",
             rem_probe=rem_probe,
         )
+        if _chain is not None:
+            _chain.touch(f"softmax_sumsq_r{r}_exp_u", exp_u)
+            _chain.touch(f"softmax_sumsq_r{r}_inv_d", inv_d)
 
     return dualrail_softmax_exit(
         engine,
@@ -627,6 +899,7 @@ def he_softmax_poly(
         rescale=rescale,
         bts_hook=bts_hook,
         bts_event=f"{bts_prefix}.softmax_dualrail_exit",
+        bts_exp_event=f"{bts_prefix}.softmax_exit_exp",
         rem_probe=rem_probe,
     )
 

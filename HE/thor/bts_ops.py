@@ -17,10 +17,11 @@ Bootstrapping 最优放置 — Branch A（``HE/thor``）本土化副本。
 ``optimize_bootstrap`` 的 placements；``compute_level_discards`` 给出每次
 bts 后应保留的剩余深度。
 
-**Bts 刷新语义**（``pack_mode``，与 HE ``dualrail_bts`` 对齐）：
+**Bts 刷新语义**（``pack_mode``，与 HE ``dualrail_bts`` / ``bts_prescale`` 对齐）：
 
-- ``direct``：已是复数/单 CT，或 **仅 1 条 real** → 直接 bootstrap，落地 rem=budget。
-- ``real_pack``：多条 real → pack→bts→unpack×½，落地 rem=budget−``dualrail_depth``。
+- 每次刷前 ``mult_int_scalar(×100)``（无深度）；刷后恢复 ``×0.01``（耗 1 rem）。
+- ``direct``：已是复数/单 CT → bootstrap 后 ``×0.01``，落地 rem=budget−1。
+- ``real_pack``：多条 real → pack→bts→unpack×(½·0.01) 一次 rescale，落地同为 budget−1。
 
 计价（关键路径乐观界）：``layout=dualrail`` 用主路径现场 CT 数；
 ``layout=real`` 用 ``max(1, n//2)``（打包后复数条数）。
@@ -53,17 +54,21 @@ for _p in (_HERE, _HE):
 
 from cost import (
     BOOTSTRAP_DEPTH_BUDGET as _MAINLINE_BOOTSTRAP_DEPTH_BUDGET,
-    LAYERNORM_DEPTH_OVERHEAD,
+    DEPTH_LN_ENC_ONE as _COST_DEPTH_LN_ENC_ONE,
+    DEPTH_LN_POST_INVSQRT as _COST_DEPTH_LN_POST_INVSQRT,
+    DEPTH_LN_SCALE as _COST_DEPTH_LN_SCALE,
+    DEPTH_LN_VAR as _COST_DEPTH_LN_VAR,
+    LN_INVSQRT_ITER_DEPTH as _COST_LN_INVSQRT_ITER_DEPTH,
     NUM_LAYERS,
     SOFTMAX_ASOR_ITER_DEPTH as _COST_SOFTMAX_ASOR_ITER_DEPTH,
     SOFTMAX_DEPTH_BASE,
     SOFTMAX_EXP_SQUARE_DEPTH,
     SOFTMAX_EXP_STOCKMEYER_DEPTH,
-    gelu_poly_depth,
-    layernorm_poly_depth,
+    gelu_he_depth,
+    layernorm_he_depth,
     log2_ceil,
     scheme_index,
-    softmax_poly_depth,
+    softmax_he_depth,
     validate_scheme,
 )
 
@@ -90,7 +95,7 @@ from layernorm_poly import (
     count_he_invsqrt_iters,
     layernorm_config_for_layer,
 )
-from nolinear.gelu_chebyshev import cheb_he_depth_ps_tree, gelu_he_depth_breakdown
+from nolinear.gelu_chebyshev import gelu_he_depth_breakdown
 from softmax_poly import (
     LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK,
     LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK,
@@ -260,13 +265,17 @@ DEPTH_FF_DENSE2_KEEP = DEPTH_FF_DENSE
 DISCARD_MAX_SPAN: int | None = None
 
 
-# HE DualRail pack→bts→unpack 后 ``mult_scalar(×½)`` 耗 1 rem（见 dualrail_bts）。
+# HE：每次 bts 后恢复消息耗 1 rem（``bts_prescale.BTS_POST_DEPTH``）：
+#   - ``direct``：bootstrap 后 ``mult_scalar(×0.01)``
+#   - ``real_pack``：unpack 时 ``mult_scalar(×½·0.01)`` 一次 rescale
+# 两种 pack_mode 落地 rem 均为 budget−1。
 # 段首刷计费约定（与 HE hook 对齐）：
 #   - **普通打包**（如 8 real DualRail / an·bn 两实数）：打包成复数再刷再 unpack；
-#     ``layout=real`` → cost = n//2；``dualrail_depth=1`` → 落地 rem = budget−1。
+#     ``layout=real`` → cost = n//2；``dualrail_depth=1`` → 走 real_pack。
 #   - **已是复数/单 CT**：直接刷；``layout=dualrail``（或 ``cost_ct``）→ cost = n；
-#     ``dualrail_depth=0`` → 落地 rem = budget。
-DUALRAIL_UNPACK_DEPTH = 1
+#     ``dualrail_depth=0`` → 走 direct（仍付 postscale 税）。
+DUALRAIL_UNPACK_DEPTH = 1  # == BTS_POST_DEPTH；direct / real_pack 共用落地税
+BTS_POST_DEPTH = DUALRAIL_UNPACK_DEPTH
 
 # Softmax 通路（非多项式；对照 softmax_he_ct / DualRail exit）
 # poly 审计深度仍在 kind=softmax 事件；下列 pathway 只调 HE rem / 放置。
@@ -281,7 +290,6 @@ CT_SOFTMAX_ASOR_SPINE = 2  # enc_one (an) + sigma_exp/summation (bn)
 # he_asor_ct 返回后 inv 落主路（1 CT）；Σy² 主路 inv/summation 条数
 CT_SOFTMAX_INV_SPINE = 1
 DEPTH_SOFTMAX_SUMSQ_ENC_ONE = 0  # apply 后 +enc_one → an/bn(2)
-DEPTH_SOFTMAX_EXP_HE_EXTRA = 0  # 保留常量以免旧引用炸掉
 # HE Σy² apply 主路：inv(1) → summation(1)；8 exp 旁路 AUX
 #   rescale(pt×ct mask·inv) + ct×ct(exp,inv) + square → Δrem≈3
 DEPTH_SOFTMAX_SUMSQ_APPLY = 3
@@ -291,36 +299,34 @@ DEPTH_SOFTMAX_INV_MASK = 1
 # （L0 probe：post-cm rem13 → sftmx_out rem12；mock/真 bts 一致）。
 DEPTH_SOFTMAX_EXIT = 1
 
-# Goldschmidt / aSOR 单次迭代 HE 乘法深度
+# aSOR 单次迭代 HE 乘法深度
 # Softmax aSOR 每轮 HE rem = cost.SOFTMAX_ASOR_ITER_DEPTH（实测 1）
 SOFTMAX_ASOR_ITER_DEPTH = int(_COST_SOFTMAX_ASOR_ITER_DEPTH)
-# LN invsqrt 一轮：an/bn 同烧 depth=2
+# LN invsqrt 一轮：an/bn 同烧 depth=2（常量与 cost.py 对齐）
 #   bn: cm_mult → level_up(bn2→bn1) → ct×ct
 #   an: cm_mult ∥ square(mc_sub) → ct×ct
 # （勿 auto_level(an,bn1)：会白烧 an，把一轮拉成 3）
-LN_INVSQRT_ITER_DEPTH = 2
-GOLDSCHMIDT_ITER_DEPTH = LN_INVSQRT_ITER_DEPTH  # 旧名别名
+LN_INVSQRT_ITER_DEPTH = int(_COST_LN_INVSQRT_ITER_DEPTH)
 # Liberate：任意乘法（cm_mult / square / ct×ct）在 rem=1 时 MaximumLevelError。
 # 因此 depth>0 的事件不能落到 rem=0；atomic 要求 rem >= depth+MIN_LEAVE。
 LIBERATE_MIN_LEAVE_REM = 1
-# phase B / cost 占位仍用 LAYERNORM_DEPTH_OVERHEAD(=3)。
 # phase C：LN prep 拆为 scale / var / enc_one（对照 ``he_layernorm_poly``）。
 # DualRail 入口 unpack 税挂在 ``*_scale``；冷启动实测以后再校准。
-DEPTH_LN_SCALE = 1  # cm_mult(x, mask_scale)：8→8
-DEPTH_LN_VAR = 2  # enc_l→variance（numerator→AUX）；先填，后测
-DEPTH_LN_ENC_ONE = 0  # encode enc_one：1→2（an/bn）
+DEPTH_LN_SCALE = int(_COST_DEPTH_LN_SCALE)  # cm_mult(x, mask_scale)：8→8
+DEPTH_LN_VAR = int(_COST_DEPTH_LN_VAR)  # enc_l→variance（numerator→AUX）
+DEPTH_LN_ENC_ONE = int(_COST_DEPTH_LN_ENC_ONE)  # encode enc_one：1→2（an/bn）
 CT_LN_VAR_SPINE = 1  # variance 主路
 CT_LN_INVSQRT_SPINE = 2  # enc_one + variance（an/bn）
 CT_LN_DENOM_SPINE = 1  # inv√ 收口后只留 bn=denominator
 # ``*_inv``（an/bn→denom, d=0）已从图上删除：an/bn DualRail 打包为 1 cplx，
-# 丢掉 an 不改变关键路径代价；inv√ 末轮直接接 ``*_post_invsqrt``。
+# 丢掉 an 不改变主路径代价；inv√ 末轮直接接 ``*_post_invsqrt``。
 # 旧名：融合 prep 深度（导出图 / 冷启动注释仍可能引用）
 DEPTH_LN_PREP = DEPTH_LN_SCALE  # 兼容：仅 scale 段
 DEPTH_LN_PREP_COLD = DEPTH_LN_SCALE + DEPTH_LN_VAR  # 兼容：scale+var
 # he_layernorm_poly 收尾主路（denom）：
 #   rescale(pt×ct(γ,denom)) +1 → auto_ct_ct_mult(num, ·) +1 ⇒ Δ=2
 # （broadcast rotate/add、pc_add(β)、cc_add×2 不烧 rem）
-DEPTH_LN_POST_INVSQRT = 2
+DEPTH_LN_POST_INVSQRT = int(_COST_DEPTH_LN_POST_INVSQRT)
 
 # 旁路槽名（仅 export / 历史命名；DP 不再跟踪 slot rem）
 SLOT_RESID = 0  # deprecated alias — HE align_bypass_to_main
@@ -466,6 +472,17 @@ class LevelDiscard:
 
 
 @dataclass
+class BypassBoot:
+    """One HE ``align_bypass_to_main`` / AUX refresh that is not a DP placement."""
+
+    event_name: str
+    ct_count: int
+    bypass_rem: int
+    main_rem: int
+    reason: str  # "align" | "aux"
+
+
+@dataclass
 class BootstrapResult:
     bts_count: int
     placements: list[BootstrapPlacement] = field(default_factory=list)
@@ -475,11 +492,16 @@ class BootstrapResult:
     level_discards: list[LevelDiscard] = field(default_factory=list)
     # Spine rem after each boot / event (for HE rem_guard fail-fast).
     rem_trace: list[RemTraceRow] = field(default_factory=list)
+    # DP 主路 Σ ct_count；``bts_count = spine + bypass``。
+    spine_bts_count: int = 0
+    bypass_bts_count: int = 0
+    bypass_boots: list[BypassBoot] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"bts={self.bts_count} "
-            f"(events={len(self.events)}, budget={self.budget}, "
+            f"(spine={self.spine_bts_count}, bypass={self.bypass_bts_count}; "
+            f"events={len(self.events)}, budget={self.budget}, "
             f"placements={len(self.placements)}, "
             f"discards={len(self.level_discards)}, "
             f"rem_trace={len(self.rem_trace)})"
@@ -765,39 +787,219 @@ def simulate_remaining_trace(
     return rows
 
 
+# ``update_inv_D_fixed``：apply 段首刷 inv 之后 ``pt_ct_mult``+rescale，再 align exp。
+_SUMSQ_MASK_BEFORE_ALIGN = 1
+
+
+def _align_bypass_cts(bypass_rem: int, main_rem: int, n_ct: int) -> int:
+    """HE ``align_bypass_to_main``：旁路更耗尽（rem 更小）则每条刷一次。"""
+    if int(n_ct) <= 0:
+        return 0
+    if int(bypass_rem) < int(main_rem):
+        return int(n_ct)
+    return 0
+
+
+def account_bypass_bts(
+    events: list[Event],
+    placements: list[BootstrapPlacement],
+    rem_trace: list[RemTraceRow],
+    *,
+    budget: int,
+) -> tuple[int, list[BypassBoot]]:
+    """
+    按 HE 真实会合点给旁路计 bts（不改 placements / rem_trace）。
+
+    对齐 ``smoke_thor_repro`` / ``softmax_he_ct`` / ``gelu_he_ct`` /
+    ``layernorm_he_ct`` 的 ``align_bypass_to_main`` 与 σ-aSOR 后的 exp AUX。
+    条数是 Liberate ``engine.bootstrap`` 次数（残差 8 real = 8，不是打包后的 4）。
+    """
+    land = _boot_land_rem(events[0], budget) if events else max(0, int(budget) - 1)
+    g = active_geometry()
+    hr = int(g.ct_hidden_real)
+    hv = int(g.ct_v_cplx)
+    n_score = int(g.ct_att_score)
+    n_exp_cplx = n_score // 2
+    n_gelu = int(g.ct_ffn)
+
+    after: dict[str, int] = {}
+    ready: dict[str, int] = {}
+    has_before: set[str] = set()
+    initial_rem = int(budget)
+    for row in rem_trace:
+        if row.kind == "start":
+            initial_rem = int(row.rem_after)
+        elif row.kind == "after_event":
+            after[row.event_name] = int(row.rem_after)
+            ready[row.event_name] = int(row.rem_before)
+        elif row.kind == "after_boot" and row.boot_reason == "before_event":
+            has_before.add(row.event_name)
+
+    names_by_layer: dict[int, dict[str, str]] = {}
+    for ev in events:
+        names_by_layer.setdefault(ev.layer_idx, {})[ev.name.split(".", 1)[-1]] = ev.name
+
+    placed = {
+        p.event_name
+        for p in placements
+        if int(p.ct_count) > 0
+    }
+
+    boots: list[BypassBoot] = []
+
+    def _add(name: str, n: int, b_rem: int, m_rem: int, reason: str) -> None:
+        if n <= 0:
+            return
+        boots.append(
+            BypassBoot(
+                event_name=name,
+                ct_count=int(n),
+                bypass_rem=int(b_rem),
+                main_rem=int(m_rem),
+                reason=reason,
+            )
+        )
+
+    def _after(nm: str | None) -> int | None:
+        if not nm:
+            return None
+        return after.get(nm)
+
+    def _ready(nm: str | None) -> int | None:
+        if not nm:
+            return None
+        return ready.get(nm)
+
+    prev_ln2 = initial_rem
+    for layer_idx in range(NUM_LAYERS):
+        suf = names_by_layer.get(layer_idx) or {}
+        if not suf:
+            continue
+        pfx = f"L{layer_idx}"
+
+        qkv = suf.get("linear_qkv")
+        att_dense = suf.get("linear_attn_dense")
+        if qkv and att_dense:
+            resid = land if qkv in has_before else prev_ln2
+            main = _after(att_dense)
+            if main is not None:
+                n = _align_bypass_cts(resid, main, hr)
+                _add(f"{pfx}.bypass.resid_attn", n, resid, main, "align")
+
+        sm_exit = suf.get("softmax_dualrail_exit")
+        if qkv and sm_exit:
+            v_rem = _after(qkv)
+            main = _after(sm_exit)
+            if v_rem is not None and main is not None:
+                n = _align_bypass_cts(v_rem, main, hv)
+                _add(f"{pfx}.bypass.v_to_softmax", n, v_rem, main, "align")
+
+        mask_ev = suf.get("softmax_attn_mask")
+        exp_rem = _after(mask_ev) if mask_ev else None
+        sigma_asor_hit = any(
+            (
+                nm.startswith(f"{pfx}.softmax_asor_sigma_i")
+                and nm in placed
+            )
+            for nm in suf.values()
+        )
+        if sigma_asor_hit:
+            _add(
+                f"{pfx}.bypass.softmax_exp_aux_after_sigma",
+                n_score,
+                exp_rem if exp_rem is not None else land,
+                land,
+                "aux",
+            )
+            exp_rem = land
+
+        r = 0
+        while suf.get(f"softmax_sumsq_r{r}_apply"):
+            apply_ev = suf[f"softmax_sumsq_r{r}_apply"]
+            inv_ready = _ready(apply_ev)
+            if exp_rem is not None and inv_ready is not None:
+                inv_at_align = inv_ready - _SUMSQ_MASK_BEFORE_ALIGN
+                n = _align_bypass_cts(exp_rem, inv_at_align, n_score)
+                _add(
+                    f"{pfx}.bypass.softmax_sumsq_r{r}_exp",
+                    n,
+                    exp_rem,
+                    inv_at_align,
+                    "align",
+                )
+                if n:
+                    exp_rem = land
+            r += 1
+
+        if sm_exit and exp_rem is not None:
+            inv_exit = _ready(sm_exit)
+            if inv_exit is not None:
+                n = _align_bypass_cts(exp_rem, inv_exit, n_exp_cplx)
+                _add(
+                    f"{pfx}.bypass.softmax_exit_exp",
+                    n,
+                    exp_rem,
+                    inv_exit,
+                    "align",
+                )
+                if n:
+                    exp_rem = land
+
+        for kind in ("ln1", "ln2"):
+            var_ev = suf.get(f"{kind}_var")
+            post_ev = suf.get(f"{kind}_post_invsqrt")
+            if not var_ev or not post_ev:
+                continue
+            num_rem = _after(var_ev)
+            den_rem = _ready(post_ev)
+            if num_rem is None or den_rem is None:
+                continue
+            n = _align_bypass_cts(num_rem, den_rem, hr)
+            _add(f"{pfx}.bypass.{kind}_num", n, num_rem, den_rem, "align")
+
+        ln1_post = suf.get("ln1_post_invsqrt")
+        ff_rot = suf.get("bridge_rot_ff1")
+        dense2 = suf.get("linear_ff_dense2")
+        if ln1_post and dense2:
+            if ff_rot and ff_rot in has_before:
+                ff_resid = land
+            else:
+                ff_resid = _after(ln1_post) if _after(ln1_post) is not None else prev_ln2
+            main = _after(dense2)
+            if main is not None:
+                n = _align_bypass_cts(ff_resid, main, hr)
+                _add(f"{pfx}.bypass.resid_ff", n, ff_resid, main, "align")
+
+        f1_ev = suf.get("gelu_f1")
+        recon_ev = suf.get("gelu_reconstruct")
+        dense1 = suf.get("linear_ff_dense1")
+        f2_ev = suf.get("gelu_f2")
+        t_rem = _after(f1_ev) if f1_ev else _after(dense1)
+        y_rem = _ready(recon_ev) if recon_ev else (_after(f2_ev) if f2_ev else None)
+        if t_rem is not None and y_rem is not None:
+            n = _align_bypass_cts(t_rem, y_rem, n_gelu)
+            _add(f"{pfx}.bypass.gelu_x_phys", n, t_rem, y_rem, "align")
+
+        ln2_post = suf.get("ln2_post_invsqrt")
+        if ln2_post and ln2_post in after:
+            prev_ln2 = after[ln2_post]
+
+    return sum(b.ct_count for b in boots), boots
+
+
 def _validate_scheme_poly_only(scheme: list[int], task_name: str = "") -> None:
     """bts 路径不允许 original(3)。"""
     validate_scheme(scheme, task_name)
     for idx, level in enumerate(scheme):
-        if level not in (0, 1, 2):
+        if level not in (0, 1):
             raise ValueError(
-                f"{task_name} bts_ops 仅允许档位 0/1/2，"
+                f"{task_name} bts_ops 仅允许档位 0/1，"
                 f"下标 {idx} 为 {level}（不支持 original）"
             )
 
 
 def _slot_level(scheme: list[int], layer_idx: int, kind: str) -> int:
     return scheme[scheme_index(layer_idx, kind)]
-
-
-def _gelu_bts_depth(layer_idx: int, level: int) -> int:
-    """GeLU 段乘法深度 = ``gelu_poly_depth``（Chebyshev depth_he）。
-
-    （否则 after_gelu rem 比 HE 少 2：max(10,12)=12 vs HE Δ=10）。
-    """
-    return int(gelu_poly_depth(layer_idx, level))
-
-
-def _nonlinear_depth(
-    task_name: str, layer_idx: int, kind: str, level: int
-) -> int:
-    if kind == "softmax":
-        return softmax_poly_depth(task_name, layer_idx, level)
-    if kind == "gelu":
-        return _gelu_bts_depth(layer_idx, level)
-    if kind in ("ln1", "ln2"):
-        return layernorm_poly_depth(task_name, layer_idx, kind, level)
-    raise ValueError(f"未知非线性 kind：{kind}")
 
 
 def _ev(
@@ -867,7 +1069,7 @@ def _softmax_params(
     if rounds >= 2:
         iters_sum_sq.append(iters_sq2)
     iters_sum_sq = iters_sum_sq[:rounds]
-    total = softmax_poly_depth(task_name, layer_idx, level)
+    total = softmax_he_depth(task_name, layer_idx, level)
     split = (
         SOFTMAX_DEPTH_BASE
         + iters_sigma * SOFTMAX_ASOR_ITER_DEPTH
@@ -879,69 +1081,6 @@ def _softmax_params(
             f"split={split} total={total}"
         )
     return iters_sigma, iters_sum_sq, rounds, total
-
-
-def _cheb_nonzero_count(coeffs: list) -> int:
-    return sum(1 for c in coeffs if abs(float(c)) > 1e-12)
-
-
-def _cheb_tree_peak(base_ct: int, step: int, degree: int) -> int:
-    """
-    Cheb 平衡 T_k 树第 ``step`` 层（0-based）的活密文峰值。
-
-    构造阶段并行节点数约 ``min(2^(step+1), degree+1)``；中途 bts 按 ``base_ct * live`` 计。
-    """
-    live = min(1 << (step + 1), max(degree, 1) + 1)
-    return base_ct * live
-
-
-def _append_cheb_ps_tree_events(
-    events: list[Event],
-    prefix: str,
-    tag: str,
-    degree: int,
-    coeffs: list,
-    ct_base: int,
-    layer_idx: int,
-    kind: str,
-) -> None:
-    """
-    Chebyshev PS-tree 微展开：每层乘法 depth=1；末步 combine（pt 系数，depth=0）。
-
-    树构造后 spine rem 已等于最深 T_k；combine 输出取该 rem（浅项 level_up 到 spine，
-    不额外降低 spine remaining）。
-    """
-    if degree <= 0:
-        return
-    nz = max(_cheb_nonzero_count(coeffs), 1)
-    levels = cheb_he_depth_ps_tree(degree)
-
-    for lv in range(levels):
-        events.append(
-            _ev(
-                prefix,
-                f"{tag}_ps_L{lv}",
-                1,
-                ct_base,
-                ct_base,
-                layer_idx,
-                kind,
-                ct_peak=_cheb_tree_peak(ct_base, lv, degree),
-            )
-        )
-    combine_peak = ct_base * min(nz, degree + 1)
-    events.append(
-        _ev(
-            prefix,
-            f"{tag}_ps_combine",
-            0,
-            ct_base,
-            ct_base,
-            layer_idx,
-            kind,
-            ct_peak=combine_peak,
-        )
-    )
 
 
 def _append_softmax_dualrail_exit(
@@ -1022,53 +1161,12 @@ def _append_softmax_events(
     task_name: str,
     level: int,
 ) -> None:
-    """阶段 B：exp → aSOR_σ → Σy² 轮 → DualRail exit。"""
-    g = active_geometry()
-    iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
-        task_name, layer_idx, level
-    )
-    _append_softmax_exp_events(events, prefix, layer_idx)
-    events.append(
-        _ev(
-            prefix,
-            "softmax_asor_sigma",
-            iters_sigma * SOFTMAX_ASOR_ITER_DEPTH,
-            g.ct_att_score,
-            g.ct_att_score,
-            layer_idx,
-            "softmax",
-            join=True,
-        )
-    )
-    for r in range(rounds):
-        events.append(
-            _ev(
-                prefix,
-                f"softmax_norm_r{r}",
-                iters_sum_sq[r] * SOFTMAX_ASOR_ITER_DEPTH,
-                g.ct_att_score,
-                g.ct_att_score,
-                layer_idx,
-                "softmax",
-                join=True,
-            )
-        )
-    _append_softmax_dualrail_exit(events, prefix, layer_idx, use_aux=False)
-
-
-def _append_softmax_events_c(
-    events: list[Event],
-    prefix: str,
-    layer_idx: int,
-    task_name: str,
-    level: int,
-) -> None:
     """
-    阶段 C：exp + attn mask + 逐次 aSOR_σ + 每轮 Σy²(apply + summation@asor0 + aSOR)
+    exp + attn mask + 逐次 aSOR_σ + 每轮 Σy²(apply + summation@asor0 + aSOR)
     + DualRail 8→128 exit（对齐 ``softmax_he_ct``，非 copy 链）。
 
     ``softmax_sigma_enc_one`` / ``sumsq_r*_enc_one``：段首只刷 1 条 live CT
-    （direct，落地 rem=budget）。随后 ``encode_and_encrypt`` 出 enc_one，不占 bts。
+    （direct，落地 rem=budget−1）。随后 ``encode_and_encrypt`` 出 enc_one，不占 bts。
     下一站 ``asor_*`` 才是 an,bn ``real_pack``（代价同为 1，落地 budget−1）。
     """
     g = active_geometry()
@@ -1204,100 +1302,8 @@ def _append_gelu_events(
     layer_idx: int,
     level: int,
 ) -> None:
-    """阶段 B：Cheb 复合 f1→f2→×x（深度来自 gelu_he_depth_breakdown）。"""
-    g = active_geometry()
-    cfg = gelu_config_for_layer(layer_idx, level)
-    if cfg["kind"] == "composite":
-        bd = gelu_he_depth_breakdown(
-            cfg["d1"],
-            cfg["d2"],
-            eval_method="ps_tree",
-            f2_domain=cfg["f2_domain"],
-        )
-        combo = int(bd.get("cheb_combo_rescale", 0)) // 2
-        f1_d = int(bd["f1_eval"]) + combo
-        f2_d = int(bd.get("f2_affine", 0)) + int(bd["f2_eval"]) + combo
-        recon_d = int(bd["gelu_reconstruct"])
-    else:
-        bd = gelu_he_depth_breakdown(cfg["degree"], eval_method="ps_tree")
-        f1_d = int(bd["y_eval"]) + int(bd.get("cheb_combo_rescale", 0))
-        f2_d = 0
-        recon_d = int(bd["gelu_reconstruct"])
-
-    # 生产路径为 Chebyshev PS-tree；峰值按 FF live packs
-    peak = g.ct_ffn
-    if f1_d > 0:
-        events.append(
-            _ev(
-                prefix,
-                "gelu_f1",
-                f1_d,
-                g.ct_ffn,
-                g.ct_ffn,
-                layer_idx,
-                "gelu",
-                join=True,
-                ct_peak=peak,
-            )
-        )
-    if f2_d > 0:
-        events.append(
-            _ev(
-                prefix,
-                "gelu_f2",
-                f2_d,
-                g.ct_ffn,
-                g.ct_ffn,
-                layer_idx,
-                "gelu",
-                join=True,
-                ct_peak=peak,
-            )
-        )
-    events.append(
-        _ev(
-            prefix,
-            "gelu_reconstruct",
-            recon_d,
-            g.ct_ffn,
-            g.ct_ffn,
-            layer_idx,
-            "gelu",
-        )
-    )
-    expected = _gelu_bts_depth(layer_idx, level)
-    # Phase B split from poly breakdown; pad slack onto reconstruct.
-    actual = sum(
-        e.depth for e in events if e.layer_idx == layer_idx and e.kind == "gelu"
-    )
-    if actual < expected:
-        events.append(
-            _ev(
-                prefix,
-                "gelu_slack",
-                expected - actual,
-                g.ct_ffn,
-                g.ct_ffn,
-                layer_idx,
-                "gelu",
-            )
-        )
-        actual = expected
-    if actual != expected:
-        raise RuntimeError(
-            f"GeLU depth 拆分不一致 L{layer_idx} level={level}: "
-            f"split={actual} expected={expected}"
-        )
-
-
-def _append_gelu_events_c(
-    events: list[Event],
-    prefix: str,
-    layer_idx: int,
-    level: int,
-) -> None:
     """
-    阶段 C：对齐 ``gelu_he_ct`` pack 路径。
+    对齐 ``gelu_he_ct`` pack 路径。
 
     - ``gelu_f1``：f1 Chebyshev（旁路 ``t`` 对齐在 HE 侧，不进 DP）
     - ``gelu_f2``：f2 Chebyshev（段首可刷 f1）
@@ -1321,7 +1327,7 @@ def _append_gelu_events_c(
     f1_d = int(bd["f1_eval"]) + combo
     f2_d = int(bd.get("f2_affine", 0)) + int(bd["f2_eval"]) + combo
     recon_d = int(bd["gelu_reconstruct"])  # ct×ct only (=1)
-    expected = _gelu_bts_depth(layer_idx, level)
+    expected = gelu_he_depth(layer_idx, level)
     F = g.ct_ffn
     if f1_d > 0:
         events.append(
@@ -1386,58 +1392,6 @@ def _append_gelu_events_c(
 
 
 def _append_layernorm_events(
-    events: list[Event],
-    prefix: str,
-    layer_idx: int,
-    task_name: str,
-    kind: str,
-    level: int,
-) -> None:
-    """阶段 B：统计 prep（depth=OVERHEAD）+ 逐次 invsqrt（每 iter depth=1）。"""
-    g = active_geometry()
-    hr = g.ct_hidden_real
-    cfg = layernorm_config_for_layer(task_name, layer_idx, kind, level)
-    iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
-    slot = kind  # ln1 | ln2
-    events.append(
-        _ev(
-            prefix,
-            f"{slot}_prep",
-            LAYERNORM_DEPTH_OVERHEAD,
-            hr,
-            hr,
-            layer_idx,
-            kind,
-            join=True,
-        )
-    )
-    for i in range(iters):
-        events.append(
-            _ev(
-                prefix,
-                f"{slot}_invsqrt_{i}",
-                1,
-                hr,
-                hr,
-                layer_idx,
-                kind,
-                join=(i > 0),
-            )
-        )
-    expected = layernorm_poly_depth(task_name, layer_idx, kind, level)
-    actual = sum(
-        e.depth
-        for e in events
-        if e.layer_idx == layer_idx and e.kind == kind
-    )
-    if actual != expected:
-        raise RuntimeError(
-            f"LN depth 拆分不一致 L{layer_idx} {kind} level={level}: "
-            f"split={actual} expected={expected}"
-        )
-
-
-def _append_layernorm_events_c(
     events: list[Event],
     prefix: str,
     layer_idx: int,
@@ -1574,8 +1528,7 @@ def build_bootstrap_events(
     """
     展开事件序列（CT 几何对齐 ``smoke_thor_repro._forward_layer``）。
 
-    phase A：非线性整段粗事件；B：微展开；C（默认）：微事件 + Softmax 通路 depth
-    + 固定 DualRail / Σy² summation bootstrap 站点。
+    仅 phase C（默认）：非线性微事件 + Softmax pathway + DualRail / Σy² 站点。
     ``geom``：``None`` 时用当前活动几何（默认 bert_base）。
     """
     if geom is not None:
@@ -1585,8 +1538,8 @@ def build_bootstrap_events(
     _validate_scheme_poly_only(scheme, task_name)
     events: list[Event] = []
     ph = phase.upper()
-    if ph not in ("A", "B", "C"):
-        raise ValueError(f"phase 须为 A/B/C，收到 {phase!r}")
+    if ph != "C":
+        raise ValueError(f"仅支持 phase=C，收到 {phase!r}")
 
     Hc = g.ct_hidden_cplx
     Hr = g.ct_hidden_real
@@ -1633,15 +1586,7 @@ def build_bootstrap_events(
             )
         )
         sm_level = _slot_level(scheme, layer_idx, "softmax")
-        if ph == "A":
-            sm_depth = _nonlinear_depth(task_name, layer_idx, "softmax", sm_level)
-            events.append(
-                _ev(p, "softmax", sm_depth, S, A, layer_idx, "softmax")
-            )
-        elif ph == "B":
-            _append_softmax_events(events, p, layer_idx, task_name, sm_level)
-        else:
-            _append_softmax_events_c(events, p, layer_idx, task_name, sm_level)
+        _append_softmax_events(events, p, layer_idx, task_name, sm_level)
 
         # Context：α(128) × V(2) → context(2)；V 对齐在 HE 侧
         events.append(
@@ -1687,17 +1632,9 @@ def build_bootstrap_events(
         )
         # 残差会合不进微事件：HE ``align_bypass_to_main`` + add → ln1
         ln1_level = _slot_level(scheme, layer_idx, "ln1")
-        if ph == "A":
-            ln1_depth = _nonlinear_depth(task_name, layer_idx, "ln1", ln1_level)
-            events.append(_ev(p, "ln1", ln1_depth, Hr, Hr, layer_idx, "ln1"))
-        elif ph == "B":
-            _append_layernorm_events(
-                events, p, layer_idx, task_name, "ln1", ln1_level
-            )
-        else:
-            _append_layernorm_events_c(
-                events, p, layer_idx, task_name, "ln1", ln1_level
-            )
+        _append_layernorm_events(
+            events, p, layer_idx, task_name, "ln1", ln1_level
+        )
 
         # --- FFN：8 real → pack/rot 64 → dense1 → (2,8)；dense2 直接回 8 ---
         # FF 残差会合不进微事件（HE align+add）；LN1 出口即 bridge 入口
@@ -1732,13 +1669,7 @@ def build_bootstrap_events(
             )
         )
         gelu_level = _slot_level(scheme, layer_idx, "gelu")
-        if ph == "A":
-            gelu_depth = _nonlinear_depth(task_name, layer_idx, "gelu", gelu_level)
-            events.append(_ev(p, "gelu", gelu_depth, F, F, layer_idx, "gelu"))
-        elif ph == "B":
-            _append_gelu_events(events, p, layer_idx, gelu_level)
-        else:
-            _append_gelu_events_c(events, p, layer_idx, gelu_level)
+        _append_gelu_events(events, p, layer_idx, gelu_level)
 
         # ``ThorBertFF.dense2``：(2,8)→(8,)；段前 DualRail 刷 GeLU 出口
         events.append(
@@ -1757,17 +1688,9 @@ def build_bootstrap_events(
         )
         # 残差会合不进微事件：HE ``align_bypass_to_main`` + add → ln2
         ln2_level = _slot_level(scheme, layer_idx, "ln2")
-        if ph == "A":
-            ln2_depth = _nonlinear_depth(task_name, layer_idx, "ln2", ln2_level)
-            events.append(_ev(p, "ln2", ln2_depth, Hr, Hr, layer_idx, "ln2"))
-        elif ph == "B":
-            _append_layernorm_events(
-                events, p, layer_idx, task_name, "ln2", ln2_level
-            )
-        else:
-            _append_layernorm_events_c(
-                events, p, layer_idx, task_name, "ln2", ln2_level
-            )
+        _append_layernorm_events(
+            events, p, layer_idx, task_name, "ln2", ln2_level
+        )
 
     _validate_event_chain(events)
     return _apply_depth_overrides(events, depth_overrides)
@@ -1878,8 +1801,8 @@ def pack_mode_for_event(ev: Event) -> str:
     """
     Bts 段首刷新模式。
 
-    - ``direct``：复数 spine / 单条 real / 无 unpack 税 → rem=budget。
-    - ``real_pack``：多条 real 且 ``dualrail_depth>0`` → pack→bts→unpack×½。
+    - ``direct``：复数 spine / 单条 real → bootstrap + ×INV（落地 budget−1）。
+    - ``real_pack``：多条 real 且 ``dualrail_depth>0`` → pack→bts→unpack×(½·INV)。
     """
     if ev.layout == "dualrail":
         return "direct"
@@ -1913,12 +1836,14 @@ def _cost_ct(ev: Event) -> int:
 def _boot_land_rem(
     ev: Event, budget: int, *, pack_mode: str | None = None
 ) -> int:
-    """Rem after bootstrap; ``real_pack`` pays ``dualrail_depth`` unpack tax."""
-    mode = pack_mode if pack_mode is not None else pack_mode_for_event(ev)
-    if mode == "real_pack":
-        tax = int(ev.dualrail_depth) or DUALRAIL_UNPACK_DEPTH
-        return max(0, budget - tax)
-    return budget
+    """
+    Rem after a full bootstrap refresh.
+
+    ``direct`` and ``real_pack`` both pay ``BTS_POST_DEPTH`` (=1) for message
+    restore (standalone ×INV or fused DualRail unpack).
+    """
+    del ev, pack_mode
+    return max(0, int(budget) - int(BTS_POST_DEPTH))
 
 
 def _boot_pay(ev: Event, pack_mode: str, budget: int) -> tuple[int, int]:
@@ -1926,7 +1851,7 @@ def _boot_pay(ev: Event, pack_mode: str, budget: int) -> tuple[int, int]:
     一次 bootstrap 的 (ct_count, rem_after)。
 
     ``ct_count`` 为关键路径乐观计费（复数打包后条数）。
-    ``rem_after``：``direct``→budget；``real_pack``→budget−tax。
+    ``rem_after``：两种 pack_mode 均为 ``budget − BTS_POST_DEPTH``。
     """
     return _cost_ct(ev), _boot_land_rem(ev, budget, pack_mode=pack_mode)
 
@@ -2129,7 +2054,8 @@ def optimize_bootstrap_events(
     路径 DP：状态 ``(rem,)``（rem-only；无旁路 slot）→ 最少关键路径 bts。
 
     旁路对齐（残差 / V / AUX）在 HE 侧 ``align_bypass_to_main`` /
-    companion DualRail，不进 DP 状态。
+    companion DualRail，不进 DP 状态；plan 生成后再由
+    ``account_bypass_bts`` 按真实会合点计入 ``bts_count``。
     """
     if budget <= 0:
         raise ValueError(f"budget 须为正，当前 {budget}")
@@ -2239,14 +2165,21 @@ def optimize_bootstrap_events(
             budget=budget,
             initial_level=initial_level,
         )
+    spine = int(total)
+    bypass, bypass_boots = account_bypass_bts(
+        events, placements, rem_trace, budget=budget
+    )
     return BootstrapResult(
-        bts_count=int(total),
+        bts_count=spine + bypass,
         placements=placements,
         events=list(events),
         budget=budget,
         initial_level=initial_level,
         level_discards=discards,
         rem_trace=rem_trace,
+        spine_bts_count=spine,
+        bypass_bts_count=bypass,
+        bypass_boots=bypass_boots,
     )
 
 
@@ -2361,9 +2294,9 @@ def compute_scheme_bts(
 
 
 def scheme_all(level: int) -> list[int]:
-    """构造合法 48 维常数方案；层 9/10 禁止 GeLU mid，自动改为 high。"""
-    if level not in (0, 1, 2):
-        raise ValueError(f"scheme_all 仅允许 0/1/2，收到 {level}")
+    """构造合法 48 维常数方案（0=low / 1=high）。"""
+    if level not in (0, 1):
+        raise ValueError(f"scheme_all 仅允许 0/1，收到 {level}")
     from gelu_poly import gelu_level_allowed
 
     out: list[int] = []
@@ -2371,7 +2304,7 @@ def scheme_all(level: int) -> list[int]:
         for kind in ("softmax", "ln1", "gelu", "ln2"):
             lv = level
             if kind == "gelu" and not gelu_level_allowed(layer_idx, lv):
-                lv = 2  # mid 禁止时改用 high
+                lv = 1
             out.append(lv)
     return out
 
@@ -2382,40 +2315,21 @@ def audit_nonlinear_depth_splits(
     *,
     phase: str = "C",
 ) -> list[str]:
-    """校验各非线性 slot 的 ``sum(event.depth)`` 与对应 depth 函数一致。
+    """校验各非线性 slot 的 ``sum(event.depth)`` 与 ``*_he_depth`` 一致。
 
-    phase C 的 LN 用 HE invsqrt 关键路径（每轮 2），不用 ``layernorm_poly_depth``
-    占位（每轮 1）。
+    Softmax 只计 kind=softmax（不含 pathway）；GeLU / LN 为整段微事件和。
     """
     events = build_bootstrap_events(task_name, scheme, phase=phase)
     errors: list[str] = []
-    ph = phase.upper()
     for layer_idx in range(NUM_LAYERS):
         for kind in ("softmax", "ln1", "gelu", "ln2"):
             level = _slot_level(scheme, layer_idx, kind)
-            if ph == "C" and kind in ("ln1", "ln2"):
-                cfg = layernorm_config_for_layer(
-                    task_name, layer_idx, kind, level
-                )
-                iters = count_he_invsqrt_iters(cfg["invsqrt_max_iters"])
-                expected = (
-                    DEPTH_LN_SCALE
-                    + DEPTH_LN_VAR
-                    + DEPTH_LN_ENC_ONE
-                    + iters * LN_INVSQRT_ITER_DEPTH
-                    + DEPTH_LN_POST_INVSQRT
-                )
-            elif ph == "C" and kind == "softmax":
-                iters_sigma, iters_sum_sq, _rounds, _ = _softmax_params(
-                    task_name, layer_idx, level
-                )
-                expected = (
-                    SOFTMAX_DEPTH_BASE
-                    + iters_sigma * SOFTMAX_ASOR_ITER_DEPTH
-                    + sum(iters_sum_sq) * SOFTMAX_ASOR_ITER_DEPTH
-                )
+            if kind == "softmax":
+                expected = softmax_he_depth(task_name, layer_idx, level)
+            elif kind == "gelu":
+                expected = gelu_he_depth(layer_idx, level)
             else:
-                expected = _nonlinear_depth(task_name, layer_idx, kind, level)
+                expected = layernorm_he_depth(task_name, layer_idx, kind, level)
             actual = sum(
                 e.depth
                 for e in events
@@ -2432,7 +2346,7 @@ def audit_nonlinear_depth_splits(
 def run_phase_d_audit(
     *,
     tasks: tuple[str, ...] | None = None,
-    levels: tuple[int, ...] = (0, 1, 2),
+    levels: tuple[int, ...] = (0, 1),
     budget: int = BOOTSTRAP_DEPTH_BUDGET,
     geom: SlotCtGeometry | None = None,
 ) -> list[str]:
@@ -2548,7 +2462,6 @@ def run_phase_d_audit(
                 expect_pw = (
                     DEPTH_SOFTMAX_ATTN_MASK
                     + DEPTH_SOFTMAX_EXIT
-                    + DEPTH_SOFTMAX_EXP_HE_EXTRA
                     + rounds
                     * (DEPTH_SOFTMAX_SUMSQ_APPLY + DEPTH_SOFTMAX_INV_MASK)
                 )
@@ -2651,15 +2564,15 @@ def run_phase_d_audit(
             if result.bts_count < 0:
                 errors.append(f"{task} L{level} 负 bts")
 
-    # 单调性：同任务 all_low ≤ all_mid ≤ all_high（phase C）
+    # 单调性：同任务 all_low ≤ all_high（phase C）
     for task in tasks:
         bts = [
             compute_scheme_bts(task, scheme_all(lv), budget=budget)
-            for lv in (0, 1, 2)
+            for lv in (0, 1)
         ]
-        if not (bts[0] <= bts[1] <= bts[2]):
+        if not (bts[0] <= bts[1]):
             errors.append(
-                f"{task} 单调性失败: low/mid/high = {bts}"
+                f"{task} 单调性失败: low/high = {bts}"
             )
 
     return errors
@@ -2688,7 +2601,7 @@ def print_bootstrap_result(result: BootstrapResult, *, max_placements: int = 40)
 
 
 if __name__ == "__main__":
-    print("bts_ops 阶段 D 自洽审计 + C smoke（全任务 × 三档）")
+    print("bts_ops 阶段 D 自洽审计 + C smoke（全任务 × 两档）")
     print("=" * 56)
     g = active_geometry()
     print(
@@ -2710,24 +2623,35 @@ if __name__ == "__main__":
 
     # 非线性深度拆解样例（任务×档可变）
     print("\n--- Softmax/GeLU/LN depth 拆解（mrpc L0）---")
-    for level, name in enumerate(("low", "mid", "high")):
+    for level, name in enumerate(("low", "high")):
         it_s, it_sq, rounds, tot = _softmax_params("mrpc", 0, level)
         print(
             f"  softmax[{name}]: base={SOFTMAX_DEPTH_BASE} "
             f"+ σ×{SOFTMAX_ASOR_ITER_DEPTH}×{it_s} "
             f"+ Σy²{it_sq} → total={tot}"
         )
-        gd = gelu_poly_depth(0, level)
+        gd = gelu_he_depth(0, level)
         print(f"  gelu[{name}]: depth_he={gd}")
         for kind in ("ln1", "ln2"):
-            ld = layernorm_poly_depth("mrpc", 0, kind, level)
-            print(f"  {kind}[{name}]: {ld} (poly iters+{LAYERNORM_DEPTH_OVERHEAD}; "
-                  f"HE C prep={DEPTH_LN_PREP}/cold={DEPTH_LN_PREP_COLD})")
+            ld = layernorm_he_depth("mrpc", 0, kind, level)
+            print(
+                f"  {kind}[{name}]: {ld} "
+                f"(scale+var+enc_one+{LN_INVSQRT_ITER_DEPTH}×iters+post)"
+            )
 
     print("\n--- scheme bts (mrpc) ---")
-    for label, level in [("all_low", 0), ("all_mid", 1), ("all_high", 2)]:
+    for label, level in [("all_low", 0), ("all_high", 1)]:
         r = optimize_bootstrap("mrpc", scheme_all(level), phase="C")
         print(f"[{label}] {r.summary()}")
+        by = {}
+        for b in r.bypass_boots:
+            li = int(b.event_name.split(".", 1)[0][1:])
+            by[li] = by.get(li, 0) + b.ct_count
+        if by:
+            print(
+                "  bypass by layer: "
+                + " ".join(f"L{i}={by[i]}" for i in sorted(by))
+            )
         join_pl = [
             p
             for p in r.placements
@@ -2742,7 +2666,7 @@ if __name__ == "__main__":
     print(
         f"\n--- L0 placements (mrpc, initial_level={DEFAULT_L0_ENTRY_REMAINING}) ---"
     )
-    for label, level in [("all_mid", 1), ("all_high", 2)]:
+    for label, level in [("all_high", 1)]:
         r = optimize_bootstrap(
             "mrpc",
             scheme_all(level),

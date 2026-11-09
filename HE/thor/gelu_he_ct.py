@@ -348,6 +348,10 @@ def gelu_poly_pack(
             t = plan_refresh_dualrail_ff(engine, t, bts_hook, f1_ev)
 
     f1 = gelu_f1_pack(engine, t, params)
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(engine, f"{bts_prefix}.gelu_f1_out", f1)
 
     if bts_prefix and bts_hook is not None:
         f2_ev = f"{bts_prefix}.gelu_f2"
@@ -360,6 +364,10 @@ def gelu_poly_pack(
             f1 = plan_refresh_dualrail_ff(engine, f1, bts_hook, f2_ev)
 
     f2 = gelu_f2_pack(engine, f1, params)
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(engine, f"{bts_prefix}.gelu_f2_out", f2)
     y = gelu_y_pack(engine, f1, f2)
     return gelu_reconstruct_pack(
         engine,
@@ -414,15 +422,38 @@ def _refresh_dualrail_pack(
     if x.shape != (2, 8):
         raise ValueError(f"expected (2, 8), got {x.shape}")
     out = np.full((2, 8), None, dtype=object)
-    for i in range(8):
-        temp = engine.cc_add(x[0, i], engine.imult(x[1, i]))
-        temp = engine.bootstrap(temp)
-        if target_level is not None and int(temp.level_calc) < int(target_level):
-            temp = engine.level_up(temp, int(target_level))
-        conj = engine.conjugate(temp)
-        out[0, i] = engine.mult_scalar(engine.cc_add(temp, conj), 0.5)
-        out[1, i] = engine.mult_scalar(
-            engine.imult(engine.cc_sub(conj, temp)), 0.5
+    try:
+        from bts_decrypt_probe import bts_probe_label
+    except ImportError:
+        from .bts_decrypt_probe import bts_probe_label  # type: ignore
+    try:
+        from bts_prescale import bootstrap_prescaled, dualrail_unpack_scale
+    except ImportError:
+        from .bts_prescale import bootstrap_prescaled, dualrail_unpack_scale  # type: ignore
+    try:
+        from bts_site_pack_probe import active_collector
+    except ImportError:
+        from .bts_site_pack_probe import active_collector  # type: ignore
+    coll = active_collector(engine)
+    pre_ff = np.array(x, copy=True) if coll is not None else None
+    s = dualrail_unpack_scale()
+    with bts_probe_label(engine, "gelu_force_refresh_ff"):
+        for i in range(8):
+            temp = engine.cc_add(x[0, i], engine.imult(x[1, i]))
+            temp = bootstrap_prescaled(engine, temp, postscale=False)
+            if target_level is not None and int(temp.level_calc) < int(target_level):
+                temp = engine.level_up(temp, int(target_level))
+            conj = engine.conjugate(temp)
+            out[0, i] = engine.mult_scalar(engine.cc_add(temp, conj), s)
+            out[1, i] = engine.mult_scalar(
+                engine.imult(engine.cc_sub(conj, temp)), s
+            )
+    if coll is not None and pre_ff is not None:
+        coll.record_dualrail_ff(
+            "bypass.gelu_force_refresh_ff",
+            "real_pack",
+            pre_ff,
+            out,
         )
     return out
 

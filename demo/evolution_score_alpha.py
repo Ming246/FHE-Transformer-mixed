@@ -46,7 +46,7 @@ from evolution_infer import format_elapsed, save_search_timings
 # ===================== 配置区 =====================
 TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 SENSITIVE_OUTPUT_DIR = SENSITIVE_S1_DIR
-POLY_LEVELS = (0, 1, 2)
+POLY_LEVELS = (0, 1)
 EVOLUTION_RESULTS_ROOT = os.path.join(DEMO_RESULTS_DIR, "evolution_alpha")
 
 
@@ -110,8 +110,7 @@ def load_sensitivity_matrix(
             kind = row["kind"]
             out[(layer_idx, kind)] = {
                 0: float(row["S_low"]),
-                1: float(row["S_mid"]),
-                2: float(row["S_high"]),
+                1: float(row["S_high"]),
             }
     if len(out) != SCHEME_LEN:
         raise ValueError(f"{task_name} 敏感度行数应为 {SCHEME_LEN}，当前为 {len(out)}")

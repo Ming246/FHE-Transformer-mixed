@@ -42,8 +42,8 @@ from evolution_infer import SchemeEvaluator, format_elapsed  # noqa: E402
 from gelu_poly import gelu_level_allowed  # noqa: E402
 
 KINDS = ("softmax", "ln1", "gelu", "ln2")
-LEVELS = (0, 1, 2)
-LEVEL_NAMES = {0: "low", 1: "mid", 2: "high"}
+LEVELS = (0, 1)
+LEVEL_NAMES = {0: "low", 1: "high"}
 EPS = 1e-30
 # 单点 KL 数值噪声：低于此阈值的档不参与 α 的 median（仍写入 CSV）
 KL_RATIO_FLOOR = 1e-8
@@ -54,11 +54,10 @@ class SlotRow:
     layer_idx: int
     kind: str
     s_low: float
-    s_mid: float
     s_high: float
 
     def s_at(self, level: int) -> float:
-        return (self.s_low, self.s_mid, self.s_high)[level]
+        return (self.s_low, self.s_high)[level]
 
 
 def iter_positions() -> list[tuple[int, str]]:
@@ -88,7 +87,6 @@ def load_s1_matrix(task_name: str, sensitive_dir: str) -> dict[tuple[int, str], 
                 layer_idx=layer_idx,
                 kind=kind,
                 s_low=float(row["S_low"]),
-                s_mid=float(row["S_mid"]),
                 s_high=float(row["S_high"]),
             )
     if len(out) != SCHEME_LEN:
@@ -193,11 +191,9 @@ def compute_alphas(
                 "n_levels_used": len(ratios),
                 **per_level,
                 "S_low": slot_s.s_low,
-                "S_mid": slot_s.s_mid,
                 "S_high": slot_s.s_high,
                 "K_low": kl_by_slot.get((layer_idx, kind, 0), float("nan")),
-                "K_mid": kl_by_slot.get((layer_idx, kind, 1), float("nan")),
-                "K_high": kl_by_slot.get((layer_idx, kind, 2), float("nan")),
+                "K_high": kl_by_slot.get((layer_idx, kind, 1), float("nan")),
             }
         )
 
@@ -226,13 +222,10 @@ def write_alpha_csv(path: str, rows: list[dict[str, object]]) -> None:
         "alpha_scale",
         "n_levels_used",
         "ratio_low",
-        "ratio_mid",
         "ratio_high",
         "S_low",
-        "S_mid",
         "S_high",
         "K_low",
-        "K_mid",
         "K_high",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:

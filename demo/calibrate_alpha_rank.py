@@ -71,7 +71,7 @@ from refine_alpha import (  # noqa: E402
     load_kl_single,
 )
 
-POLY_LEVELS = (0, 1, 2)
+POLY_LEVELS = (0, 1)
 
 
 @dataclass
@@ -114,7 +114,7 @@ def load_pareto_items(path: str, source: str) -> list[CalibItem]:
 
 
 def all_high_scheme() -> list[int]:
-    return [2] * SCHEME_LEN
+    return [1] * SCHEME_LEN
 
 
 def sparse_degrade(
@@ -122,7 +122,7 @@ def sparse_degrade(
     *,
     n_flip: int,
 ) -> list[int]:
-    """全 high 基线，随机改 1–2 个合法位置到 low/mid。"""
+    """全 high 基线，随机改 1–2 个合法位置到 low。"""
     scheme = all_high_scheme()
     slots: list[tuple[int, str]] = []
     for layer_idx, kind in iter_positions():
@@ -132,7 +132,7 @@ def sparse_degrade(
     n_flip = max(1, min(n_flip, len(slots)))
     for layer_idx, kind in slots[:n_flip]:
         levels = allowed_levels(layer_idx, kind)
-        # 倾向 low（0），偶尔 mid
+        # 倾向 low（0），否则 high（1）
         if len(levels) == 1:
             lv = levels[0]
         else:

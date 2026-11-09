@@ -56,12 +56,11 @@ CALIB_SEED = 42
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CALIB_INDICES_DIR = os.path.join(_SCRIPT_DIR, "results", "coverage_metrics")
 
-# per-dataset 方案：key=数据集名，value=长度 48 的 0/1/2/3 数组
+# per-dataset 方案：key=数据集名，value=长度 48 的 0/1/3 数组（0=low,1=high,3=original）
 SCHEME_ORIGINAL = 3
 SCHEME_LEVEL_NAMES: dict[int, str] = {
     0: "low",
-    1: "mid",
-    2: "high",
+    1: "high",
     SCHEME_ORIGINAL: "original",
 }
 
@@ -184,7 +183,7 @@ def validate_scheme(scheme: list[int], task_name: str = "") -> None:
     for idx, level in enumerate(scheme):
         if level not in SCHEME_LEVEL_NAMES:
             raise ValueError(
-                f"{task_name} 方案下标 {idx} 取值非法：{level}（仅允许 0/1/2/3）"
+                f"{task_name} 方案下标 {idx} 取值非法：{level}（仅允许 0/1/3）"
             )
         slot = idx % SCHEME_SLOTS_PER_LAYER
         if slot == 2 and not is_original_scheme(level):
@@ -192,7 +191,7 @@ def validate_scheme(scheme: list[int], task_name: str = "") -> None:
             if not gelu_level_allowed(layer_idx, level):
                 allowed = [
                     GELU_LEVEL_KEYS[lvl]
-                    for lvl in (0, 1, 2)
+                    for lvl in (0, 1)
                     if gelu_level_allowed(layer_idx, lvl)
                 ]
                 raise ValueError(
@@ -360,7 +359,7 @@ def apply_polynomial_scheme(
 ) -> None:
     """
     按方案为 12 层注册 Softmax / GeLU / LayerNorm 替换。
-    档位 0/1/2 用多项式近似；3 保留原始算子。
+    档位 0/1 用多项式近似（low/high）；3 保留原始算子。
     需已设置 attn_implementation='eager' 且已调用 install_eager_attention_poly_patch()。
     """
     validate_scheme(scheme)
