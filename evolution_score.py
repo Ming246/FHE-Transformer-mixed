@@ -17,7 +17,7 @@ Archive：维护至今发现的非支配方案集合，作为 Pareto 前沿。
 
 推理汇报（默认开启）：
   1) 全量校验集评估 archive
-  2) 按 f_cost 过滤：排除 OOR / 非有限 KL；同 cost 只保留 KL 最小方案
+  2) 按 f_cost 过滤：排除非有限 KL；同 cost 只保留 KL 最小方案（保留 OOR，CSV 写 oor_count）
   3) 写出 {task}_pareto_calib.csv（仅过滤后解）
   4) 再在全量验证集上评估过滤后解，写出 {task}_pareto_validation.csv
 """
@@ -36,7 +36,9 @@ from cost import (
     NUM_LAYERS,
     SCHEME_LEN,
     compute_f_cost,
+    compute_f_cost_many,
     compute_scheme_cost,
+    default_bts_workers,
     f_cost_label,
     scheme_index,
 )
@@ -46,7 +48,7 @@ from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED
 
 # ===================== 配置区 =====================
 # TASK_NAMES = ["mrpc", "rte","sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["mrpc"]
+TASK_NAMES = ["rte","sst2", "cola", "qnli", "mnli"]
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"
 POLY_LEVELS = (0, 1)
 EVOLUTION_RESULTS_ROOT = "./results/evolution_results/"
@@ -79,6 +81,9 @@ TOURNAMENT_SIZE = 2
 MAX_REGEN_ATTEMPTS = 32
 ARCHIVE_MAX_SIZE = 300
 RANDOM_SEED = 42
+PROGRESS_EVERY = 10
+# DualRail DP 并行进程数；0 = 全部 CPU。bts 是 CPU 整数 DP，GPU 加速不了。
+BTS_COST_WORKERS = 32
 
 # loss 目标单一相对容差；由 τ 导出严格 / 不差阈值
 LOSS_REL_TOL = 0.05
@@ -270,8 +275,30 @@ def evaluate_individual(
 ) -> Individual:
     ind.f_loss = compute_f_loss(ind.scheme, s_mat)
     ind.f_cost = compute_f_cost(task_name, ind.scheme, cost_mode=cost_mode)
-    ind.total_depth = int(compute_scheme_cost(task_name, ind.scheme))
     return ind
+
+
+def evaluate_individuals(
+    inds: list[Individual],
+    task_name: str,
+    s_mat: dict[tuple[int, str], dict[int, float]],
+    *,
+    cost_mode: str,
+    workers: int,
+) -> None:
+    """批量评估 ΣS + f_cost；bts DP 可多进程。搜索期不算 total_depth。"""
+    if not inds:
+        return
+    for ind in inds:
+        ind.f_loss = compute_f_loss(ind.scheme, s_mat)
+    costs = compute_f_cost_many(
+        task_name,
+        [ind.scheme for ind in inds],
+        cost_mode=cost_mode,
+        workers=workers,
+    )
+    for ind, cost in zip(inds, costs):
+        ind.f_cost = int(cost)
 
 
 def fast_non_dominated_sort(
@@ -474,22 +501,30 @@ def run_evolution(
     cost_mode: str = "bts",
     seed: int = RANDOM_SEED,
     sensitive_dir: str = SENSITIVE_OUTPUT_DIR,
+    workers: int | None = None,
 ) -> tuple[list[Individual], Archive]:
     rng = random.Random(seed)
     s_mat = load_sensitivity_matrix(task_name, sensitive_dir)
     allowed_table = build_allowed_levels_table()
 
+    n_workers = default_bts_workers() if not workers else int(workers)
     population = [
         Individual(scheme=scheme)
         for scheme in init_population_strategy(rng, allowed_table, population_size)
     ]
-    for ind in population:
-        evaluate_individual(ind, task_name, s_mat, cost_mode=cost_mode)
+    evaluate_individuals(
+        population, task_name, s_mat, cost_mode=cost_mode, workers=n_workers
+    )
 
     archive = Archive(cost_mode=cost_mode)
     archive.extend(population)
+    print(
+        f"  {task_name.upper()} 初始种群 {population_size}，"
+        f"共 {num_generations} 代，bts_workers={n_workers}",
+        flush=True,
+    )
 
-    for _gen in range(num_generations):
+    for gen in range(1, num_generations + 1):
         offspring: list[Individual] = []
         ranks = fast_non_dominated_sort(population, cost_mode=cost_mode)
         flat = [ind for front in ranks for ind in front]
@@ -501,9 +536,10 @@ def run_evolution(
             p2 = tournament_select(rng, flat, cost_mode=cost_mode)
             child_scheme = crossover(rng, p1.scheme, p2.scheme)
             child_scheme = mutate(rng, child_scheme, allowed_table)
-            child = Individual(scheme=child_scheme)
-            evaluate_individual(child, task_name, s_mat, cost_mode=cost_mode)
-            offspring.append(child)
+            offspring.append(Individual(scheme=child_scheme))
+        evaluate_individuals(
+            offspring, task_name, s_mat, cost_mode=cost_mode, workers=n_workers
+        )
 
         population = environmental_selection(
             population + offspring,
@@ -511,6 +547,15 @@ def run_evolution(
             cost_mode=cost_mode,
         )
         archive.extend(population)
+
+        if gen % PROGRESS_EVERY == 0 or gen == num_generations:
+            best_s = min(ind.f_loss for ind in population)
+            print(
+                f"  代 {gen}/{num_generations}  "
+                f"pop_best_ΣS={best_s:.6e}  "
+                f"archive={len(archive.items)}",
+                flush=True,
+            )
 
     return archive.sorted_items(), archive
 
@@ -526,14 +571,14 @@ def _finite_or_inf(x: float) -> float:
 def filter_pareto_cost_min_kl(items: list[Individual]) -> list[Individual]:
     """
     校验集评估后筛选：
-      · 丢弃 oor_count != 0 或非有限 output_kl
+      · 丢弃非有限 output_kl（OOR 仍保留，数量写入 CSV）
       · 同一 f_cost（bts 或 depth 映射）：只保留 KL 最小者（并列看 f_loss）
     结果按 (f_cost, output_kl) 排序。
     """
     clean = [
         ind
         for ind in items
-        if int(ind.oor_count) == 0 and math.isfinite(ind.output_kl)
+        if math.isfinite(ind.output_kl)
     ]
     by_cost: dict[int, list[Individual]] = defaultdict(list)
     for ind in clean:
@@ -560,7 +605,7 @@ def save_pareto_csv(
     *,
     with_inference: bool,
 ) -> None:
-    """精简列：去掉 task / rank_hint / oor_* / n_eval_used。"""
+    """精简列：去掉 task / rank_hint / oor_pct / n_eval_used；保留 oor_count。"""
     from evolution_infer import fmt_flips_pct
     from poly_model_inference import fmt_metric_delta
 
@@ -573,6 +618,7 @@ def save_pareto_csv(
                 "accuracy_delta",
                 "loss_delta",
                 "output_kl",
+                "oor_count",
                 "flips_pct",
             ]
         )
@@ -583,13 +629,18 @@ def save_pareto_csv(
         writer = csv.writer(f)
         writer.writerow(header)
         for ind in items:
-            row: list = [f"{ind.f_loss:.8e}", ind.f_cost, ind.total_depth]
+            depth = int(ind.total_depth)
+            if depth <= 0:
+                depth = int(compute_scheme_cost(task_name, ind.scheme))
+                ind.total_depth = depth
+            row: list = [f"{ind.f_loss:.8e}", ind.f_cost, depth]
             if with_inference:
                 row.extend(
                     [
                         fmt_metric_delta(ind.accuracy_delta),
                         f"{ind.loss_delta:.8f}",
                         f"{ind.output_kl:.8f}",
+                        int(ind.oor_count),
                         fmt_flips_pct(ind.flips_pct),
                     ]
                 )
@@ -675,6 +726,12 @@ def main() -> None:
         action="store_true",
         help="跳过推理汇报（仅按 f_loss/f_cost 写出未过滤 archive）",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=BTS_COST_WORKERS,
+        help="bts DP 进程数；0=全部 CPU（默认）。GPU 不能加速该 DP。",
+    )
     args = parser.parse_args()
 
     with_inference = not args.skip_inference
@@ -687,7 +744,8 @@ def main() -> None:
     print(
         f"pop={args.pop}, gens={args.gens}, seed={args.seed}, "
         f"cost_mode={args.cost_mode} ({f_cost_label(args.cost_mode)}), "
-        f"sensitive_dir={args.sensitive_dir}"
+        f"sensitive_dir={args.sensitive_dir}, "
+        f"bts_workers={args.workers or default_bts_workers()}"
     )
     print(f"output_dir={args.output_dir}")
     if with_inference:
@@ -705,6 +763,7 @@ def main() -> None:
 
     for task_name in args.tasks:
         try:
+            print(f"\n>>> {task_name.upper()}：NSGA-II 搜索（ΣS vs cost）...", flush=True)
             t0 = time.perf_counter()
             _items, archive = run_evolution(
                 task_name,
@@ -713,6 +772,7 @@ def main() -> None:
                 cost_mode=args.cost_mode,
                 seed=args.seed,
                 sensitive_dir=args.sensitive_dir,
+                workers=args.workers or default_bts_workers(),
             )
             search_elapsed_s = time.perf_counter() - t0
         except FileNotFoundError as exc:
@@ -754,7 +814,7 @@ def main() -> None:
         archive.items = filtered
         print(
             f"  f_cost 过滤：{full_n} → {len(filtered)} "
-            f"（同 f_cost 仅留 KL 最小；已排除 OOR）"
+            f"（同 f_cost 仅留 KL 最小；保留 OOR）"
         )
 
         out_calib = os.path.join(

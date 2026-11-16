@@ -7,7 +7,8 @@ THOR 必做的位置照做。THOR 里看 level 才做的，这里每次都做。
 
 - ``softmax_exp_stockmeyer``：QK 分数之后、Softmax 之前
 - ``softmax_sumsq_r*_sum``：Σy² 求和之后、rotsum 之前
-- ``softmax_asor_sigma_i*`` / ``softmax_norm_r*_asor*``：每轮 aSOR
+- ``softmax_sigma_enc_one`` / ``softmax_asor_sigma_inv``：σ 或 1/σ（σ-aSOR 中途不刷）
+- ``softmax_norm_r*_asor*``：Σy² aSOR 每轮
 - ``softmax_exit_exp``：出口 4 条 exp，乘 inv 之前
 - ``bridge_rot_attn_dense``：attention context 之后、dense 之前
 - ``ln*_invsqrt_*``：inv√ 每一轮
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-# mrpc high L0–L2 上限（σ 6、Σy² 7、ln2 inv√ 7）。没被调用的名字不会刷。
+# mrpc high L0–L2 上限（Σy² 7、ln2 inv√ 7）。没被调用的名字不会刷。
 _N_ITER = 12
 
 
@@ -45,10 +46,11 @@ def thor_fixed_events(layers: Iterable[int]) -> dict[str, str]:
         add(f"{p}.ln2_scale", "real_pack")
         add(f"{p}.ln1_post_invsqrt", "direct")
         add(f"{p}.ln2_post_invsqrt", "direct")
+        add(f"{p}.softmax_sigma_enc_one", "direct")
+        add(f"{p}.softmax_asor_sigma_inv", "direct")
         for r in (0, 1):
             add(f"{p}.softmax_sumsq_r{r}_sum", "direct")
         for i in range(_N_ITER):
-            add(f"{p}.softmax_asor_sigma_i{i}", "real_pack")
             add(f"{p}.ln1_invsqrt_{i}", "real_pack")
             add(f"{p}.ln2_invsqrt_{i}", "real_pack")
             for r in (0, 1):

@@ -1,5 +1,5 @@
 """
-微调模型推理 - MRPC / RTE / SST2
+微调模型推理 - MRPC / RTE / SST2 / CoLA / QNLI / MNLI
 使用钩子统计 12 层 × 4 个非线性函数的输入范围。
   Softmax / GeLU：输入张量元素 min/max
   LayerNorm1/2：与 nolinear/layernorm.py 相同口径，统计有效 token 上 Var(x) 的
@@ -24,7 +24,7 @@ from transformers import (
 )
 
 # ===================== 【核心配置区】 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2"]
+TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
 
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
@@ -32,7 +32,14 @@ INFER_OUTPUT_ROOT = "./finetuned_infer/"
 
 MAX_SEQ_LENGTH = 128
 NUM_LAYERS = 12
-NUM_LABELS = 2
+TASK_NUM_LABELS = {
+    "mrpc": 2,
+    "rte": 2,
+    "sst2": 2,
+    "cola": 2,
+    "qnli": 2,
+    "mnli": 3,
+}
 
 NONLINEAR_NAMES = ["Softmax", "LayerNorm1", "GeLU", "LayerNorm2"]
 
@@ -250,14 +257,26 @@ def remove_hooks(hooks):
 # ===================== 单任务推理 =====================
 
 def get_preprocess_fn(task_name, tokenizer):
-    """根据任务类型返回预处理函数"""
-    if task_name == "sst2":
+    """根据任务类型返回预处理函数。"""
+    if task_name in ("sst2", "cola"):
         def fn(examples):
             return tokenizer(
                 examples["sentence"],
                 truncation=True, max_length=MAX_SEQ_LENGTH
             )
-    else:  # mrpc, rte（双句任务）
+    elif task_name == "qnli":
+        def fn(examples):
+            return tokenizer(
+                examples["question"], examples["sentence"],
+                truncation=True, max_length=MAX_SEQ_LENGTH
+            )
+    elif task_name == "mnli":
+        def fn(examples):
+            return tokenizer(
+                examples["premise"], examples["hypothesis"],
+                truncation=True, max_length=MAX_SEQ_LENGTH
+            )
+    else:  # mrpc, rte
         def fn(examples):
             return tokenizer(
                 examples["sentence1"], examples["sentence2"],
@@ -281,9 +300,12 @@ def infer_single_task(task_name):
     # 1. 加载模型（强制 eager attention，确保 softmax 可观测）
     print(f"✅ 加载模型：{finetuned_model_path}")
     tokenizer = AutoTokenizer.from_pretrained(finetuned_model_path)
+    n_labels = TASK_NUM_LABELS.get(task_name)
+    if n_labels is None:
+        raise KeyError(f"未知任务 {task_name}，请在 TASK_NUM_LABELS 中配置")
     model = AutoModelForSequenceClassification.from_pretrained(
         finetuned_model_path,
-        num_labels=NUM_LABELS,
+        num_labels=n_labels,
         attn_implementation="eager"  # 关键：禁用 SDPA
     )
     model = model.to(device)
@@ -318,7 +340,15 @@ def infer_single_task(task_name):
             remove_columns=drop_cols,
         )
 
-    tokenized_validation = tokenize_split(dataset["validation"])
+    val_split = "validation"
+    if val_split not in dataset and task_name == "mnli":
+        if "validation_matched" in dataset:
+            val_split = "validation_matched"
+        else:
+            raise KeyError(
+                f"{task_name} 缺少 validation / validation_matched：{list(dataset.keys())}"
+            )
+    tokenized_validation = tokenize_split(dataset[val_split])
 
     # 4. 验证集评估（同时收集 LayerNorm 输入）
     print(f"📊 验证集评估中...")
@@ -409,7 +439,7 @@ def infer_single_task(task_name):
 
 def save_merged_csv(all_stats, csv_path):
     """
-    保存合并表格：48 行 × (3 + 3×2) 列
+    保存合并表格：48 行 × (3 + n_tasks×2) 列
     LayerNorm 行 min/max 为 Var(x) 真实 min/max；其余为元素 min/max。
     """
     header = ["Layer", "NonLinear", "stat_kind"]

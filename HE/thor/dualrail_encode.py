@@ -144,8 +144,8 @@ def pack_weight_ff_dualrail(
     ``split='horizontal'`` → FC2 ``(768,3072)`` via ``hsplit``.
 
     Returns object array shape ``(2, n_out_p, ll, n_in_c)`` with ``n_in_c=64``.
-    ``/2`` baked into messages. Linear gate uses ``scale=1`` (production GeLU
-    path bakes ``1/C`` into FC1 only).
+    ``/2`` baked into messages. Linear gate uses ``scale=1``; production
+    high-GeLU FC1 additionally bakes ``1/C`` (low FC1 does not).
     """
     n_in, n_out, b_shape = 128, 128, (128, 128)
     pack = 16

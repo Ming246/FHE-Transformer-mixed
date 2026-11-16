@@ -53,10 +53,22 @@ class GeluHeParams:
     @staticmethod
     def from_gelu_poly(layer_idx: int, *, level: int = 2) -> "GeluHeParams":
         cfg = gelu_config_for_layer(layer_idx, level)
+        if cfg["kind"] == "direct":
+            return GeluHeParams(
+                kind="direct",
+                C=1.0,
+                depth_he=int(cfg["depth_he"]),
+                scheme_name=str(cfg["scheme_name"]),
+                f_cheb_coeffs=tuple(float(c) for c in cfg["f_cheb_coeffs"]),
+                f_domain=(
+                    float(cfg["f_domain"][0]),
+                    float(cfg["f_domain"][1]),
+                ),
+            )
         if cfg["kind"] != "composite":
             raise ValueError(
                 f"layer {layer_idx} level={level} scheme is {cfg['kind']!r} "
-                f"({cfg.get('scheme_name')}); HE path requires composite"
+                f"({cfg.get('scheme_name')}); HE path requires composite|direct"
             )
         return GeluHeParams(
             kind="composite",
@@ -144,17 +156,20 @@ def gelu_poly_slots(x: np.ndarray, params: GeluHeParams) -> np.ndarray:
     """
     单条 slot 向量 Chebyshev GeLU（PS-tree）：GELU ≈ x_phys·(0.5+y)。
 
-    ``x`` 为 FC1 输出（``x_phys/C``）；Chebyshev 在 ``t=x`` 上求值；
-    最终 ``×C`` 恢复物理 pre-GeLU 幅度（替代旧路径 entry ×64 + 内部 /C）。
+    high/composite：``x`` 为 FC1 输出 ``x_phys/C``，Cheb 在 ``t=x`` 上求值，
+    最终 ``×C`` 还原。low/direct：``x`` 已是物理幅度，Cheb 直接在 ``x`` 上求值。
     """
+    x = np.asarray(x, dtype=np.float64)
+    if params.kind == "direct":
+        assert params.f_cheb_coeffs is not None and params.f_domain is not None
+        return cheb_eval_slots(params.f_cheb_coeffs, x, params.f_domain)
     if params.kind != "composite":
         raise ValueError(
-            f"gelu_poly_slots expects composite, got kind={params.kind!r} "
+            f"gelu_poly_slots expects composite|direct, got kind={params.kind!r} "
             f"({params.scheme_name})"
         )
     assert params.f1_cheb_coeffs is not None and params.f1_domain is not None
     assert params.f2_cheb_coeffs is not None and params.f2_domain is not None
-    x = np.asarray(x, dtype=np.float64)
     t = x
     f1 = cheb_eval_slots(params.f1_cheb_coeffs, t, params.f1_domain)
     y = add_vec(

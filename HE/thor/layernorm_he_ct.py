@@ -31,7 +31,7 @@ if _REPO not in sys.path:
 
 from layernorm_poly import _he_invsqrt_kn  # noqa: E402
 from slot_layernorm_he import LayerNormHeParams  # noqa: E402
-from softmax_he_ct import align_bypass_to_main  # noqa: E402
+from softmax_he_ct import align_join  # noqa: E402
 
 
 def _lane0_mask(num_slots: int) -> np.ndarray:
@@ -306,9 +306,17 @@ def he_layernorm_poly(
     ):
         denominator = bts_hook.refresh(post_ev, denominator)
 
-    numerator = [
-        align_bypass_to_main(engine, denominator, ct) for ct in numerator
-    ]
+    num_ev = None
+    if ln_prefix and "." in str(ln_prefix):
+        layer, kind = str(ln_prefix).split(".", 1)
+        num_ev = f"{layer}.bypass.{kind}_num"
+    denominator, numerator = align_join(
+        engine,
+        denominator,
+        numerator,
+        bts_hook=bts_hook,
+        bypass_event=num_ev,
+    )
 
     out = np.full((8,), None, dtype=object)
     for i in range(4):

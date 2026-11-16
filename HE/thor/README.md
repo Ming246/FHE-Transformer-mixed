@@ -88,7 +88,7 @@ python3 HE/thor/smoke_bootstrap.py --burn-levels 6
 # 主复现 / 链
 python3 HE/thor/encode_thor_weights.py --dataset mrpc --layers 0
 python3 HE/thor/smoke_thor_repro.py --layer 0 --bootstrap mock --rest-div 1
-python3 HE/thor/smoke_thor_chain.py --layers 0,1 --bootstrap plan_mock
+python3 HE/thor/smoke_thor_chain.py --layers 0 1 --bootstrap plan
 
 # 深度 / bts（根目录）
 python3 -c "from cost import print_scheme_cost; print_scheme_cost('mrpc', [2]*48)"

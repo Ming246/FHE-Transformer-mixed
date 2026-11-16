@@ -1,6 +1,7 @@
 """
 多项式近似 BERT 推理
-按 per-dataset 方案数组替换各层 Softmax / GeLU / LayerNorm，在验证集/校验集上评估并与原始模型对比。
+按 per-dataset 方案数组替换各层 Softmax / GeLU / LayerNorm，并把 BertPooler 的 tanh
+换成 C=5 的 p2(p1(z/C))（tanh_poly.py），在验证集/校验集上评估并与原始模型对比。
 
 方案数组顺序（长度 48 = 12 层 × 4）：
   [layer0_softmax, layer0_ln1, layer0_gelu, layer0_ln2,
@@ -33,8 +34,8 @@ from transformers import (
 )
 
 # ===================== 配置区 =====================
-TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-#TASK_NAMES = ["rte"]
+#TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 
@@ -108,41 +109,36 @@ def normalize_scheme(
 
 def _init_poly_schemes() -> dict[str, list[int]]:
     raw: dict[str, list[int]] = {
-        "mrpc": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
-        ],
+        "mrpc": [1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         "rte": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
         ], #rte数据集第四层gelu有问题
         "sst2": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
+            0, 0, 0, 0,   0, 0, 0, 0,   0, 0, 0, 0,
         ],
         "cola": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
         ],
         "qnli": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
         ],
         "mnli": [
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 1, 1,   1, 1, 1, 1,   1, 1, 1, 1,
-            1, 1, 0, 1,   1, 1, 0, 1,    1, 1, 1, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
+            1, 1, 0, 1,   1, 1, 0, 1,   1, 1, 0, 1,
         ],
         # "mrpc": [0]*48,
         # "rte": [0]*48,
@@ -171,6 +167,10 @@ from softmax_poly import (
     ThorSoftmaxEvaluator,
     additive_attention_mask_to_key_valid,
 )
+from tanh_poly import TanhPolyEvaluator
+
+# Pooler tanh 不在 48 维方案里；poly 推理默认用 C=5 的 p2(p1(z/C))
+USE_POLY_POOLER_TANH = True
 
 
 # ===================== 方案工具 =====================
@@ -336,6 +336,30 @@ def _restore_layernorm_module(ln_module: torch.nn.Module) -> None:
     ln_module._poly_ln_level = SCHEME_ORIGINAL
 
 
+def _patch_pooler_tanh(pooler: torch.nn.Module, poly_fn) -> None:
+    """将 BertPooler.activation（nn.Tanh）换成 p2(p1(z/C))。"""
+    act = pooler.activation
+    if not hasattr(act, "_orig_tanh_forward"):
+        act._orig_tanh_forward = act.forward
+
+    @functools.wraps(act.forward)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return poly_fn(input)
+
+    act.forward = types.MethodType(forward, act)
+    act._poly_tanh_fn = poly_fn
+    pooler._poly_tanh = True
+
+
+def _restore_pooler_tanh(pooler: torch.nn.Module) -> None:
+    act = pooler.activation
+    orig = getattr(act, "_orig_tanh_forward", None)
+    if orig is not None:
+        act.forward = orig
+    act._poly_tanh_fn = None
+    pooler._poly_tanh = False
+
+
 def _patch_layernorm_module(
     ln_module: torch.nn.Module, poly_evaluator: HeLayerNormPolyEvaluator
 ) -> None:
@@ -410,6 +434,12 @@ def apply_polynomial_scheme(
                 ln2_module,
                 HeLayerNormPolyEvaluator(task_name, layer_idx, "ln2", ln2_level),
             )
+
+    pooler = model.bert.pooler
+    if USE_POLY_POOLER_TANH:
+        _patch_pooler_tanh(pooler, TanhPolyEvaluator())
+    else:
+        _restore_pooler_tanh(pooler)
 
 
 # ===================== 数据与推理 =====================
@@ -855,6 +885,8 @@ def _warmup_poly_kernels(model, scheme: list[int]) -> None:
             layer.attention.output.LayerNorm.forward(ln_warmup)
         if not is_original_scheme(scheme[scheme_index(layer_idx, "ln2")]):
             layer.output.LayerNorm.forward(ln_warmup)
+    if USE_POLY_POOLER_TANH and getattr(model.bert.pooler, "_poly_tanh", False):
+        model.bert.pooler.activation.forward(gelu_warmup)
 
 
 def run_poly_inference(

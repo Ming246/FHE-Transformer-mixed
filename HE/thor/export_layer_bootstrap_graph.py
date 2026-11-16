@@ -489,7 +489,7 @@ def export_layer_bootstrap_plan(
         "  QKV --> SM[Softmax: exp / aSOR / Σy² / dualrail exit]",
         "  SM --> CTX[att_context + attn_dense]",
         "  CTX --> LN1[LN1: scale var invsqrt x5 post]",
-        "  LN1 --> FF[FFN: dense1 gelu_f1/f2 reconstruct dense2]",
+        "  LN1 --> FF[FFN: dense1 gelu_direct|f1/f2/recon dense2]",
         "  FF --> LN2[LN2: scale var invsqrt x5 post]",
         f"  LN2 --> OUT[ln2_out → L{layer + 1}]",
         "```",

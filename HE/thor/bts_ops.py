@@ -26,11 +26,15 @@ bts 后应保留的剩余深度。
 计价（关键路径乐观界）：``layout=dualrail`` 用主路径现场 CT 数；
 ``layout=real`` 用 ``max(1, n//2)``（打包后复数条数）。
 
-DP 状态是 **spine rem only**（``(rem,)``）。旁路对齐在 HE 侧
-``align_bypass_to_main``（含 Softmax exit 的 exp→inv）；不进 DP。
+DP 状态是 **(spine rem, resid, side, aux)**。会合只做
+``min(主路 rem, 旁路 rem)``（两侧都不在会合点刷）；HE ``align_join``
+按该 rem ``level_up``。段首刷只发生在非会合事件。
 
 现行微事件划分：**全部 atomic**（不可再拆、段内不可中途 bts；
 ``rem >= depth + LIBERATE_MIN_LEAVE_REM``，不够则段首 before-boot）。
+σ-aSOR：整段 ``softmax_asor_sigma`` ``forbid_boot``（禁止中途刷 an/bn）；
+可在 ``softmax_sigma_enc_one`` 刷 σ，或在 ``softmax_asor_sigma_inv`` 刷算出的 1/σ。
+Σy² aSOR / LN inv√：仍按轮可段首 bts。
 
 不修改仓库根 ``cost.py`` / ``HE/bts_ops.py``。
 """
@@ -328,14 +332,14 @@ DEPTH_LN_PREP_COLD = DEPTH_LN_SCALE + DEPTH_LN_VAR  # 兼容：scale+var
 # （broadcast rotate/add、pc_add(β)、cc_add×2 不烧 rem）
 DEPTH_LN_POST_INVSQRT = int(_COST_DEPTH_LN_POST_INVSQRT)
 
-# 旁路槽名（仅 export / 历史命名；DP 不再跟踪 slot rem）
-SLOT_RESID = 0  # deprecated alias — HE align_bypass_to_main
-SLOT_V = 1  # deprecated alias — Softmax 期间 V
-SLOT_AUX = 2  # deprecated alias — Softmax exp / LN numerator
-N_SLOTS = 0  # DP rem-only；无 slot 维
+# 活旁路槽（互斥复用 SIDE：V / GeLU t / LN numerator）
+SLOT_RESID = 0  # attn / FF residual
+SLOT_SIDE = 1  # V, then LN num, then GeLU t
+SLOT_AUX = 2  # softmax exp
+N_SLOTS = 3
 SLOT_UNSET = -1
-SlotVec = tuple[int, ...]  # length N_SLOTS (== 0 → empty)
-DpState = tuple[int, ...]  # (rem,) + empty slots
+SlotVec = tuple[int, ...]  # length N_SLOTS
+DpState = tuple[int, ...]  # (rem, resid, side, aux)
 
 # 默认审计任务：与 softmax/LN 配置表一致
 DEFAULT_AUDIT_TASKS: tuple[str, ...] = tuple(
@@ -356,14 +360,16 @@ class Event:
     join: bool = False
     ct_peak: int | None = None
     align_depth: int = 0  # 旧固定对齐（已弃用）
-    # Deprecated slot fields（N_SLOTS=0；DP/rem_trace 忽略；保留以免旧调用炸掉）
     save_slot: int | None = None
     entry_save_slot: int | None = None
     join_slot: int | None = None
-    join_offset: int = 0
-    join_ct: int = 0
+    join_offset: int = 0  # 会合前主路先烧的 depth（如 Σy² mask）
+    join_ct: int = 0  # 旁路 Liberate bootstrap 次数（direct 按条）
     refresh_side: bool = False
     clear_slot: int | None = None
+    bypass_event: str | None = None  # plan 名，如 L0.bypass.resid_attn
+    boot_slot_on_before: int | None = None  # 段首刷主路时连带刷的槽
+    boot_slot_ct: int = 0
     # Deprecated：保留字段以免旧调用炸掉；DP 已忽略（一律可选）。
     force_bootstrap: bool = False
     # 兼容字段（DP 已不选 DualRail pack；保留以免旧调用炸掉）。
@@ -380,6 +386,8 @@ class Event:
     cost_ct: int | None = None  # 覆盖计价；None → layout 推导
     # True：段首 before-boot 只刷 off-spine 伴侣（如 Σy² summation），spine rem 不变。
     companion_boot: bool = False
+    # True：禁止段首 before-boot（aSOR/inv√ 第 4 轮起的原子 tail）。
+    forbid_boot: bool = False
 
     @property
     def bts_ct(self) -> int:
@@ -418,6 +426,12 @@ class Event:
                 raise ValueError(f"join_slot 非法：{self.join_slot}")
             if self.clear_slot is not None and not (0 <= self.clear_slot < N_SLOTS):
                 raise ValueError(f"clear_slot 非法：{self.clear_slot}")
+            if self.boot_slot_on_before is not None and not (
+                0 <= self.boot_slot_on_before < N_SLOTS
+            ):
+                raise ValueError(
+                    f"boot_slot_on_before 非法：{self.boot_slot_on_before}"
+                )
         if self.join_offset < 0:
             raise ValueError(f"join_offset 不能为负：{self.name}")
         if self.join_ct < 0:
@@ -445,7 +459,7 @@ class BootstrapPlacement:
     event_name: str
     ct_count: int
     remaining_before: int
-    reason: str  # "before_event" | "mid_event"
+    reason: str  # "before_event" | "mid_event" | "bypass"
     pack_mode: str = "direct"  # "direct" | "real_pack"
 
 
@@ -473,7 +487,7 @@ class LevelDiscard:
 
 @dataclass
 class BypassBoot:
-    """One HE ``align_bypass_to_main`` / AUX refresh that is not a DP placement."""
+    """Join/AUX bootstrap emitted as ``reason=bypass`` in placements."""
 
     event_name: str
     ct_count: int
@@ -538,6 +552,10 @@ def compute_level_discards(
     理想情况：bts 只恢复会用到的链长。原生库做不到，只能满预算恢复后再
     discard：若到下一次 bts 只需 ``D < remaining_after_bts``，则保留 ``D``。
     THOR 原版入口 level_calc≈21（剩~8）是其放置下的特例，而非常数。
+
+    ``remaining_keep`` 只计乘法 depth 和，不含会合 ``min`` 造成的 level_up。
+    会合降 rem 由 HE ``align_join`` 执行；若把 min 折进 keep，会在会合前
+    就把主路砍到旁路深度，改变会合结果。
     """
     if budget <= 0:
         raise ValueError("budget 须为正")
@@ -665,6 +683,7 @@ def simulate_remaining_trace(
 
     rows: list[RemTraceRow] = []
     r = min(init, budget)
+    sl: list[int] = [r] + [SLOT_UNSET] * (N_SLOTS - 1)
     rows.append(
         RemTraceRow(
             kind="start",
@@ -675,35 +694,61 @@ def simulate_remaining_trace(
             depth_charged=0,
         )
     )
-    # DualRail LN 入口 boot 后，融合 prep 只烧 DEPTH_LN_PREP；否则冷启动 COLD。
-    dualrail_ln_entry = False
-
-    def do_boot(ev: Event, ei: int, p: BootstrapPlacement | None, reason: str) -> None:
-        nonlocal r
-        pm = (
-            (p.pack_mode if p is not None else None)
-            or pack_mode_for_event(ev)
+    for ei, ev in enumerate(events):
+        pls = by_ev.get(ei, [])
+        before = [p for p in pls if p.reason == "before_event"]
+        side_boot = any(
+            p.reason == "bypass"
+            and ev.bypass_event is not None
+            and p.event_name == ev.bypass_event
+            for p in pls
         )
         rb = r
-        if ev.companion_boot and reason == "before_event":
-            pass  # summation companion；spine rem 不变
-        else:
-            r = _boot_land_rem(ev, budget, pack_mode=pm)
-        rows.append(
-            RemTraceRow(
-                kind="after_boot",
-                event_name=ev.name,
-                event_index=ei,
-                rem_before=rb,
-                rem_after=r,
-                depth_charged=0,
-                boot_reason=reason,
-                boot_pack_mode=pm,
+        if before:
+            pm = before[0].pack_mode or pack_mode_for_event(ev)
+            rows.append(
+                RemTraceRow(
+                    kind="before_boot",
+                    event_name=ev.name,
+                    event_index=ei,
+                    rem_before=rb,
+                    rem_after=rb,
+                    depth_charged=0,
+                    boot_reason="before_event",
+                    boot_pack_mode=pm,
+                )
             )
+            r_boot = (
+                rb
+                if ev.companion_boot
+                else _boot_land_rem(ev, budget, pack_mode=pm)
+            )
+            rows.append(
+                RemTraceRow(
+                    kind="after_boot",
+                    event_name=ev.name,
+                    event_index=ei,
+                    rem_before=rb,
+                    rem_after=r_boot,
+                    depth_charged=0,
+                    boot_reason="before_event",
+                    boot_pack_mode=pm,
+                )
+            )
+        add, r, _mid, ns, _st = _transition_event(
+            rb,
+            sl,
+            ev,
+            budget,
+            before_style=("plain" if before else None),
+            side_boot=side_boot,
         )
-
-    def _finish_event(ev: Event, ei: int, rb: int, depth_charged: int) -> None:
-        """Record rem-only after_event（无 slot save/clear / post_invsqrt min）。"""
+        if add >= 10**9:
+            raise RuntimeError(
+                f"rem_trace: {ev.name} rem={rb} 不可行 "
+                f"(before={bool(before)} side_boot={side_boot})"
+            )
+        sl = list(ns)
         rows.append(
             RemTraceRow(
                 kind="after_event",
@@ -711,84 +756,33 @@ def simulate_remaining_trace(
                 event_index=ei,
                 rem_before=rb,
                 rem_after=r,
-                depth_charged=depth_charged,
+                depth_charged=int(ev.depth) if ev.depth > 0 else 0,
             )
         )
-
-    for ei, ev in enumerate(events):
-        pls = by_ev.get(ei, [])
-        before = [p for p in pls if p.reason == "before_event"]
-        mids = [p for p in pls if p.reason == "mid_event"]
-        if before:
-            rows.append(
-                RemTraceRow(
-                    kind="before_boot",
-                    event_name=ev.name,
-                    event_index=ei,
-                    rem_before=r,
-                    rem_after=r,
-                    depth_charged=0,
-                    boot_reason="before_event",
-                    boot_pack_mode=(before[0].pack_mode or pack_mode_for_event(ev)),
-                )
-            )
-            do_boot(ev, ei, before[0], "before_event")
-            if int(getattr(ev, "dualrail_depth", 0) or 0) > 0 and (
-                ev.name.endswith(".ln1_scale")
-                or ev.name.endswith(".ln2_scale")
-            ):
-                dualrail_ln_entry = True
-
-        d = _event_spine_depth(ev)
-
-        mid_i = 0
-        rb = r
-        # HE inv√：plan mid 在段首 in_plan 即刷（不必等 rem<MIN）；先落 planned mid。
-        # （现行一律 atomic 后 DP 不再产生 mid；保留回放兼容旧 placements。）
-        while mid_i < len(mids):
-            p = mids[mid_i]
-            rows.append(
-                RemTraceRow(
-                    kind="before_boot",
-                    event_name=ev.name,
-                    event_index=ei,
-                    rem_before=r,
-                    rem_after=r,
-                    depth_charged=0,
-                    boot_reason="mid_event",
-                    boot_pack_mode=(p.pack_mode or pack_mode_for_event(ev)),
-                )
-            )
-            do_boot(ev, ei, p, "mid_event")
-            if int(getattr(ev, "dualrail_depth", 0) or 0) > 0 and (
-                ev.name.endswith(".ln1_scale")
-                or ev.name.endswith(".ln2_scale")
-            ):
-                dualrail_ln_entry = True
-            mid_i += 1
-            rb = r
-
-        # LN scale/var 已声明 depth；DualRail 入口仅作标记（unpack 税在 dualrail_depth）。
-        if ev.name.endswith(".ln1_scale") or ev.name.endswith(".ln2_scale"):
-            dualrail_ln_entry = False
-
-        if d <= 0:
-            _finish_event(ev, ei, rb, 0)
-            continue
-        leave = int(LIBERATE_MIN_LEAVE_REM)
-        # 一律 atomic：禁止把 depth 拆成多段 mid-boot；也不允许烧到 rem=0。
-        if r < d + leave:
-            raise RuntimeError(
-                f"rem_trace: {ev.name} rem={r} < depth+MIN_LEAVE={d}+{leave}; "
-                f"missing before_event placement (atomic micro-event)"
-            )
-        r -= d
-        _finish_event(ev, ei, rb, d)
     return rows
 
 
 # ``update_inv_D_fixed``：apply 段首刷 inv 之后 ``pt_ct_mult``+rescale，再 align exp。
 _SUMSQ_MASK_BEFORE_ALIGN = 1
+
+
+def _bypass_from_placements(
+    placements: list[BootstrapPlacement],
+) -> tuple[list[BypassBoot], int]:
+    boots: list[BypassBoot] = []
+    for p in placements:
+        if p.reason != "bypass" or int(p.ct_count) <= 0:
+            continue
+        boots.append(
+            BypassBoot(
+                event_name=p.event_name,
+                ct_count=int(p.ct_count),
+                bypass_rem=-1,
+                main_rem=-1,
+                reason="align",
+            )
+        )
+    return boots, sum(b.ct_count for b in boots)
 
 
 def _align_bypass_cts(bypass_rem: int, main_rem: int, n_ct: int) -> int:
@@ -896,13 +890,8 @@ def account_bypass_bts(
 
         mask_ev = suf.get("softmax_attn_mask")
         exp_rem = _after(mask_ev) if mask_ev else None
-        sigma_asor_hit = any(
-            (
-                nm.startswith(f"{pfx}.softmax_asor_sigma_i")
-                and nm in placed
-            )
-            for nm in suf.values()
-        )
+        # σ-aSOR 禁止刷 an/bn，不再连带 AUX；1/σ 刷在 softmax_asor_sigma_inv。
+        sigma_asor_hit = suf.get("softmax_asor_sigma") in placed
         if sigma_asor_hit:
             _add(
                 f"{pfx}.bypass.softmax_exp_aux_after_sigma",
@@ -1024,6 +1013,16 @@ def _ev(
     layout: str = "real",
     cost_ct: int | None = None,
     companion_boot: bool = False,
+    save_slot: int | None = None,
+    entry_save_slot: int | None = None,
+    join_slot: int | None = None,
+    join_offset: int = 0,
+    join_ct: int = 0,
+    clear_slot: int | None = None,
+    bypass_event: str | None = None,
+    boot_slot_on_before: int | None = None,
+    boot_slot_ct: int = 0,
+    forbid_boot: bool = False,
 ) -> Event:
     del atomic  # 现行划分一律 atomic；保留形参以免旧调用炸掉
     return Event(
@@ -1033,7 +1032,7 @@ def _ev(
         ct_out=ct_out,
         layer_idx=layer_idx,
         kind=kind,
-        join=join,
+        join=join or join_slot is not None,
         ct_peak=ct_peak,
         align_depth=align_depth,
         force_bootstrap=force_bootstrap,
@@ -1046,6 +1045,16 @@ def _ev(
         layout=layout,
         cost_ct=cost_ct,
         companion_boot=companion_boot,
+        save_slot=save_slot,
+        entry_save_slot=entry_save_slot,
+        join_slot=join_slot,
+        join_offset=join_offset,
+        join_ct=join_ct,
+        clear_slot=clear_slot,
+        bypass_event=bypass_event,
+        boot_slot_on_before=boot_slot_on_before,
+        boot_slot_ct=boot_slot_ct,
+        forbid_boot=forbid_boot,
     )
 
 
@@ -1106,8 +1115,12 @@ def _append_softmax_dualrail_exit(
             layout="real",
             no_level_discard=True,
             atomic=True,
-            # 主路径 = inv（1）；exp 旁路乐观不计
+            # 主路径 = inv（1）；exp 旁路会合计入 join_ct
             cost_ct=1 if use_aux else None,
+            join_slot=SLOT_AUX if use_aux else None,
+            join_ct=(g.ct_att_score // 2) if use_aux else 0,
+            clear_slot=SLOT_AUX if use_aux else None,
+            bypass_event=f"{prefix}.bypass.softmax_exit_exp" if use_aux else None,
         )
     )
 
@@ -1165,9 +1178,10 @@ def _append_softmax_events(
     exp + attn mask + 逐次 aSOR_σ + 每轮 Σy²(apply + summation@asor0 + aSOR)
     + DualRail 8→128 exit（对齐 ``softmax_he_ct``，非 copy 链）。
 
-    ``softmax_sigma_enc_one`` / ``sumsq_r*_enc_one``：段首只刷 1 条 live CT
-    （direct，落地 rem=budget−1）。随后 ``encode_and_encrypt`` 出 enc_one，不占 bts。
-    下一站 ``asor_*`` 才是 an,bn ``real_pack``（代价同为 1，落地 budget−1）。
+    ``softmax_sigma_enc_one``：段首可刷 σ（1 CT、direct）。
+    ``softmax_asor_sigma``：整段 σ-aSOR，``forbid_boot``（不刷 an/bn）。
+    ``softmax_asor_sigma_inv``：段首可刷算出的 1/σ。
+    ``sumsq_r*_enc_one`` 后 Σy² aSOR 仍按轮 ``real_pack``。
     """
     g = active_geometry()
     iters_sigma, iters_sum_sq, rounds, _ = _softmax_params(
@@ -1183,6 +1197,7 @@ def _append_softmax_events(
             g.ct_att_score,
             layer_idx,
             "pathway",
+            save_slot=SLOT_AUX,
         )
     )
     events.append(
@@ -1194,8 +1209,11 @@ def _append_softmax_events(
             CT_SOFTMAX_INV_SPINE,
             layer_idx,
             "pathway",
-            plain_ct=CT_SOFTMAX_INV_SPINE,
-            layout="real",
+            # HE：段首 refresh 的是 8 条 exp_u（随后 cc_add 成 σ）；AUX 跟到 land
+            plain_ct=g.ct_att_score,
+            layout="dualrail",
+            cost_ct=g.ct_att_score,
+            boot_slot_on_before=SLOT_AUX,
         )
     )
     events.append(
@@ -1213,23 +1231,36 @@ def _append_softmax_events(
             cost_ct=1,
         )
     )
-    for i in range(iters_sigma):
-        events.append(
-            _ev(
-                prefix,
-                f"softmax_asor_sigma_i{i}",
-                SOFTMAX_ASOR_ITER_DEPTH,
-                CT_SOFTMAX_ASOR_SPINE,
-                CT_SOFTMAX_ASOR_SPINE,
-                layer_idx,
-                "softmax",
-                # 2 实数 an/bn → DualRail 打包刷：cost=1，落地 rem=budget−1
-                plain_ct=2,
-                layout="real",
-                dualrail_depth=DUALRAIL_UNPACK_DEPTH,
-                atomic=True,
-            )
+    events.append(
+        _ev(
+            prefix,
+            "softmax_asor_sigma",
+            iters_sigma * SOFTMAX_ASOR_ITER_DEPTH,
+            CT_SOFTMAX_ASOR_SPINE,
+            CT_SOFTMAX_INV_SPINE,
+            layer_idx,
+            "softmax",
+            # 整段 σ-aSOR 原子：禁止刷 an/bn。σ 在 enc_one 刷；1/σ 在下一站 inv 刷。
+            plain_ct=2,
+            layout="real",
+            forbid_boot=True,
         )
+    )
+    events.append(
+        _ev(
+            prefix,
+            "softmax_asor_sigma_inv",
+            0,
+            CT_SOFTMAX_INV_SPINE,
+            CT_SOFTMAX_INV_SPINE,
+            layer_idx,
+            "pathway",
+            # 段首可刷算出的 1/σ（1 CT、direct）
+            plain_ct=1,
+            layout="dualrail",
+            cost_ct=1,
+        )
+    )
     for r in range(rounds):
         events.append(
             _ev(
@@ -1243,9 +1274,13 @@ def _append_softmax_events(
                 plain_ct=CT_SOFTMAX_INV_SPINE,
                 layout="real",
                 no_level_discard=True,
-                # 主路 inv→summation；旁路 exp 对齐在 HE 侧
+                # 主路 inv→summation；旁路 exp 会合
                 cost_ct=CT_SOFTMAX_INV_SPINE,
                 atomic=True,
+                join_slot=SLOT_AUX,
+                join_offset=_SUMSQ_MASK_BEFORE_ALIGN,
+                join_ct=g.ct_att_score,
+                bypass_event=f"{prefix}.bypass.softmax_sumsq_r{r}_exp",
             )
         )
         events.append(
@@ -1303,18 +1338,60 @@ def _append_gelu_events(
     level: int,
 ) -> None:
     """
-    对齐 ``gelu_he_ct`` pack 路径。
+    对齐 ``gelu_he_ct`` pack 路径。low / high 流程不同：
 
-    - ``gelu_f1``：f1 Chebyshev（旁路 ``t`` 对齐在 HE 侧，不进 DP）
-    - ``gelu_f2``：f2 Chebyshev（段首可刷 f1）
-    - ``gelu_reconstruct``：主路 ``y``（段首可刷）；旁路 ``x_phys=t·C`` 由 HE
-      ``align_bypass_to_main`` 会合后 ct×ct（depth=1，仅 mul；``×C`` 不计主路）
+    Direct (low)：
+      - ``gelu_direct``：单段 Chebyshev ≈ GELU（原子；无 SIDE、无 reconstruct）
+        depth = ⌈log₂ deg⌉ + combo + [domain affine]
+
+    Composite (high)：
+      - ``gelu_f1``：f1 Chebyshev；段首刷则旁路 ``t`` 同步 land
+      - ``gelu_f2``：f2 Chebyshev（段首可刷 f1）
+      - ``gelu_reconstruct``：主路 ``y`` 与旁路 ``t`` 会合后 ct×ct
     """
     g = active_geometry()
     cfg = gelu_config_for_layer(layer_idx, level)
+    expected = gelu_he_depth(layer_idx, level)
+    F = g.ct_ffn
+    if cfg["kind"] == "direct":
+        bd = cfg["depth_he_breakdown"]
+        d = (
+            int(bd["y_eval"])
+            + int(bd["cheb_combo_rescale"])
+            + int(bd.get("domain_affine", 0))
+        )
+        events.append(
+            _ev(
+                prefix,
+                "gelu_direct",
+                d,
+                F,
+                F,
+                layer_idx,
+                "gelu",
+                ct_peak=F,
+                plain_ct=F,
+                layout="real",
+                atomic=True,
+                dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+            )
+        )
+        actual = sum(
+            e.depth
+            for e in events
+            if e.layer_idx == layer_idx and e.kind == "gelu"
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"GeLU depth 拆分不一致 L{layer_idx} level={level}: "
+                f"split={actual} expected={expected} "
+                f"(direct y={bd['y_eval']} combo={bd['cheb_combo_rescale']} "
+                f"affine={bd.get('domain_affine', 0)})"
+            )
+        return
     if cfg["kind"] != "composite":
         raise RuntimeError(
-            f"phase C GeLU expects composite, got {cfg['kind']!r} "
+            f"phase C GeLU expects composite|direct, got {cfg['kind']!r} "
             f"L{layer_idx} level={level}"
         )
     bd = gelu_he_depth_breakdown(
@@ -1327,8 +1404,6 @@ def _append_gelu_events(
     f1_d = int(bd["f1_eval"]) + combo
     f2_d = int(bd.get("f2_affine", 0)) + int(bd["f2_eval"]) + combo
     recon_d = int(bd["gelu_reconstruct"])  # ct×ct only (=1)
-    expected = gelu_he_depth(layer_idx, level)
-    F = g.ct_ffn
     if f1_d > 0:
         events.append(
             _ev(
@@ -1344,6 +1419,7 @@ def _append_gelu_events(
                 layout="real",
                 atomic=True,
                 dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+                entry_save_slot=SLOT_SIDE,
             )
         )
     if f2_d > 0:
@@ -1378,6 +1454,10 @@ def _append_gelu_events(
                 layout="real",
                 atomic=True,
                 dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+                join_slot=SLOT_SIDE,
+                join_ct=F,
+                clear_slot=SLOT_SIDE,
+                bypass_event=f"{prefix}.bypass.gelu_x_phys",
             )
         )
     actual = sum(
@@ -1444,11 +1524,12 @@ def _append_layernorm_events(
             CT_LN_VAR_SPINE,
             layer_idx,
             kind,
-            # 段首刷 8×enc_l（普通打包）；出口 variance 主路 1
+            # 段首刷 8×enc_l（普通打包）；出口 variance 主路 1；numerator→SIDE
             plain_ct=hr,
             layout="real",
             dualrail_depth=DUALRAIL_UNPACK_DEPTH,
             atomic=True,
+            save_slot=SLOT_SIDE,
         )
     )
     events.append(
@@ -1492,10 +1573,15 @@ def _append_layernorm_events(
             hr,
             layer_idx,
             kind,
-            # 段首只刷 denom（单 CT 直接刷）；旁路 num 对齐在 HE 侧
+            # 段首只刷 denom；旁路 num 会合
             plain_ct=1,
             layout="dualrail",
             cost_ct=1,
+            join_slot=SLOT_SIDE,
+            join_ct=hr,
+            clear_slot=SLOT_SIDE,
+            bypass_event=f"{prefix}.bypass.{kind}_num",
+            save_slot=SLOT_RESID if kind == "ln1" else SLOT_RESID,
         )
     )
     expected = (
@@ -1566,6 +1652,8 @@ def build_bootstrap_events(
                 cost_ct=Hc,  # before：4 cplx
                 ct_peak=R,  # 段内 rot 峰值 64
                 atomic=True,
+                entry_save_slot=SLOT_RESID,
+                save_slot=SLOT_SIDE,  # V rem = after QKV
             )
         )
         # Q∥K→sftmx_in 原子岛：段前 bts 刷 Q+K（不计 V）；段后由下一站刷 sftmx_in。
@@ -1600,9 +1688,12 @@ def build_bootstrap_events(
                 "linear",
                 join=True,
                 layout="real",
-                # 主路径 = α；V 旁路不计
                 cost_ct=A // 2,
                 atomic=True,
+                join_slot=SLOT_SIDE,
+                join_ct=g.ct_v_cplx,
+                clear_slot=SLOT_SIDE,
+                bypass_event=f"{p}.bypass.v_to_softmax",
             )
         )
         events.append(
@@ -1630,7 +1721,24 @@ def build_bootstrap_events(
                 atomic=True,
             )
         )
-        # 残差会合不进微事件：HE ``align_bypass_to_main`` + add → ln1
+        events.append(
+            _ev(
+                p,
+                "join_resid_attn",
+                0,
+                Hr,
+                Hr,
+                layer_idx,
+                "bridge",
+                plain_ct=Hr,
+                layout="real",
+                dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+                join_slot=SLOT_RESID,
+                join_ct=Hr,
+                clear_slot=SLOT_RESID,
+                bypass_event=f"{p}.bypass.resid_attn",
+            )
+        )
         ln1_level = _slot_level(scheme, layer_idx, "ln1")
         _append_layernorm_events(
             events, p, layer_idx, task_name, "ln1", ln1_level
@@ -1648,9 +1756,11 @@ def build_bootstrap_events(
                 layer_idx,
                 "bridge",
                 # 8 real LN1 普通打包 → DualRail：cost=4，落地 budget−1
+                # 段首刷会刷新 FF 残差 ln1_out
                 plain_ct=Hr,
                 layout="real",
                 dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+                boot_slot_on_before=SLOT_RESID,
             )
         )
         events.append(
@@ -1686,7 +1796,24 @@ def build_bootstrap_events(
                 dualrail_depth=DUALRAIL_UNPACK_DEPTH,
             )
         )
-        # 残差会合不进微事件：HE ``align_bypass_to_main`` + add → ln2
+        events.append(
+            _ev(
+                p,
+                "join_resid_ff",
+                0,
+                Hr,
+                Hr,
+                layer_idx,
+                "bridge",
+                plain_ct=Hr,
+                layout="real",
+                dualrail_depth=DUALRAIL_UNPACK_DEPTH,
+                join_slot=SLOT_RESID,
+                join_ct=Hr,
+                clear_slot=SLOT_RESID,
+                bypass_event=f"{p}.bypass.resid_ff",
+            )
+        )
         ln2_level = _slot_level(scheme, layer_idx, "ln2")
         _append_layernorm_events(
             events, p, layer_idx, task_name, "ln2", ln2_level
@@ -1769,12 +1896,11 @@ def _consume_event_depth(
 
 
 def _side_remaining(slots: SlotVec, ev: Event) -> int:
-    """Unused with N_SLOTS=0；保留签名以免旧调用炸掉。"""
     assert ev.join_slot is not None
     saved = slots[ev.join_slot]
     if saved == SLOT_UNSET:
         raise RuntimeError(f"{ev.name}: join_slot={ev.join_slot} 尚未 fork save")
-    return max(0, saved - ev.join_offset)
+    return max(0, int(saved))
 
 
 def _pad_slots(slots: tuple[int, ...] | list[int]) -> list[int]:
@@ -1892,8 +2018,10 @@ def _consume_depth_with_style(
 
 
 def _on_boot_slots(slots: list[int], ev: Event, budget: int) -> None:
-    """No-op：DP rem-only；旁路对齐在 HE 侧。"""
-    del slots, ev, budget
+    """段首刷主路时，与主路同 CT 的槽跟到 land。"""
+    land = _boot_land_rem(ev, budget)
+    if ev.boot_slot_on_before is not None and ev.boot_slot_ct <= 0:
+        slots[ev.boot_slot_on_before] = land
 
 
 def _consume_depth_pick(
@@ -1907,9 +2035,9 @@ def _consume_depth_pick(
     if depth <= 0:
         return 0, remaining, 0, "direct"
     extra, r, mid = _consume_depth_with_style(
-        remaining, depth, ev, budget, slots, pack_mode=pack_mode_for_event(ev)
+        remaining, depth, ev, budget, slots, pack_mode=None
     )
-    return extra, r, mid, pack_mode_for_event(ev)
+    return extra, r, mid, "direct"
 
 
 def _consume_depth_with_side_refresh(
@@ -1932,46 +2060,102 @@ def _transition_event(
     budget: int,
     *,
     before_style: str | None,
+    side_boot: bool = False,
 ) -> tuple[int, int, int, SlotVec, str]:
     """
-    执行事件一步（rem-only；忽略 ``slots`` / join/save/clear）。
+    执行事件一步（含活旁路槽与会合对齐）。
 
-    ``before_style``：None 或任意非 None（仅表示段首是否 boot；落地 rem 由 Event 决定）。
+    ``before_style``：None 或不刷 / 非 None 段首刷主路（会合事件 DP 只传 None）。
+    ``side_boot``：现固定 False。会合 rem = min(主路, 旁路)。
     返回 (add, rem, mid_count, new_slots, mid_pack_mode)。
     """
     add = 0
     mid = 0
-    mid_pm = pack_mode_for_event(ev)
-    r = rem
-    del slots  # N_SLOTS=0；签名保留
+    mid_pm = "direct"
+    r = int(rem)
+    sl = list(slots)
+    if len(sl) < N_SLOTS:
+        sl.extend([SLOT_UNSET] * (N_SLOTS - len(sl)))
+    elif len(sl) > N_SLOTS:
+        sl = sl[:N_SLOTS]
+    land = int(budget) - int(BTS_POST_DEPTH)
 
     if before_style is not None:
         if ev.companion_boot:
             add += 1
         else:
-            ct, r = _boot_pay(ev, pack_mode_for_event(ev), budget)
+            ct, r = _boot_pay(ev, "direct", budget)
             add += ct
+        if ev.entry_save_slot is not None:
+            sl[ev.entry_save_slot] = r
+        if ev.boot_slot_on_before is not None:
+            # HE σ-aSOR 整段结束后只刷一轮 exp；槽已是 land 则不再加价。
+            extra = int(ev.boot_slot_ct)
+            if extra > 0 and sl[ev.boot_slot_on_before] == land:
+                extra = 0
+            sl[ev.boot_slot_on_before] = land
+            add += extra
+    elif ev.entry_save_slot is not None:
+        sl[ev.entry_save_slot] = r
 
+    if ev.join_slot is not None and ev.join_offset > 0:
+        a, r, m, st = _consume_depth_pick(
+            r, ev.join_offset, ev, budget, sl
+        )
+        add += a
+        mid += m
+        if m > 0:
+            mid_pm = st
+        if add >= 10**9:
+            return add, r, mid, _slots_tuple(sl), mid_pm
+
+    if ev.join_slot is not None:
+        saved = sl[ev.join_slot]
+        if saved == SLOT_UNSET:
+            return 10**9, r, mid, _slots_tuple(sl), mid_pm
+        side = int(saved)
+        if side_boot:
+            if int(ev.join_ct) <= 0:
+                return 10**9, r, mid, _slots_tuple(sl), mid_pm
+            add += int(ev.join_ct)
+            side = land
+        r = min(int(r), int(side))
+        sl[ev.join_slot] = r
+
+    body_d = int(ev.depth)
+    if ev.join_slot is not None:
+        body_d = max(0, body_d - int(ev.join_offset))
     if ev.align_depth > 0:
         a, r, m, st = _consume_depth_pick(
-            r, ev.align_depth, ev, budget, []
+            r, ev.align_depth, ev, budget, sl
         )
         add += a
         mid += m
         mid_pm = st
+        if add >= 10**9:
+            return add, r, mid, _slots_tuple(sl), mid_pm
 
-    a, r, m, st = _consume_depth_pick(r, ev.depth, ev, budget, [])
+    a, r, m, st = _consume_depth_pick(r, body_d, ev, budget, sl)
     add += a
     mid += m
     if m > 0:
         mid_pm = st
 
-    return add, r, mid, _slots_tuple([]), mid_pm
+    # 会合后 body（Σy² mul/square、context、LN post…）两路一起烧；旁路 rem 跟主路。
+    if ev.join_slot is not None and sl[ev.join_slot] != SLOT_UNSET:
+        sl[ev.join_slot] = r
+    if ev.save_slot is not None:
+        sl[ev.save_slot] = r
+    if ev.clear_slot is not None:
+        sl[ev.clear_slot] = SLOT_UNSET
+
+    return add, r, mid, _slots_tuple(sl), mid_pm
 
 
 def _before_styles(ev: Event) -> tuple[str | None, ...]:
     """段首可选：不刷 / boot。落地 rem 由 ``pack_mode_for_event`` 决定。"""
-    del ev
+    if ev.forbid_boot:
+        return (None,)
     return (None, "plain")
 
 
@@ -2044,6 +2228,58 @@ def _align_mid_placements_to_rem_trace(
     return pls, extra
 
 
+def dp_bts_count(
+    events: list[Event],
+    *,
+    budget: int = BOOTSTRAP_DEPTH_BUDGET,
+    initial_level: int | None = None,
+) -> int:
+    """只求最少总 bts，不回溯 placement / rem_trace（进化 ``f_cost`` 快路径）。"""
+    if budget <= 0:
+        raise ValueError(f"budget 须为正，当前 {budget}")
+    if initial_level is None:
+        initial_level = budget
+    if initial_level < 0:
+        raise ValueError(f"initial_level 不能为负：{initial_level}")
+    n = len(events)
+    if n == 0:
+        return 0
+
+    inf = 10**18
+    start_r = min(initial_level, budget)
+    start_slots = (start_r,) + (SLOT_UNSET,) * (N_SLOTS - 1)
+    start_state: DpState = (start_r,) + start_slots
+    cur: dict[DpState, int] = {start_state: 0}
+
+    for ev in events:
+        nxt: dict[DpState, int] = {}
+        befores = (None,) if ev.join_slot is not None else _before_styles(ev)
+        for state, cost in cur.items():
+            rem = int(state[0])
+            slots = state[1:]
+            for before in befores:
+                add, r_after, _mid, ns, _st = _transition_event(
+                    rem,
+                    slots,
+                    ev,
+                    budget,
+                    before_style=before,
+                    side_boot=False,
+                )
+                if add >= 10**9:
+                    continue
+                nstate: DpState = (r_after,) + tuple(ns)
+                ncost = cost + add
+                prev = nxt.get(nstate, inf)
+                if ncost < prev:
+                    nxt[nstate] = ncost
+        if not nxt:
+            raise RuntimeError(f"optimize_bootstrap: 事件 {ev.name} 后无可达状态")
+        cur = nxt
+
+    return int(min(cur.values()))
+
+
 def optimize_bootstrap_events(
     events: list[Event],
     *,
@@ -2051,11 +2287,9 @@ def optimize_bootstrap_events(
     initial_level: int | None = None,
 ) -> BootstrapResult:
     """
-    路径 DP：状态 ``(rem,)``（rem-only；无旁路 slot）→ 最少关键路径 bts。
+    路径 DP：状态 ``(rem, resid, side, aux)`` → 最少总 bts。
 
-    旁路对齐（残差 / V / AUX）在 HE 侧 ``align_bypass_to_main`` /
-    companion DualRail，不进 DP 状态；plan 生成后再由
-    ``account_bypass_bts`` 按真实会合点计入 ``bts_count``。
+    会合只 ``min``（不刷主路、不刷旁路）。段首刷仅非会合事件。
     """
     if budget <= 0:
         raise ValueError(f"budget 须为正，当前 {budget}")
@@ -2072,12 +2306,13 @@ def optimize_bootstrap_events(
 
     inf = 10**18
     start_r = min(initial_level, budget)
-    start_state: DpState = (start_r,) + (SLOT_UNSET,) * N_SLOTS
+    start_slots = (start_r,) + (SLOT_UNSET,) * (N_SLOTS - 1)
+    start_state: DpState = (start_r,) + start_slots
     cur: dict[DpState, int] = {start_state: 0}
     parents: list[
         dict[
             DpState,
-            tuple[DpState, int, int, int, str],
+            tuple[DpState, int, int, int, str, int],
         ]
     ] = [{} for _ in range(n + 1)]
 
@@ -2095,9 +2330,17 @@ def optimize_bootstrap_events(
         for state, cost in cur.items():
             rem = int(state[0])
             slots = state[1:]
-            for before in _before_styles(ev):
+            befores = (
+                (None,) if ev.join_slot is not None else _before_styles(ev)
+            )
+            for before in befores:
                 add, r_after, mid, ns, mid_style = _transition_event(
-                    rem, slots, ev, budget, before_style=before
+                    rem,
+                    slots,
+                    ev,
+                    budget,
+                    before_style=before,
+                    side_boot=False,
                 )
                 if add >= 10**9:
                     continue
@@ -2112,6 +2355,7 @@ def optimize_bootstrap_events(
                         add,
                         mid,
                         mid_style,
+                        0,
                     )
         if not nxt:
             raise RuntimeError(f"optimize_bootstrap: 事件 {ev.name} 后无可达状态")
@@ -2165,12 +2409,20 @@ def optimize_bootstrap_events(
             budget=budget,
             initial_level=initial_level,
         )
-    spine = int(total)
-    bypass, bypass_boots = account_bypass_bts(
-        events, placements, rem_trace, budget=budget
+    spine = sum(
+        p.ct_count for p in placements if p.reason != "bypass"
     )
+    bypass_boots, bypass = _bypass_from_placements(placements)
+    if spine + bypass != int(total):
+        # σ-aSOR 连带 AUX 计在 spine 事件 add 里，不单独占 placement
+        extra = int(total) - spine - bypass
+        if extra < 0:
+            raise RuntimeError(
+                f"DP total={total} spine={spine} bypass={bypass}"
+            )
+        bypass += extra
     return BootstrapResult(
-        bts_count=spine + bypass,
+        bts_count=int(total),
         placements=placements,
         events=list(events),
         budget=budget,
@@ -2188,7 +2440,7 @@ def _reconstruct_placements_forward(
     parents: list[
         dict[
             DpState,
-            tuple[DpState, int, int, int, str],
+            tuple[DpState, int, int, int, str, int],
         ]
     ],
     end_state: DpState,
@@ -2196,11 +2448,11 @@ def _reconstruct_placements_forward(
     budget: int,
 ) -> list[BootstrapPlacement]:
     n = len(events)
-    chain: list[tuple[int, DpState, int, int, int, str]] = []
+    chain: list[tuple[int, DpState, int, int, int, str, int]] = []
     state = end_state
     for i in range(n, 0, -1):
-        prev_state, tag, add, mid, mid_style = parents[i][state]
-        chain.append((i - 1, prev_state, tag, add, mid, mid_style))
+        prev_state, tag, add, mid, mid_style, side_boot = parents[i][state]
+        chain.append((i - 1, prev_state, tag, add, mid, mid_style, side_boot))
         state = prev_state
     chain.reverse()
 
@@ -2208,7 +2460,7 @@ def _reconstruct_placements_forward(
         return (None, "plain", "dualrail")[tag]
 
     placements: list[BootstrapPlacement] = []
-    for i, prev_state, tag, add, mid, mid_style in chain:
+    for i, prev_state, tag, add, mid, mid_style, side_boot in chain:
         ev = events[i]
         rem_before = prev_state[0]
         paid = 0
@@ -2245,6 +2497,39 @@ def _reconstruct_placements_forward(
                 )
             )
             paid += mct
+        if before is not None and int(ev.boot_slot_ct) > 0:
+            slot_i = ev.boot_slot_on_before
+            prev_slot = (
+                int(prev_state[1 + slot_i])
+                if slot_i is not None and len(prev_state) > 1 + slot_i
+                else SLOT_UNSET
+            )
+            land = _boot_land_rem(ev, budget)
+            if prev_slot != land:
+                pfx = ev.name.split(".", 1)[0]
+                placements.append(
+                    BootstrapPlacement(
+                        event_index=i,
+                        event_name=f"{pfx}.bypass.softmax_exp_aux_after_sigma",
+                        ct_count=int(ev.boot_slot_ct),
+                        remaining_before=rem_before,
+                        reason="bypass",
+                        pack_mode="direct",
+                    )
+                )
+                paid += int(ev.boot_slot_ct)
+        if side_boot and ev.bypass_event and int(ev.join_ct) > 0:
+            placements.append(
+                BootstrapPlacement(
+                    event_index=i,
+                    event_name=ev.bypass_event,
+                    ct_count=int(ev.join_ct),
+                    remaining_before=rem_before,
+                    reason="bypass",
+                    pack_mode="direct",
+                )
+            )
+            paid += int(ev.join_ct)
         if paid != add:
             raise RuntimeError(
                 f"事件 {ev.name} placement 记账 {paid} != DP add {add}"
@@ -2270,7 +2555,9 @@ def optimize_bootstrap(
         depth_overrides=depth_overrides,
     )
     return optimize_bootstrap_events(
-        events, budget=budget, initial_level=initial_level
+        events,
+        budget=budget,
+        initial_level=initial_level,
     )
 
 
@@ -2283,14 +2570,17 @@ def compute_scheme_bts(
     phase: str = "C",
     geom: SlotCtGeometry | None = None,
 ) -> int:
-    return optimize_bootstrap(
+    events = build_bootstrap_events(
         task_name,
         scheme,
-        budget=budget,
-        initial_level=initial_level,
         phase=phase,
         geom=geom,
-    ).bts_count
+    )
+    return dp_bts_count(
+        events,
+        budget=budget,
+        initial_level=initial_level,
+    )
 
 
 def scheme_all(level: int) -> list[int]:
@@ -2376,7 +2666,7 @@ def run_phase_d_audit(
     add, r, mid, _ns, _st = _transition_event(
         8, empty_slots, ev_qk, budget, before_style="plain"
     )
-    expect_r = budget - DEPTH_QK_SCORE
+    expect_r = _boot_land_rem(ev_qk, budget) - DEPTH_QK_SCORE
     if add != 2 * g.ct_qkv_out or mid != 0 or r != expect_r:
         errors.append(
             f"Q∥K 原子岛 before 失败: add={add} mid={mid} r={r} "
@@ -2404,10 +2694,11 @@ def run_phase_d_audit(
     add_p, r_p, _, _, _ = _transition_event(
         10, empty_slots, ev_dr, budget, before_style="plain"
     )
-    if add_p != g.ct_att_score // 2 or r_p != budget:
+    land = budget - BTS_POST_DEPTH
+    if add_p != g.ct_att_score // 2 or r_p != land:
         errors.append(
             f"real-8 cost 失败: add={add_p} r={r_p} "
-            f"(应 add={g.ct_att_score // 2}, r={budget})"
+            f"(应 add={g.ct_att_score // 2}, r={land})"
         )
 
     # sumsq/sigma enc_one：depth=0，段首 1 CT；不刷则 rem 不变
@@ -2487,6 +2778,8 @@ def run_phase_d_audit(
                     "softmax_attn_mask",
                     "softmax_sigma_aggregate",
                     "softmax_sigma_enc_one",
+                    "softmax_asor_sigma",
+                    "softmax_asor_sigma_inv",
                     "softmax_dualrail_exit",
                     "linear_att_context",
                     "bridge_rot_attn_dense",
@@ -2497,14 +2790,36 @@ def run_phase_d_audit(
                     "ln2_scale",
                     "ln2_var",
                     "ln2_enc_one",
-                    "gelu_f1",
-                    "gelu_f2",
-                    "gelu_reconstruct",
+                    "join_resid_attn",
+                    "join_resid_ff",
                 ):
                     if need not in names_l:
                         errors.append(
                             f"{task} L{level} L{layer_idx} 缺微事件 {need}"
                         )
+                gelu_cfg = gelu_config_for_layer(layer_idx, level)
+                if gelu_cfg["kind"] == "direct":
+                    if "gelu_direct" not in names_l:
+                        errors.append(
+                            f"{task} L{level} L{layer_idx} 缺微事件 gelu_direct"
+                        )
+                    for old in ("gelu_f1", "gelu_f2", "gelu_reconstruct"):
+                        if old in names_l:
+                            errors.append(
+                                f"{task} L{level} L{layer_idx} "
+                                f"direct 不应有 {old}"
+                            )
+                elif gelu_cfg["kind"] == "composite":
+                    for need in ("gelu_f1", "gelu_f2", "gelu_reconstruct"):
+                        if need not in names_l:
+                            errors.append(
+                                f"{task} L{level} L{layer_idx} 缺微事件 {need}"
+                            )
+                else:
+                    errors.append(
+                        f"{task} L{level} L{layer_idx} 未知 GeLU kind="
+                        f"{gelu_cfg['kind']!r}"
+                    )
                 n_sumsq_apply = sum(
                     1 for n in names_l if re.match(r"softmax_sumsq_r\d+_apply$", n)
                 )
@@ -2563,6 +2878,19 @@ def run_phase_d_audit(
 
             if result.bts_count < 0:
                 errors.append(f"{task} L{level} 负 bts")
+
+            for e in events:
+                suf = e.name.split(".", 1)[-1]
+                if suf == "softmax_asor_sigma" and not e.forbid_boot:
+                    errors.append(
+                        f"{task} L{level} {e.name} σ-aSOR 未 forbid_boot"
+                    )
+            for p in result.placements:
+                suf = p.event_name.split(".", 1)[-1]
+                if suf == "softmax_asor_sigma":
+                    errors.append(
+                        f"{task} L{level} σ-aSOR 中途有 bts: {p.event_name}"
+                    )
 
     # 单调性：同任务 all_low ≤ all_high（phase C）
     for task in tasks:

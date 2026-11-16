@@ -70,6 +70,7 @@ GeLU 档位有 **层组方案**（A/B/C，`gelu_poly.gelu_level_allowed` / `_GEL
   - **未用轮次**（\(\delta_2=2\) 时第 2 轮）表项为 **0**，且不计入深度
 - **LayerNorm**：`layernorm_he_depth` = scale+var+enc_one + 2×iters + post（每轮 inv√ 深度 2）
 - 进化默认 \(f_\mathrm{cost}=\) DualRail DP 总 bts（`HE/thor/bts_ops.optimize_bootstrap`，budget **14**，与 `plan_mock` 相同）
+- σ-aSOR：整段禁止刷 an/bn；只可在 `softmax_sigma_enc_one` 刷 σ，或在 `softmax_asor_sigma_inv` 刷算出的 1/σ。Σy² aSOR / LN inv√ 仍按轮可段首 bts
 - `--cost-mode depth` 仍可用：\(\lceil\mathrm{depth}/\texttt{COST\_DEPTH\_DIVISOR}\rceil\)
 - 简报见 [`docs/HE_BOOTSTRAP_COST.md`](docs/HE_BOOTSTRAP_COST.md)
 

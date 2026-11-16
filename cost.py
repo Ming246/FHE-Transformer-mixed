@@ -26,6 +26,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from typing import Any
 
@@ -113,15 +114,21 @@ def _thor_bts_ops():
     return mod
 
 
-@lru_cache(maxsize=4096)
+_BTS_MEMO: dict[tuple[str, tuple[int, ...], int, str], int] = {}
+
+
 def _scheme_bts_cached(
     task_name: str,
     scheme: tuple[int, ...],
     budget: int,
     phase: str,
 ) -> int:
+    key = (task_name, scheme, int(budget), phase)
+    hit = _BTS_MEMO.get(key)
+    if hit is not None:
+        return hit
     bts_ops = _thor_bts_ops()
-    return int(
+    val = int(
         bts_ops.compute_scheme_bts(
             task_name,
             list(scheme),
@@ -129,6 +136,91 @@ def _scheme_bts_cached(
             phase=phase,
         )
     )
+    _BTS_MEMO[key] = val
+    return val
+
+
+def _f_cost_worker(
+    item: tuple[str, tuple[int, ...], str, int | None, str],
+) -> tuple[tuple[int, ...], int]:
+    """进程池 worker：返回 (scheme, f_cost)。"""
+    task_name, scheme, cost_mode, budget, phase = item
+    val = compute_f_cost(
+        task_name,
+        list(scheme),
+        cost_mode=cost_mode,
+        budget=budget,
+        phase=phase,
+    )
+    return scheme, int(val)
+
+
+_F_COST_POOL: ProcessPoolExecutor | None = None
+_F_COST_POOL_N = 0
+
+
+def default_bts_workers() -> int:
+    n = os.cpu_count() or 1
+    return max(1, int(n))
+
+
+def compute_f_cost_many(
+    task_name: str,
+    schemes: list[list[int]] | list[tuple[int, ...]],
+    *,
+    cost_mode: str = "bts",
+    budget: int | None = None,
+    phase: str = "C",
+    workers: int | None = None,
+) -> list[int]:
+    """
+    批量 ``f_cost``。相同 scheme 只算一次；``workers>1`` 时进程池并行 DP。
+    DualRail 整数 DP 不适合 GPU，并行用 CPU 多核。
+    """
+    keys = [tuple(int(x) for x in sch) for sch in schemes]
+    if not keys:
+        return []
+    unique: list[tuple[int, ...]] = list(dict.fromkeys(keys))
+    n_workers = default_bts_workers() if workers is None else max(1, int(workers))
+    bgt = BTS_DEPTH_BUDGET if budget is None else int(budget)
+
+    memo: dict[tuple[int, ...], int] = {}
+    missing: list[tuple[int, ...]] = []
+    if cost_mode == "bts":
+        for sch in unique:
+            hit = _BTS_MEMO.get((task_name, sch, bgt, phase))
+            if hit is None:
+                missing.append(sch)
+            else:
+                memo[sch] = hit
+    else:
+        missing = list(unique)
+
+    if not missing:
+        return [memo[k] for k in keys]
+
+    if n_workers <= 1 or len(missing) == 1:
+        for sch in missing:
+            memo[sch] = compute_f_cost(
+                task_name, list(sch), cost_mode=cost_mode, budget=budget, phase=phase
+            )
+        return [memo[k] for k in keys]
+
+    global _F_COST_POOL, _F_COST_POOL_N
+    if _F_COST_POOL is None or _F_COST_POOL_N != n_workers:
+        if _F_COST_POOL is not None:
+            _F_COST_POOL.shutdown(wait=False)
+        _F_COST_POOL = ProcessPoolExecutor(max_workers=n_workers)
+        _F_COST_POOL_N = n_workers
+
+    payloads = [
+        (task_name, sch, cost_mode, budget, phase) for sch in missing
+    ]
+    for sch, val in _F_COST_POOL.map(_f_cost_worker, payloads, chunksize=1):
+        memo[sch] = val
+        if cost_mode == "bts":
+            _BTS_MEMO[(task_name, sch, bgt, phase)] = val
+    return [memo[k] for k in keys]
 
 
 @lru_cache(maxsize=4096)

@@ -196,6 +196,7 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 
 - 倒数是 **aSOR**（与 THOR `he_inv` 同形；固定 kn 更新）
 - **不是** Newton（无 `D*r` 耦合项）；生产路径已不用 Goldschmidt
+- DP：σ-aSOR 整段 `forbid_boot`（不刷 an/bn）；σ 在 `softmax_sigma_enc_one`，1/σ 在 `softmax_asor_sigma_inv`。Σy² aSOR / LN inv√ 仍按轮可刷
 - 深度公式与 `cost.softmax_he_depth` 对齐；eval 打印可用实际 iters（α 提前停）
 - `LAYER_ASOR_MAX_ITERS_SUM_SQ2_*`：仅 \(\delta_2=4\) 的层非零，其余为 0 且不计深度
 

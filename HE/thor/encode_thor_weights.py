@@ -4,10 +4,11 @@ Encode DualRail THOR weights, **one pickle per layer**.
 
 Writes (under ``encoded_models_new/{dataset}/``)::
 
-  ff_L{0..11}.pkl   ~6 GiB each (FF / LN2 tiles for that layer)
-  att_L{0..11}.pkl  ~3 GiB each (QKV / W_O / LN1 tiles)
-  pooler.pkl        small
-  cls.pkl           classifier (after last att encode)
+  ff_L{0..11}_low.pkl   FC1 scale=1 + FC2/LN2（GeLU low/direct）
+  ff_L{0..11}_high.pkl  FC1 scale=1/C + FC2/LN2（GeLU high/composite）
+  att_L{0..11}.pkl      ~3 GiB each (QKV / W_O / LN1 tiles)
+  pooler.pkl            small
+  cls.pkl               classifier (after last att encode)
 
 Does **not** write the old monolithic ``ff.pkl`` / ``att.pkl``.
 Each layer is dumped and dropped before the next, so RSS stays ~one layer.
@@ -35,6 +36,14 @@ ensure_thor_path()
 import torch
 
 
+def ff_gelu_tag(gelu_level: int) -> str:
+    """GeLU scheme slot → FF pickle tag. 0/3 → low (no /C); else high (/C)."""
+    lv = int(gelu_level)
+    if lv in (0, 3):
+        return "low"
+    return "high"
+
+
 def encoded_layer_pkl(
     dataset: str,
     kind: str,
@@ -42,12 +51,22 @@ def encoded_layer_pkl(
     *,
     encoded_dir: str | None = None,
     thor_root: str = _THOR_ROOT,
+    gelu_level: int | None = None,
+    ff_tag: str | None = None,
 ) -> str:
-    """``…/encoded_models_new/{dataset}/{ff|att}_L{n}.pkl``."""
+    """``…/encoded_models_new/{dataset}/{att_Ln|ff_Ln_{low|high}}.pkl``."""
     if kind not in ("ff", "att"):
         raise ValueError(f"kind must be ff|att, got {kind!r}")
     root = encoded_dir or os.path.join(thor_root, "encoded_models_new", dataset)
-    return os.path.join(root, f"{kind}_L{int(layer_idx)}.pkl")
+    if kind == "att":
+        return os.path.join(root, f"att_L{int(layer_idx)}.pkl")
+    if ff_tag is None:
+        if gelu_level is None:
+            raise ValueError("ff pickle requires gelu_level or ff_tag=low|high")
+        ff_tag = ff_gelu_tag(gelu_level)
+    if ff_tag not in ("low", "high"):
+        raise ValueError(f"ff_tag must be low|high, got {ff_tag!r}")
+    return os.path.join(root, f"ff_L{int(layer_idx)}_{ff_tag}.pkl")
 
 
 def _remap_cuda_device() -> None:
@@ -77,7 +96,12 @@ def _normalize_layernorm_keys(weights_m: dict) -> None:
 
 
 def _dump_layer_pkl(
-    weights_pt: dict, out_path: str, layer_idx: int, *, label: str
+    weights_pt: dict,
+    out_path: str,
+    layer_idx: int,
+    *,
+    label: str,
+    drop: bool = True,
 ) -> None:
     needle = f".layer.{layer_idx}."
     layer_w = {
@@ -93,9 +117,10 @@ def _dump_layer_pkl(
         pickle.dump(layer_w, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, out_path)
     n = len(layer_w)
-    for k in list(weights_pt):
-        if needle in k:
-            weights_pt[k] = None
+    if drop:
+        for k in list(weights_pt):
+            if needle in k:
+                weights_pt[k] = None
     del layer_w
     gc.collect()
     print(
@@ -122,6 +147,7 @@ def _dump_named_pkl(weights_pt: dict, out_path: str, pred, *, label: str) -> Non
 
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, _REPO)
+from gelu_poly import gelu_ff1_encode_scale  # noqa: E402
 from softmax_poly import k_key_encode_scale  # noqa: E402
 
 
@@ -144,6 +170,12 @@ def main() -> int:
         choices=("ff", "att", "both"),
         default="both",
         help="which DualRail family to encode (default: both)",
+    )
+    ap.add_argument(
+        "--ff-gelu",
+        choices=("both", "low", "high"),
+        default="both",
+        help="FF pickle(s): low=FC1×1, high=FC1×1/C, both=two files (default)",
     )
     ap.add_argument(
         "--model",
@@ -228,17 +260,40 @@ def main() -> int:
         gc.collect()
 
     if do_ff:
+        ff_tags = (
+            ("low", "high")
+            if args.ff_gelu == "both"
+            else (args.ff_gelu,)
+        )
+        abs_out = os.path.abspath(out_dir)
         for layer in layers:
-            print(f"FF layer {layer}", flush=True)
-            encoder.encode_ff(layer)
-            _dump_layer_pkl(
-                encoder.weights_pt,
-                encoded_layer_pkl(
-                    args.dataset, "ff", layer, encoded_dir=os.path.abspath(out_dir)
-                ),
-                layer,
-                label="ff",
-            )
+            print(f"FF layer {layer} tags={ff_tags}", flush=True)
+            first = True
+            for i, tag in enumerate(ff_tags):
+                scale = gelu_ff1_encode_scale(layer, 0 if tag == "low" else 1)
+                rest = first
+                print(
+                    f"  encode FC1 scale={scale:g} rest={rest} → {tag}",
+                    flush=True,
+                )
+                encoder.encode_ff(
+                    layer, fc1_scale=scale, encode_rest=rest
+                )
+                last = i == len(ff_tags) - 1
+                _dump_layer_pkl(
+                    encoder.weights_pt,
+                    encoded_layer_pkl(
+                        args.dataset,
+                        "ff",
+                        layer,
+                        encoded_dir=abs_out,
+                        ff_tag=tag,
+                    ),
+                    layer,
+                    label=f"ff/{tag}",
+                    drop=last,
+                )
+                first = False
 
     if do_att:
         print("-" * 50)
@@ -272,9 +327,31 @@ def main() -> int:
     print(f"Encoding complete for {args.dataset}", flush=True)
     print("-" * 50)
     for layer in layers:
-        for kind in (("ff",) if do_ff else ()) + (("att",) if do_att else ()):
+        if do_ff:
+            tags = (
+                ("low", "high")
+                if args.ff_gelu == "both"
+                else (args.ff_gelu,)
+            )
+            for tag in tags:
+                p = encoded_layer_pkl(
+                    args.dataset,
+                    "ff",
+                    layer,
+                    encoded_dir=os.path.abspath(out_dir),
+                    ff_tag=tag,
+                )
+                if os.path.isfile(p):
+                    print(
+                        f"  {p}  {os.path.getsize(p) / (1024**3):.2f} GiB",
+                        flush=True,
+                    )
+        if do_att:
             p = encoded_layer_pkl(
-                args.dataset, kind, layer, encoded_dir=os.path.abspath(out_dir)
+                args.dataset,
+                "att",
+                layer,
+                encoded_dir=os.path.abspath(out_dir),
             )
             if os.path.isfile(p):
                 print(

@@ -1567,7 +1567,7 @@ def ff_dense1_plain(
     """
     Plain dense1: two ``block_diag_2`` PC-MM + optional bias + conjugate → ``(2, n_out_p)`` real.
 
-    Production THOR uses ``scale=1/C`` on W and bias (per-layer GeLU domain C).
+    Production: high GeLU uses ``scale=1/C`` on FC1 W/bias; low uses ``1``.
     """
     w_msgs = pack_weight_ff_dualrail(
         w1, split="vertical", scale=scale, out_packs=out_packs

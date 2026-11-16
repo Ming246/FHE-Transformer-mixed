@@ -48,7 +48,7 @@ from softmax_poly import (
 
 # ===================== 配置区 =====================
 #TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["mrpc"]
+TASK_NAMES = ["mrpc","rte", "sst2", "cola", "qnli", "mnli"]
 LOCAL_DATA_ROOT = "./glue_datasets/"
 FINETUNED_MODEL_ROOT = "./finetuned_weight/"
 SENSITIVE_OUTPUT_DIR = "./results/sensitive_scores_1/"

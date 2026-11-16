@@ -6,9 +6,10 @@ I/O matches THOR ``he_gelu``: ciphertext array shape ``(2, 8)``.
 
 Eval (aligned with ``slot_gelu_he`` / ``nolinear/gelu_chebyshev``):
   Build T_0..T_n via T_{a+b}=2 T_a T_b - T_|a-b| (depth ≈ ⌈log₂ n⌉), then
-  ∑ c_k T_k with one lazy rescale.   Composite pack path:
-    ``gelu_f1_pack`` → ``gelu_f2_pack`` → ``gelu_y_pack`` → ``gelu_reconstruct_pack``
-  (f1 / f2 / reconstruct = separate micro-events). FC1 bake ``/C``; restore ``×C``.
+  ∑ c_k T_k with one lazy rescale.   Composite (high): ``gelu_f1_pack`` → ``gelu_f2_pack`` → ``gelu_y_pack``
+    → ``gelu_reconstruct_pack``（三段微事件）。
+  Direct (low): ``gelu_direct_pack`` 一次 Chebyshev ≈ GELU（单原子微事件
+    ``gelu_direct``；无 f2、无 reconstruct）。
 """
 from __future__ import annotations
 
@@ -222,6 +223,57 @@ def _map_pack(fn, packs: np.ndarray) -> np.ndarray:
     return out
 
 
+def gelu_direct_pack(
+    engine,
+    t: np.ndarray,
+    params: GeluHeParams,
+    *,
+    bts_hook=None,
+    bts_prefix: str | None = None,
+) -> np.ndarray:
+    """
+    Low / kind=direct：单段 Chebyshev 直接输出 GELU。
+
+    微事件 ``{prefix}.gelu_direct``（原子）：段首可刷 ``t``，然后
+    affine_to_z（定义域非 [-1,1] 时）+ PS-tree + combo rescale。
+    无 f2、无 ``x·(0.5+y)``、无 SIDE 旁路。
+    """
+    from dualrail_bts import plan_refresh_dualrail_ff
+
+    if params.kind != "direct":
+        raise ValueError(
+            f"gelu_direct_pack expects kind=direct, got {params.kind!r} "
+            f"({params.scheme_name})"
+        )
+    assert params.f_cheb_coeffs is not None and params.f_domain is not None
+
+    if bts_prefix and bts_hook is not None:
+        ev = f"{bts_prefix}.gelu_direct"
+        if bts_hook.should_refresh(ev):
+            print(
+                f"  [gelu_he_ct] {ev} refresh "
+                f"pack_mode={bts_hook.pack_mode(ev)}",
+                flush=True,
+            )
+            t = plan_refresh_dualrail_ff(engine, t, bts_hook, ev)
+
+    out = _map_pack(
+        lambda ct: cheb_eval_ct(
+            engine,
+            params.f_cheb_coeffs,
+            ct,
+            params.f_domain,
+            rescale_combo=True,
+        ),
+        t,
+    )
+    if getattr(engine, "_mag_sk", None) is not None:
+        from mag_probe import report as _mag_report
+
+        _mag_report(engine, f"{bts_prefix}.gelu_direct_out", out)
+    return out
+
+
 def gelu_f1_pack(engine, t: np.ndarray, params: GeluHeParams) -> np.ndarray:
     """
     Micro-event candidate: f1 Chebyshev on FC1 scale ``t = x_phys/C``.
@@ -286,11 +338,11 @@ def gelu_reconstruct_pack(
     - Input spine: ``y = f1+f2`` (shape ``(2, 8)``); output = GeLU
     - Bypass: ``x_phys = t·C``（``×C`` 不计主路 depth；t rem 足以完成 scale）
     - Plan hook ``{prefix}.gelu_reconstruct``：在 ``f1+f2`` 之后、``ct×ct`` 之前刷 ``y``
-    - 显式 ``align_bypass_to_main(half_plus, x_phys)``，不依赖 ``_ct_mul`` 对齐
+    - 显式 ``align_join(half_plus, x_phys)``，不依赖 ``_ct_mul`` 对齐
     - Depth = 1（仅 ``_ct_mul(x_phys, half_plus)``）
     """
     from dualrail_bts import plan_refresh_dualrail_ff
-    from softmax_he_ct import align_bypass_to_main
+    from softmax_he_ct import align_join
 
     _require_composite(params, where="gelu_reconstruct_pack")
     if t.shape != (2, 8) or y.shape != (2, 8):
@@ -309,13 +361,26 @@ def gelu_reconstruct_pack(
             )
             y = plan_refresh_dualrail_ff(engine, y, bts_hook, recon_ev)
 
+    half_plus = np.full((2, 8), None, dtype=object)
+    x_phys = np.full((2, 8), None, dtype=object)
+    for i in range(2):
+        for j in range(8):
+            half_plus[i, j] = _ct_add_scalar(engine, y[i, j], 0.5)
+            x_phys[i, j] = _ct_scale(engine, t[i, j], C)
+    bypass_ev = (
+        f"{bts_prefix}.bypass.gelu_x_phys" if bts_prefix else None
+    )
+    half_plus, x_phys = align_join(
+        engine,
+        half_plus,
+        x_phys,
+        bts_hook=bts_hook,
+        bypass_event=bypass_ev,
+    )
     out = np.full((2, 8), None, dtype=object)
     for i in range(2):
         for j in range(8):
-            half_plus = _ct_add_scalar(engine, y[i, j], 0.5)
-            x_phys = _ct_scale(engine, t[i, j], C)
-            x_phys = align_bypass_to_main(engine, half_plus, x_phys)
-            out[i, j] = _ct_mul(engine, x_phys, half_plus)
+            out[i, j] = _ct_mul(engine, x_phys[i, j], half_plus[i, j])
     return out
 
 
@@ -328,14 +393,26 @@ def gelu_poly_pack(
     bts_prefix: str | None = None,
 ) -> np.ndarray:
     """
-    Full DualRail GeLU on shape ``(2, 8)``: f1 → f2 → y → reconstruct.
+    DualRail GeLU ``(2, 8)``.
 
-    Plan hooks:
+    Direct (low)：``gelu_direct_pack``（原子 ``gelu_direct``）。
+    Composite (high)：f1 → f2 → y → reconstruct。
+
+    Plan hooks (composite):
       - ``{prefix}.gelu_f1`` before：刷 ``t``
       - ``{prefix}.gelu_f2`` before：刷 ``f1``
-      - ``{prefix}.gelu_reconstruct``：刷 ``y=f1+f2``；``x_phys`` 旁路对齐后 ct×ct
+      - ``{prefix}.gelu_reconstruct``：刷 ``y``；旁路 ``x_phys`` 后 ct×ct
     """
     from dualrail_bts import plan_refresh_dualrail_ff
+
+    if params.kind == "direct":
+        return gelu_direct_pack(
+            engine,
+            t,
+            params,
+            bts_hook=bts_hook,
+            bts_prefix=bts_prefix,
+        )
 
     if bts_prefix and bts_hook is not None:
         f1_ev = f"{bts_prefix}.gelu_f1"
@@ -384,9 +461,18 @@ def gelu_poly_ct(engine, x, params: GeluHeParams, *, reactive_bts: bool = False)
     Single-CT helper (unit tests). Prefer ``gelu_poly_pack`` / stage APIs
     for production DualRail ``(2, 8)``.
     """
-    from softmax_he_ct import align_bypass_to_main
+    from softmax_he_ct import align_join
 
     del reactive_bts
+    if params.kind == "direct":
+        assert params.f_cheb_coeffs is not None and params.f_domain is not None
+        return cheb_eval_ct(
+            engine,
+            params.f_cheb_coeffs,
+            x,
+            params.f_domain,
+            rescale_combo=True,
+        )
     _require_composite(params, where="gelu_poly_ct")
     f1 = cheb_eval_ct(
         engine,
@@ -405,7 +491,7 @@ def gelu_poly_ct(engine, x, params: GeluHeParams, *, reactive_bts: bool = False)
     y = _ct_add(engine, f1, f2)
     half_plus = _ct_add_scalar(engine, y, 0.5)
     x_phys = _ct_scale(engine, x, float(params.C))
-    x_phys = align_bypass_to_main(engine, half_plus, x_phys)
+    half_plus, x_phys = align_join(engine, half_plus, x_phys)
     return _ct_mul(engine, x_phys, half_plus)
 
 
@@ -475,8 +561,9 @@ def he_gelu_cheb(
     """
     Drop-in for THOR ``he_gelu(engine, x, ...)``.
 
-    ``x`` shape ``(2, 8)`` at FC1 output scale (``x_phys/C``; FC1 W+b baked ``/C``).
-    Runs pack-level ``gelu_poly_pack`` (f1 → f2 → y → reconstruct) with plan hooks.
+    ``x`` shape ``(2, 8)``：high/composite 为 ``x_phys/C``（FC1 baked ``/C``）；
+    low/direct 为物理 ``x``（FC1 scale=1）。
+    Runs ``gelu_poly_pack``（direct=原子 Cheb；composite=f1/f2/reconstruct）。
 
     ``suppress_post_bts``：plan 路径由 forward 的 ``linear_ff_dense2``
     段前 hook 负责（与 ``linear_ff_dense1`` 同形），避免 reactive bootstrap。
@@ -520,6 +607,7 @@ def bind_ff_gelu_cheb(
 
     del input_scale
     params = GeluHeParams.from_gelu_poly(layer_idx, level=level)
+    thor_ff.engine._gelu_kind = params.kind
     thor_ff.gelu = partial(
         he_gelu_cheb,
         engine=thor_ff.engine,

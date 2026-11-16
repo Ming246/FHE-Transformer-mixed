@@ -1,8 +1,12 @@
 """
 GeLU 多项式近似：Chebyshev 系数 + Clenshaw 求值。
 
-系数来源：nolinear/gelu/gelu_chebyshev_coeffs_C{C}.json
-GELU(x) = x * (0.5 + y(t))，t = x/C；复合 y ≈ f1(t)+f2(f1(t))，单段 y ≈ f(t)。
+系数来源：
+  - high 复合：nolinear/gelu/gelu_chebyshev_coeffs_C{C}.json（层组共用）
+  - low 直接 GELU：nolinear/gelu/gelu_direct_layer_coeffs.json（每层独立次数/拟合区间）
+
+复合：GELU(x) = x * (0.5 + y(t))，t = x/C，y ≈ f1(t)+f2(f1(t))
+直接：ĝ(x) = Chebyshev(x) ≈ GELU(x)，f_domain=LAYER_FIT_X（无 /C、无 reconstruct）
 
 用法：
     from gelu_poly import GeluPolyEvaluator, gelu_config_for_layer
@@ -23,30 +27,30 @@ GELU_POLY_FUNC_NAMES: list[str] = [
     "poly_gelu_high",
 ]
 
-# 层组方案：(C, scheme_name)；键 0=low / 1=high
+# high：(C, scheme_name) 仍按层组共用；low 每层独立，见 gelu_direct_layer_coeffs.json
 _GROUP_A_LAYERS = frozenset({0, 1, 6, 7, 8, 11})
 _GROUP_B_LAYERS = frozenset({2, 3, 4, 5})
 _GROUP_C_LAYERS = frozenset({9, 10})
 
-_GELU_LAYER_SCHEME: dict[int, dict[int, tuple[int, str]]] = {}
+_GELU_LAYER_SCHEME: dict[int, dict[int, tuple[int, str] | None]] = {}
 
 for _layer in _GROUP_A_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        1: (40, "composite_15_23"),  # high（旧档位键 2）
-        # mid（旧档位键 1）: (40, "composite_13_15"),
-        0: (40, "composite_7_15"),  # low
+        1: (40, "composite_15_23"),  # high（层组共用）
+        0: None,  # low：每层独立 direct
     }
 for _layer in _GROUP_B_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        1: (80, "composite_27_31"),  # high（旧档位键 2）
-        # mid（旧档位键 1）: (80, "composite_15_23"),
-        0: (80, "composite_15_15"),  # low
+        1: (80, "composite_27_31"),
+        0: None,
     }
 for _layer in _GROUP_C_LAYERS:
     _GELU_LAYER_SCHEME[_layer] = {
-        1: (160, "composite_31_31"),  # high（旧档位键 2）
-        0: (160, "composite_15_31"),  # low（组 C 原本无 mid）
+        1: (160, "composite_31_31"),
+        0: None,
     }
+
+_DIRECT_LAYER_JSON = "gelu_direct_layer_coeffs.json"
 
 # 历史：组 C 曾禁止 mid；现仅 low/high，无额外禁止档
 GELU_FORBIDDEN_LEVELS: dict[int, frozenset[int]] = {}
@@ -67,9 +71,15 @@ def gelu_level_allowed(layer_idx: int, level: int) -> bool:
     return level not in GELU_FORBIDDEN_LEVELS.get(layer_idx, frozenset())
 
 
+_SCHEME_JSON_STEMS = (
+    "gelu_chebyshev_coeffs",
+    "gelu_direct_coeffs",
+)
+
+
 @lru_cache(maxsize=None)
-def _load_cheb_json(C: int) -> dict:
-    path = os.path.join(_CHEB_JSON_DIR, f"gelu_chebyshev_coeffs_C{int(C)}.json")
+def _load_scheme_json(C: int, stem: str) -> dict:
+    path = os.path.join(_CHEB_JSON_DIR, f"{stem}_C{int(C)}.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Chebyshev 系数文件不存在：{path}")
     with open(path, encoding="utf-8") as f:
@@ -77,25 +87,60 @@ def _load_cheb_json(C: int) -> dict:
 
 
 @lru_cache(maxsize=None)
+def _load_cheb_json(C: int) -> dict:
+    return _load_scheme_json(C, "gelu_chebyshev_coeffs")
+
+
+@lru_cache(maxsize=None)
 def _scheme_config(C: int, scheme_name: str) -> dict:
-    data = _load_cheb_json(C)
-    for item in data["schemes"]:
-        if item["name"] == scheme_name:
+    seen = []
+    for stem in _SCHEME_JSON_STEMS:
+        try:
+            data = _load_scheme_json(C, stem)
+        except FileNotFoundError:
+            continue
+        seen.append(stem)
+        for item in data["schemes"]:
+            if item["name"] == scheme_name:
+                return _normalize_scheme(item)
+    raise KeyError(
+        f"C={C} 中未找到方案 {scheme_name!r}（已查 {seen or _SCHEME_JSON_STEMS}）"
+    )
+
+
+@lru_cache(maxsize=None)
+def _load_direct_layer_json() -> dict:
+    path = os.path.join(_CHEB_JSON_DIR, _DIRECT_LAYER_JSON)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"每层 low GeLU 系数文件不存在：{path}")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@lru_cache(maxsize=None)
+def _low_config_for_layer(layer_idx: int) -> dict:
+    data = _load_direct_layer_json()
+    for item in data.get("schemes", []):
+        if int(item.get("layer", -1)) == int(layer_idx):
             return _normalize_scheme(item)
-    raise KeyError(f"C={C} 中未找到方案 {scheme_name!r}")
+    raise KeyError(
+        f"{_DIRECT_LAYER_JSON} 中未找到 layer={layer_idx} 的 low 方案"
+    )
 
 
 def _normalize_scheme(item: dict) -> dict:
     p = item["params"]
+    kind = str(item["kind"])
     cfg: dict = {
         "basis": "chebyshev",
-        "kind": item["kind"],
-        "C": float(item["C"]),
+        "kind": kind,
         "scheme_name": item["name"],
         "depth_he": int(item["depth"]),
         "gelu_max_err": float(item["gelu_max_err"]),
     }
-    if item["kind"] == "composite":
+    if kind != "direct":
+        cfg["C"] = float(item["C"])
+    if kind == "composite":
         cfg.update(
             {
                 "d1": int(p["d1"]),
@@ -128,8 +173,26 @@ def _normalize_scheme(item: dict) -> dict:
         from nolinear.gelu_chebyshev import gelu_he_depth_breakdown
 
         bd = gelu_he_depth_breakdown(cfg["degree"], eval_method="ps_tree")
-        cfg["depth_he"] = int(bd["total"])
-        cfg["depth_he_breakdown"] = bd
+        if kind == "direct":
+            # ĝ(x)=Cheb(x) on f_domain；无 /C、无 reconstruct。定义域非 [-1,1] 时 affine_to_z +1。
+            from nolinear.gelu_chebyshev import _domain_is_unit_depth
+
+            affine = 0 if _domain_is_unit_depth(cfg["f_domain"]) else 1
+            total = (
+                int(bd["y_eval"]) + int(bd["cheb_combo_rescale"]) + affine
+            )
+            cfg["depth_he"] = total
+            cfg["depth_he_breakdown"] = {
+                "y_eval": int(bd["y_eval"]),
+                "cheb_combo_rescale": int(bd["cheb_combo_rescale"]),
+                "domain_affine": affine,
+                "gelu_reconstruct": 0,
+                "total": total,
+                "eval_method": bd["eval_method"],
+            }
+        else:
+            cfg["depth_he"] = int(bd["total"])
+            cfg["depth_he_breakdown"] = bd
     return cfg
 
 
@@ -140,7 +203,12 @@ def gelu_config_for_layer(layer_idx: int, level: int) -> dict:
             f"layer {layer_idx} 禁止 GeLU 档位 {GELU_LEVEL_KEYS[level]}；"
             f"允许档位：{[GELU_LEVEL_KEYS[l] for l in allowed]}"
         )
-    C, name = _GELU_LAYER_SCHEME[layer_idx][level]
+    if level == 0:
+        return _low_config_for_layer(layer_idx)
+    spec = _GELU_LAYER_SCHEME[layer_idx][level]
+    if spec is None:
+        raise ValueError(f"layer {layer_idx} 档位 {level} 无方案")
+    C, name = spec
     return _scheme_config(C, name)
 
 
@@ -151,15 +219,20 @@ def gelu_scale_for_layer(layer_idx: int) -> float:
     raise KeyError(f"layer {layer_idx} 无 high 档配置")
 
 
-# THOR / HE encode scale (FC1): see ``gelu_ff1_encode_scale``.
+# THOR / HE encode scale (FC1): ``gelu_ff1_encode_scale(layer, level)``.
 # KEY encode / score decode: ``softmax_poly.k_key_encode_scale`` /
 # ``softmax_poly.score_hf_decode_bake`` (``1/(64·δ1·δ2)`` per layer).
 
 from softmax_poly import k_key_encode_scale, score_hf_decode_bake  # noqa: F401
 
 
-def gelu_ff1_encode_scale(layer_idx: int) -> float:
-    """FC1 W/bias encode scale ``1/C`` for layer ``layer_idx``."""
+def gelu_ff1_encode_scale(layer_idx: int, level: int = 1) -> float:
+    """FC1 W/bias encode scale for GeLU ``level`` (0=low, 1=high, 3=original).
+
+    high：``1/C``（复合 Cheb 在 ``t=x/C``）；low / original：``1``（直接 Cheb 在 ``x``）。
+    """
+    if int(level) in (0, 3):
+        return 1.0
     return 1.0 / gelu_scale_for_layer(layer_idx)
 
 
@@ -216,6 +289,13 @@ def _single_gelu_cheb(
     return (x64 * (0.5 + y)).to(x.dtype)
 
 
+def _direct_gelu_cheb(
+    x: torch.Tensor, cfg: dict, f_f64: torch.Tensor
+) -> torch.Tensor:
+    x64 = x.to(_POLY_EVAL_DTYPE)
+    return _cheb_eval(f_f64, x64, cfg["f_domain"]).to(x.dtype)
+
+
 def gelu_eval_from_config(x: torch.Tensor, cfg: dict) -> torch.Tensor:
     device = x.device
     if cfg["kind"] == "composite":
@@ -223,6 +303,8 @@ def gelu_eval_from_config(x: torch.Tensor, cfg: dict) -> torch.Tensor:
         f2_f64 = _coeffs_to_f64(cfg["f2_cheb_coeffs"], device)
         return _composite_gelu_cheb(x, cfg, f1_f64, f2_f64)
     f_f64 = _coeffs_to_f64(cfg["f_cheb_coeffs"], device)
+    if cfg["kind"] == "direct":
+        return _direct_gelu_cheb(x, cfg, f_f64)
     return _single_gelu_cheb(x, cfg, f_f64)
 
 
@@ -260,6 +342,8 @@ class GeluPolyEvaluator:
         self._ensure_coeff_tensors(x.device, x.dtype)
         if self._cfg["kind"] == "composite":
             return _composite_gelu_cheb(x, self._cfg, self._f1, self._f2)
+        if self._cfg["kind"] == "direct":
+            return _direct_gelu_cheb(x, self._cfg, self._f)
         return _single_gelu_cheb(x, self._cfg, self._f)
 
 

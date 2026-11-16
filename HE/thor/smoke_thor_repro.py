@@ -16,7 +16,7 @@ DualRail linear patches (``linear_eval`` binds)::
 Prereqs (under ``thirdparty/THOR-main/``):
   keys/keys0/, liberate/.../resources/, datasets/mrpc/,
   finetuned_models/mrpc/model.safetensors,
-  encoded_models_new/mrpc/{att,ff,pooler,cls}.pkl  (from ``encode.py``)
+  encoded_models_new/mrpc/{att_L*,ff_L*_{low,high},pooler,cls}.pkl
 
 Usage (from repo root or HE/thor)::
 
@@ -62,16 +62,7 @@ from thor.utils.matrix import ld  # noqa: E402
 _H_INDICES = [np.where(np.arange(0, 2**11) % 16 == i)[0] for i in range(12)]
 
 
-def encoded_layer_pkl(dataset: str, kind: str, layer_idx: int) -> str:
-    """``encoded_models_new/{dataset}/{ff|att}_L{n}.pkl``."""
-    if kind not in ("ff", "att"):
-        raise ValueError(f"kind must be ff|att, got {kind!r}")
-    return os.path.join(
-        _THOR_ROOT,
-        "encoded_models_new",
-        dataset,
-        f"{kind}_L{int(layer_idx)}.pkl",
-    )
+from encode_thor_weights import encoded_layer_pkl  # noqa: E402
 
 
 def _thor_paths(dataset: str) -> dict[str, str]:
@@ -94,6 +85,7 @@ def _require_assets(
     *,
     layers: list[int] | None = None,
     need_pooler_cls: bool = False,
+    gelu_levels: dict[int, int] | None = None,
 ) -> None:
     missing = []
     for k in ("dataset", "finetuned"):
@@ -104,10 +96,13 @@ def _require_assets(
         dataset = os.path.basename(paths["encoded_dir"])
     if layers:
         for li in layers:
-            for kind in ("ff", "att"):
-                p = encoded_layer_pkl(dataset, kind, li)
-                if not os.path.isfile(p):
-                    missing.append(f"{kind}_L{li}={p}")
+            att_p = encoded_layer_pkl(dataset, "att", li)
+            if not os.path.isfile(att_p):
+                missing.append(f"att_L{li}={att_p}")
+            g_lv = 1 if gelu_levels is None else int(gelu_levels[li])
+            ff_p = encoded_layer_pkl(dataset, "ff", li, gelu_level=g_lv)
+            if not os.path.isfile(ff_p):
+                missing.append(f"ff_L{li}={ff_p}")
     if need_pooler_cls:
         for k in ("pooler", "cls"):
             if not os.path.exists(paths[k]):
@@ -116,7 +111,8 @@ def _require_assets(
         raise FileNotFoundError(
             "Missing THOR assets "
             + ", ".join(missing)
-            + ". Encode with: python3 HE/thor/encode_thor_weights.py"
+            + ". Encode with: python3 HE/thor/encode_thor_weights.py "
+            "(FF: ff_L{n}_low.pkl / ff_L{n}_high.pkl)"
         )
 
 
@@ -395,7 +391,7 @@ def _forward_layer(
         plan_refresh_dualrail8,
         plan_refresh_dualrail_ff,
     )
-    from softmax_he_ct import align_bypass_to_main
+    from softmax_he_ct import align_join
     from level_probe import ProbeStop
 
     def _as_object_array(seq):
@@ -430,7 +426,12 @@ def _forward_layer(
             if site in ("after_att_score", "after_bts_score"):
                 _mag_note = "score_slots=plain/(8*δ1*δ2)"
             elif site in ("after_ff_dense1", "after_ff_dense1_pre_gelu"):
-                _mag_note = "gelu_in slots are x/C"
+                _kind = getattr(engine, "_gelu_kind", None)
+                _mag_note = (
+                    "gelu_in slots are x_phys"
+                    if _kind == "direct"
+                    else "gelu_in slots are x/C"
+                )
             _mag_report(engine, site, cts, note=_mag_note)
         if level_probe is not None:
             level_probe.record_first(site, cts, note=note)
@@ -610,11 +611,13 @@ def _forward_layer(
     v_cplx = np.full((2,), None, dtype=object)
     for i in range(2):
         v_cplx[i] = engine.cc_add(v[i], engine.imult(v[i + 2]))
-    # score 为主路；V 为旁路：只动 V（必要时 bts），绝不 level_up score。
-    from softmax_he_ct import align_bypass_to_main
-
-    for j in range(2):
-        v_cplx[j] = align_bypass_to_main(engine, sftmx_out[0], v_cplx[j])
+    sftmx_out, v_cplx = align_join(
+        engine,
+        sftmx_out,
+        v_cplx,
+        bts_hook=bts_hook,
+        bypass_event=f"{prefix}.bypass.v_to_softmax",
+    )
     for i in range(2):
         v_cplx[i] = engine.rescale(v_cplx[i])
     sftmx_out_rescale = np.full((128,), None, dtype=object)
@@ -679,13 +682,28 @@ def _forward_layer(
         thor_attention,
         ("dense.weight", "dense.bias"),
     )
+    _join_attn = f"{prefix}.join_resid_attn"
+    if bts_hook is not None and bts_hook.should_refresh(_join_attn):
+        print(
+            f"  [smoke_thor_repro] join_resid_attn refresh "
+            f"pack_mode={bts_hook.pack_mode(_join_attn)}",
+            flush=True,
+        )
+        dense_output = _as_object_array(
+            plan_refresh_dualrail8(
+                engine, dense_output, bts_hook, _join_attn
+            )
+        )
+    dense_output, x = align_join(
+        engine,
+        dense_output,
+        x,
+        bts_hook=bts_hook,
+        bypass_event=f"{prefix}.bypass.resid_attn",
+    )
     x_out_sum = np.full((8,), None, dtype=object)
-    for i in range(4):
-        # 主路 dense_output；旁路 x（fork 残差）向主路对齐后再 add
-        xi = align_bypass_to_main(engine, dense_output[i], x[i])
-        xip4 = align_bypass_to_main(engine, dense_output[i + 4], x[i + 4])
-        x_out_sum[i] = engine.add(xi, dense_output[i])
-        x_out_sum[i + 4] = engine.add(xip4, dense_output[i + 4])
+    for i in range(8):
+        x_out_sum[i] = engine.add(x[i], dense_output[i])
     ln1_in = x_out_sum
     ln1_out = thor_attention.layernorm(x=ln1_in, sk=None)
     _probe("after_ln1", ln1_out)
@@ -698,7 +716,7 @@ def _forward_layer(
     thor_ff.to(devices)
 
     # Plan site ``bridge_rot_ff1`` before：刷 8 LN1（主路 inputs）。
-    # FF 残差旁路由 HE ``align_bypass_to_main`` 对齐，不进 DP。
+    # FF 残差会合：``join_resid_ff`` + ``bypass.resid_ff``。
     _ff_rot_ev = f"{prefix}.bridge_rot_ff1"
     if bts_hook is not None and bts_hook.should_refresh(_ff_rot_ev):
         print(
@@ -782,11 +800,28 @@ def _forward_layer(
         thor_ff,
         ("dense2.weight", "dense2.bias"),
     )
+    _join_ff = f"{prefix}.join_resid_ff"
+    if bts_hook is not None and bts_hook.should_refresh(_join_ff):
+        print(
+            f"  [smoke_thor_repro] join_resid_ff refresh "
+            f"pack_mode={bts_hook.pack_mode(_join_ff)}",
+            flush=True,
+        )
+        dense2_out = _as_object_array(
+            plan_refresh_dualrail8(
+                engine, dense2_out, bts_hook, _join_ff
+            )
+        )
+    dense2_out, ln1_out = align_join(
+        engine,
+        dense2_out,
+        ln1_out,
+        bts_hook=bts_hook,
+        bypass_event=f"{prefix}.bypass.resid_ff",
+    )
     ln2_in = np.full((8,), None, dtype=object)
     for i in range(8):
-        # 主路 dense2_out；旁路 ln1_out（FF 残差）向主路对齐后再 add
-        ri = align_bypass_to_main(engine, dense2_out[i], ln1_out[i])
-        ln2_in[i] = engine.add(ri, dense2_out[i])
+        ln2_in[i] = engine.add(ln1_out[i], dense2_out[i])
     # LN2 DualRail / scale hooks 在 ``he_layernorm_poly``（``ln2_scale`` 起）
     if getattr(engine, "_mag_ln_audit", False) and int(layer_idx) == int(
         getattr(engine, "_mag_layer", -1)
@@ -1241,6 +1276,7 @@ def _he_vs_plain_diag(
     head: int = 0,
     rest_div: float = 8.0,
     post_dualrail_bs: bool = False,
+    gelu_level: int = 1,
 ) -> HePlainDiag:
     """
     Compare one DualRail diagonal slice (notebook plot convention).
@@ -1281,9 +1317,11 @@ def _he_vs_plain_diag(
         cur = cur[:40] * bake
         ref = ref[:40]
     elif name == "gelu_in_wo_bs":
-        from gelu_poly import gelu_scale_for_layer  # noqa: WPS433
+        from gelu_poly import gelu_ff1_encode_scale  # noqa: WPS433
 
-        cur = cur * float(gelu_scale_for_layer(layer_idx))
+        enc = float(gelu_ff1_encode_scale(layer_idx, gelu_level))
+        if abs(enc - 1.0) > 1e-15:
+            cur = cur / enc
     elif name == "ln2_in":
         cur = cur / 2.0
 
@@ -1391,9 +1429,9 @@ def main() -> int:
     ap.add_argument(
         "--bootstrap",
         choices=("plan", "plan_mock"),
-        default="plan_mock",
-        help="plan=bts_ops placements + real bs; "
-        "plan_mock=bts_ops placements + decrypt→reencrypt (depth reconcile).",
+        default="plan",
+        help="plan=bts_ops placements + real CKKS bootstrap (default); "
+        "plan_mock=same placements + decrypt→encodecrypt (depth/poly debug).",
     )
     ap.add_argument(
         "--mock-land-level",
@@ -1498,7 +1536,14 @@ def main() -> int:
     os.chdir(_THOR_ROOT)
     paths = _thor_paths(args.dataset)
     layer_idx = int(args.layer)
-    _require_assets(paths, layers=[layer_idx])
+    from gelu_poly import gelu_level_allowed
+
+    ge_for_ff = int(args.gelu_level) if args.gelu == "cheb" else 1
+    if args.gelu == "cheb" and not gelu_level_allowed(layer_idx, ge_for_ff):
+        ge_for_ff = 1
+    _require_assets(
+        paths, layers=[layer_idx], gelu_levels={layer_idx: ge_for_ff}
+    )
 
     devices = [0]
     bts_mock = args.bootstrap in ("mock", "plan_mock")
@@ -1582,7 +1627,9 @@ def main() -> int:
     model_plain.to(device)
 
     att_path = encoded_layer_pkl(args.dataset, "att", layer_idx)
-    ff_path = encoded_layer_pkl(args.dataset, "ff", layer_idx)
+    ff_path = encoded_layer_pkl(
+        args.dataset, "ff", layer_idx, gelu_level=ge_for_ff
+    )
     with open(att_path, "rb") as f:
         weights_pt = pickle.load(f)
     import gc
@@ -2040,6 +2087,7 @@ def main() -> int:
                     layer_idx=layer_idx,
                     rest_div=float(args.rest_div),
                     post_dualrail_bs=post_bs,
+                    gelu_level=ge_for_ff,
                 )
             status = "OK" if d.abs_err_ls < args.tol else "BAD"
             print(
@@ -2177,6 +2225,7 @@ def main() -> int:
                     layer_idx=layer_idx,
                     rest_div=float(args.rest_div),
                     post_dualrail_bs=False,
+                    gelu_level=ge_for_ff,
                 )
                 err, corr, gain_ls = d.abs_err_ls, d.corr, d.ls_gain
         status = "OK" if err < args.tol else "BAD"

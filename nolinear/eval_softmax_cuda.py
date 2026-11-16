@@ -63,7 +63,7 @@ from softmax_poly import (  # noqa: E402
 
 # ===================== 配置（可独立修改）=====================
 #TASK_NAMES = ["mrpc", "rte", "sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["mrpc"]
+TASK_NAMES = [ "mnli"]
 LOCAL_DATA_ROOT = "../glue_datasets/"
 FINETUNED_MODEL_ROOT = "../finetuned_weight/"
 
@@ -117,53 +117,37 @@ LAYER_ASOR_ALPHA_SUM_SQ2_BY_TASK: dict[str, list[float]] = {
 }
 
 LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK: dict[str, list[int]] = {
-        # #"mrpc": [3, 4, 4, 4, 4, 4, 4, 4, 6, 6, 5, 5],
-        # #"mrpc": [4, 4, 4, 5, 4, 4, 4, 4, 6, 6, 5, 5],
         "mrpc": [5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "rte": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "sst2": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
 
-        # #"rte": [4, 6, 4, 5, 4, 5, 4, 5, 5, 5, 4, 4],
-        # #"rte": [5, 7, 4, 6, 5, 6, 5, 6, 6, 6, 5, 5],
-        # "rte": [5, 7, 4, 6, 5, 6, 5, 6, 6, 6, 5, 5],
-
-        # #"sst2": [4, 4, 4, 5, 4, 4, 5, 5, 5, 5, 8, 5],
-        # #"sst2": [5, 5, 5, 6, 5, 5, 6, 5, 6, 5, 9, 6],
-        # "sst2": [5, 5, 5, 7, 5, 5, 6, 6, 6, 6, 9, 6],
-        # "cola": [5, 6, 4, 6, 6, 6, 6, 6, 6, 6, 9, 7],
-        # "qnli": [5, 6, 4, 7, 6, 6, 6, 6, 7, 6, 7 ,6],
-
-
-        # "mnli": [5, 7, 5, 8, 7, 7, 7, 7, 7, 7, 8 ,6],
+        "cola": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "qnli": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "mnli": [7, 6, 7, 6, 6, 6, 6, 6, 6, 6, 6, 6],
 }
 LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK: dict[str, list[int]] = {
-    # #"mrpc": [5, 5, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5],
-    # #"mrpc": [5, 6, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6],
     "mrpc": [7, 7, 6, 7, 7, 7, 7, 7, 6, 6, 6, 6],
+    "rte": [7, 6, 7, 6, 7, 7, 7, 6, 6, 6, 7, 7],
+    "sst2": [7, 7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
 
-    # #"rte": [5, 5, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5],
-    # #"rte": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
-    # "rte": [6, 6, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6],
-
-    # #"sst2": [5, 5, 5, 6, 5, 5, 5, 5, 5, 5, 6, 5],
-    # #"sst2": [5, 5, 5, 6, 5, 5, 5, 6, 5, 6, 6, 5],
-    # "sst2": [6, 6, 5, 6, 6, 6, 6, 6, 6, 6, 7, 6],
-    # "cola": [6, 6, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6],
-    # "qnli": [6, 6, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6],
-
-    # "mnli": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    "cola": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    "qnli": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    "mnli": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
 
 }
 LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK: dict[str, list[int]] = {
-    "mrpc": [0, 0, 7, 0, 0, 0, 0, 0, 6, 6, 6, 6],
-    # "rte": [0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    # "sst2": [0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    # "cola": [0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    # "qnli": [0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "mrpc": [7, 7, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6],
+    "rte": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+    "sst2": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
 
-    # "mnli": [0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "cola": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    "qnli": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+    "mnli": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
 }
-# LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK["mrpc"]= [x-2  for x in LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK["mrpc"]]
-# LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK["mrpc"] = [x-2  for x in LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK["mrpc"]]
-# LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK["mrpc"] = [x-2  for x in LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK["mrpc"]]
+now = "mnli"
+LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK[now]= [x-2  for x in LAYER_ASOR_MAX_ITERS_SIGMA_BY_TASK[now]]
+LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK[now] = [x-2  for x in LAYER_ASOR_MAX_ITERS_SUM_SQ_BY_TASK[now]]
+LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK[now] = [x-2  for x in LAYER_ASOR_MAX_ITERS_SUM_SQ2_BY_TASK[now]]
 LAYER_ENABLE = [True, True, True, True, True, True, 
                 True, True, True, True, True, True]
 MAX_VECTORS_FOR_ERROR_EVAL: int | None = None

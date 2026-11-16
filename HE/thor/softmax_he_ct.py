@@ -46,41 +46,132 @@ from softmax_poly import (  # noqa: E402
 from thor.nonlinear.polynomial import evaluate_polynomial_stockmeyer  # noqa: E402
 
 
-def align_bypass_to_main(engine, main_ct, bypass_ct):
+def _looks_ct(x) -> bool:
+    try:
+        int(x.level_calc)
+        return True
+    except Exception:
+        return False
+
+
+def _unwrap_ct(x):
+    """Peel ``[ct]`` wrappers from mock ``encodecrypt`` / list packs."""
+    while isinstance(x, (list, tuple)) and len(x) == 1 and not _looks_ct(x):
+        x = x[0]
+    if _looks_ct(x):
+        return x
+    if isinstance(x, (list, tuple)):
+        for y in x:
+            y = _unwrap_ct(y)
+            if _looks_ct(y):
+                return y
+    try:
+        import numpy as np
+
+        if isinstance(x, np.ndarray) and x.dtype == object:
+            for y in x.ravel():
+                y = _unwrap_ct(y)
+                if _looks_ct(y):
+                    return y
+    except Exception:
+        pass
+    return x
+
+
+def _as_ct_list(cts):
+    # Liberate DataStruct subclasses list — never iterate a live CT.
+    if _looks_ct(cts):
+        return [cts], None, True
+    try:
+        import numpy as np
+
+        if isinstance(cts, np.ndarray):
+            flat = [_unwrap_ct(cts.ravel()[i]) for i in range(cts.size)]
+            return flat, cts.shape, False
+    except Exception:
+        pass
+    if isinstance(cts, (list, tuple)):
+        return [_unwrap_ct(x) for x in cts], None, False
+    return [_unwrap_ct(cts)], None, True
+
+
+def _restore_ct_list(out, *, shape, wrap_single: bool):
+    if wrap_single:
+        return out[0]
+    if shape is not None:
+        import numpy as np
+
+        arr = np.empty(shape, dtype=object)
+        for i, v in enumerate(out):
+            arr.ravel()[i] = v
+        return arr
+    return out
+
+
+def align_join(
+    engine,
+    main_cts,
+    bypass_cts,
+    *,
+    bts_hook=None,
+    bypass_event: str | None = None,
+):
     """
-    旁路向主路对齐：不改 main。bypass 更耗尽则先 bootstrap，再 level_up 到 main.lc。
+    会合：可选按 plan 刷旁路，然后两侧 ``level_up`` 到同一 ``level_calc``
+    （= min rem）。plan 模式下不反应式刷旁路；无 plan 时旁路更耗尽则刷旁路。
+    主路刷新由调用方 ``hook.refresh(主路事件)`` 完成。
+    返回 ``(main_cts, bypass_cts)``（形状与输入相同）。
     """
-    main_lc = int(main_ct.level_calc)
-    b_lc = int(bypass_ct.level_calc)
-    if b_lc > main_lc:
-        try:
-            from bts_prescale import bootstrap_prescaled
-        except ImportError:
-            from .bts_prescale import bootstrap_prescaled  # type: ignore
-        try:
-            from bts_decrypt_probe import bts_probe_label
-        except ImportError:
-            from .bts_decrypt_probe import bts_probe_label  # type: ignore
-        try:
-            from bts_site_pack_probe import active_collector
-        except ImportError:
-            from .bts_site_pack_probe import active_collector  # type: ignore
-        coll = active_collector(engine)
-        pre_ct = bypass_ct
-        with bts_probe_label(engine, "align_bypass"):
-            bypass_ct = bootstrap_prescaled(engine, bypass_ct, postscale=True)
-        if coll is not None:
-            coll.record_ct_sequence(
-                "bypass.align_to_main",
-                "direct",
-                "direct_1",
-                [pre_ct],
-                [bypass_ct],
-            )
-        b_lc = int(bypass_ct.level_calc)
-    if b_lc < main_lc:
-        bypass_ct = engine.level_up(bypass_ct, main_lc)
-    return bypass_ct
+    mains, m_shape, m_one = _as_ct_list(main_cts)
+    byps, b_shape, b_one = _as_ct_list(bypass_cts)
+    plan = bts_hook is not None and getattr(bts_hook, "mode", None) == "plan"
+    if plan:
+        if (
+            bypass_event
+            and bts_hook.should_refresh(bypass_event)
+        ):
+            byps_ref = bts_hook.refresh(bypass_event, byps)
+            byps, _, _ = _as_ct_list(byps_ref)
+    else:
+        main_lc = int(mains[0].level_calc)
+        if int(byps[0].level_calc) > main_lc:
+            try:
+                from bts_prescale import bootstrap_prescaled
+            except ImportError:
+                from .bts_prescale import bootstrap_prescaled  # type: ignore
+            try:
+                from bts_decrypt_probe import bts_probe_label
+            except ImportError:
+                from .bts_decrypt_probe import bts_probe_label  # type: ignore
+            with bts_probe_label(engine, bypass_event or "align_bypass"):
+                byps = [
+                    bootstrap_prescaled(engine, ct, postscale=True) for ct in byps
+                ]
+    target = max(int(mains[0].level_calc), int(byps[0].level_calc))
+    for i, ct in enumerate(mains):
+        if int(ct.level_calc) < target:
+            mains[i] = engine.level_up(ct, target)
+    for i, ct in enumerate(byps):
+        if int(ct.level_calc) < target:
+            byps[i] = engine.level_up(ct, target)
+    return (
+        _restore_ct_list(mains, shape=m_shape, wrap_single=m_one),
+        _restore_ct_list(byps, shape=b_shape, wrap_single=b_one),
+    )
+
+
+def align_bypass_to_main(
+    engine, main_ct, bypass_ct, *, bts_hook=None, bypass_event=None
+):
+    """兼容旧接口：返回对齐后的旁路。主路可能已被 level_up，调用方应改用 ``align_join``。"""
+    _main, bypass = align_join(
+        engine,
+        main_ct,
+        bypass_ct,
+        bts_hook=bts_hook,
+        bypass_event=bypass_event,
+    )
+    return bypass
 
 
 def _rem(engine, ct) -> int:
@@ -137,6 +228,27 @@ def _asor_prepare_boot(engine, an: _DeltaCt, bn: _DeltaCt) -> tuple[_DeltaCt, _D
     return an, bn
 
 
+def _asor_pack_pre_gain(an: _DeltaCt, bn: _DeltaCt) -> int:
+    """Integer ×gain before packing ``an+i·bn`` into CKKS bootstrap.
+
+    Late σ-aSOR has ``1/σ`` already O(10²–10³) and raw ``an≈ logical·delta``
+    already O(1). A fixed ×64 then sends |m|~100 into bootstrap (L2 i5:
+    an_raw≈1.73 → ×64≈110), which is not bootstrap noise — it is overflow.
+    Cap so an estimated |m| stays ≲ 0.4. Tiny-delta early iters still get ×64.
+    """
+    delta = max(float(an.delta), float(bn.delta), 1e-16)
+    raw_est = 1000.0 * delta
+    room = 0.4 / max(raw_est, 1e-12)
+    gain = 1
+    g = 64
+    while g > 1:
+        if room >= g:
+            gain = g
+            break
+        g //= 2
+    return int(gain)
+
+
 def _asor_pack_bootstrap(
     engine,
     an: _DeltaCt,
@@ -147,15 +259,15 @@ def _asor_pack_bootstrap(
 ) -> tuple[_DeltaCt, _DeltaCt]:
     """Plan boot that leaves logical ``ct/delta`` unchanged.
 
-    ``×64`` / bootstrap / ``×1/64`` is a matched pair, so a message-preserving
-    kernel does not care which iteration the plan picked. Unpack divides by 2
-    because ``z+conj = 2·Re``. ``delta`` is not changed by those factors.
+    Pack ``z=an+i·bn``, optional integer prescale, bootstrap, unpack.
+    Unpack ``/2`` undoes ``z+conj=2·Re``. ``delta`` is unchanged.
     """
     if bts_hook is None or not bts_event:
         raise RuntimeError(
             "aSOR pack bootstrap requires bts_hook + bts_event (plan-only)"
         )
     an, bn = _asor_prepare_boot(engine, an, bn)
+    pre = _asor_pack_pre_gain(an, bn)
     _an_pre, _bn_pre = an.ciphertext, bn.ciphertext
     temp = engine.add(an.ciphertext, engine.imult(bn.ciphertext))
     _site_probe = None
@@ -177,15 +289,21 @@ def _asor_pack_bootstrap(
         bare.add(bts_event)
         added_bare = True
     try:
-        temp = engine.mult_int_scalar(temp, 2**6)
+        if pre != 1:
+            temp = engine.mult_int_scalar(temp, int(pre))
         with suppress_hook_site_probe(engine):
             temp1 = bts_hook.refresh(bts_event, temp)
     finally:
         if added_bare:
             bare.discard(bts_event)
-    # ×1/64 undoes the pre-scale. /2 undoes z+conj. One rescale.
+    # Undo prescale. /2 undoes z+conj. One rescale.
     conj = engine.conjugate(temp1)
-    restore = 1.0 / (2**6) / 2.0
+    restore = 1.0 / float(pre) / 2.0
+    print(
+        f"  [asor pack bts] {bts_event} pre=×{pre} "
+        f"an.delta={an.delta:.3e} bn.delta={bn.delta:.3e}",
+        flush=True,
+    )
     an = _DeltaCt(engine.mult_scalar(engine.add(temp1, conj), restore), an.delta)
     bn = _DeltaCt(
         engine.mult_scalar(engine.imult(engine.sub(conj, temp1)), restore),
@@ -219,7 +337,8 @@ def he_asor_ct(
     ``for _ in range(max_iters)`` instead of ``while en < 1-alpha``.
 
     ``bts_iter_event(i)`` → plan event for before-boot at iteration ``i``
-    (unique site; e.g. ``L0.softmax_asor_sigma_i4``).
+    (unique site; e.g. ``L0.softmax_norm_r0_asor4``). σ-aSOR does **not**
+    pass this hook (no mid-iter an/bn boot).
 
     Returns ``(inv_ct, D_delta, en)`` — do **not** fold ``1/delta`` into the CT;
     DualRail exit / ``update_inv_D`` consume ``D_delta`` like native THOR.
@@ -444,12 +563,18 @@ def update_inv_D_fixed(
         engine.rescale(engine.pt_ct_mult(attention_mask[i], inv_d))
         for i in range(8)
     ]
+    bypass_ev = None
+    if bts_apply_event and ".softmax_sumsq_" in str(bts_apply_event):
+        head, tail = str(bts_apply_event).split(".", 1)
+        bypass_ev = f"{head}.bypass.{tail.replace('_apply', '_exp')}"
+    inv_list, exp_u = align_join(
+        engine,
+        inv_list,
+        exp_u,
+        bts_hook=bts_hook,
+        bypass_event=bypass_ev,
+    )
     for i in range(4):
-        # inv_list 为主路；exp 旁路向 inv 对齐（不烧 inv rem）
-        exp_u[i] = align_bypass_to_main(engine, inv_list[i], exp_u[i])
-        exp_u[i + 4] = align_bypass_to_main(
-            engine, inv_list[i + 4], exp_u[i + 4]
-        )
         k = max(int(1.0 / float(d_delta) / 2.0), 1)
         exp_2u[i] = engine.square(
             engine.mult_int_scalar(
@@ -631,16 +756,8 @@ def dualrail_softmax_exit(
 ):
     """Native THOR DualRail exit: 8 real → 128 real α copies.
 
-    Plan 仅刷主路 **inv**（``direct``，1 CT；入口 rem≥``DEPTH_SOFTMAX_EXIT``）。
-    旁路 exp 不进 DP：
-
-      1. 8 real → 4 ``exp_cplx``
-      2. 一次 ``align_bypass_to_main(exp→rotated_inv[0])``
-         （``rotate_left`` 不烧 rem，16 个 rotated_inv 同 level）
-      3. ``mult_int_scalar(scale_k)``（不改 ``level_calc``，对齐关系保持）
-      4. ``auto_ct_ct_mult(exp_cplx, rotated_inv[j])``
-
-    不再对 exp 做 rem≤1 本地 bootstrap：ct×ct 预算由主路 inv 的 plan/bts 保证。
+    Plan 刷主路 **inv**（``direct``，1 CT）。旁路 exp 由
+    ``bypass.softmax_exit_exp`` + ``align_join``（可 level_up inv）。
     """
     if (
         bts_hook is not None
@@ -654,21 +771,18 @@ def dualrail_softmax_exit(
         rotated_inv.append(engine.rotate_left(rotated_inv[-1], -(2**11)))
 
     scale_k = int(1.0 / (2.0 * float(d_delta))) + 1
-    # Pack + align once to inv (all rotated_inv share inv's level).
     exp_cplx = [None] * 4
     for i in range(4):
-        packed = engine.cc_add(exp_u[i], engine.imult(exp_u[i + 4]))
-        # 可选出口 bootstrap 与 align 都在 scale_k 之前。
-        # align 在旁路更耗尽时会 ×100；scale_k 后再 ×100 会冲出 bootstrap 范围。
-        if (
-            bts_hook is not None
-            and bts_exp_event
-            and bts_hook.should_refresh(bts_exp_event)
-        ):
-            packed = bts_hook.refresh(bts_exp_event, packed)
-        packed = align_bypass_to_main(engine, rotated_inv[0], packed)
-        packed = engine.mult_int_scalar(packed, scale_k)
-        exp_cplx[i] = packed
+        exp_cplx[i] = engine.cc_add(exp_u[i], engine.imult(exp_u[i + 4]))
+    rotated_inv, exp_cplx = align_join(
+        engine,
+        rotated_inv,
+        exp_cplx,
+        bts_hook=bts_hook,
+        bypass_event=bts_exp_event,
+    )
+    for i in range(4):
+        exp_cplx[i] = engine.mult_int_scalar(exp_cplx[i], scale_k)
 
     cplx_softmax1 = []
     cplx_softmax2 = []
@@ -825,9 +939,12 @@ def he_softmax_poly(
         float(params.e0_sigma),
         int(params.asor_max_iters_sigma),
         bts_hook=bts_hook,
-        bts_iter_event=lambda i, p=bts_prefix: f"{p}.softmax_asor_sigma_i{i}",
+        bts_iter_event=None,
         rem_probe=rem_probe,
     )
+    inv_ev = f"{bts_prefix}.softmax_asor_sigma_inv"
+    if bts_hook is not None and bts_hook.should_refresh(inv_ev):
+        inv_d = bts_hook.refresh(inv_ev, inv_d)
     if _chain is not None:
         _chain.touch("softmax_inv_d_sigma", inv_d)
     # σ-aSOR spine 刷了 an/bn 时，AUX 上的 exp packs 一并恢复
@@ -899,7 +1016,7 @@ def he_softmax_poly(
         rescale=rescale,
         bts_hook=bts_hook,
         bts_event=f"{bts_prefix}.softmax_dualrail_exit",
-        bts_exp_event=f"{bts_prefix}.softmax_exit_exp",
+        bts_exp_event=f"{bts_prefix}.bypass.softmax_exit_exp",
         rem_probe=rem_probe,
     )
 

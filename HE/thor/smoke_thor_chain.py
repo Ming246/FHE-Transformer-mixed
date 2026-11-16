@@ -6,22 +6,25 @@ Encrypts embedding once, feeds each layer's ``ln2_out`` into the next
 (notebook ``forward_layer`` chaining). Compares the **last** layer's
 intermediates to **same-scheme** dense poly refs (``poly_model_inference``).
 
-Weight memory: each layer reads ``ff_L{{n}}.pkl`` / ``att_L{{n}}.pkl``
-(one DualRail encode file per layer), then releases that layer.
+Weight memory: each layer reads ``ff_L{{n}}_{low|high}.pkl`` (by GeLU
+level) and ``att_L{{n}}.pkl``, then releases that layer.
 
 Usage::
 
   python3 HE/thor/smoke_thor_chain.py --layers 0 1 2 \\
-    --gelu cheb --ln poly --softmax poly --bootstrap plan_mock
+    --gelu cheb --ln poly --softmax poly
 
   python3 HE/thor/smoke_thor_chain.py --layers 0 1 2 3 4 5 \\
-    --bootstrap plan_mock --check ln2_out \\
+    --check ln2_out \\
     --save-out results/he_chain/mrpc_L5_ln2_out.pkl
 
   python3 HE/thor/smoke_thor_chain.py --layers 6 7 8 \\
-    --bootstrap plan_mock --check ln2_out \\
+    --check ln2_out \\
     --load-in results/he_chain/mrpc_L5_ln2_out.pkl \\
     --save-out results/he_chain/mrpc_L8_ln2_out.pkl
+
+  # depth/poly debug only (decrypt→reencrypt, not real CKKS bootstrap):
+  #   --bootstrap plan_mock
 """
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ from smoke_thor_repro import (  # noqa: E402
     _he_vs_plain_diag,
     _he_vs_poly_layer_entry,
     he_plain_dense_error_stats,
+    _plain_layer_refs,
     _poly_layer_refs,
     _release_he_module_weights,
     _require_assets,
@@ -345,6 +349,83 @@ def _tensor_tree_to_device(obj, device):
     return obj
 
 
+def _as_seq_hidden(arr) -> np.ndarray:
+    a = np.asarray(arr, dtype=np.float64).squeeze()
+    if a.ndim != 2:
+        raise ValueError(f"expected (seq, hidden), got shape={a.shape}")
+    return a
+
+
+def _pooler_classifier_logits(hidden_2d, model) -> np.ndarray:
+    import torch
+
+    x = torch.as_tensor(_as_seq_hidden(hidden_2d), dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        pooled = model.bert.pooler(x.to(next(model.parameters()).device))
+        logits = model.classifier(pooled)
+    return np.asarray(logits.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+
+
+def _report_plain_head(
+    *,
+    engine,
+    sk,
+    he_ln2,
+    poly_ln2,
+    orig_ln2,
+    model,
+    batch_cpu: dict,
+    last_layer: int,
+):
+    """Decrypt last-layer ln2, run plaintext BertPooler + classifier."""
+    from research_unified_entry_slots import decode_layer_output_to_matrix
+
+    he_ct = he_ln2
+    if isinstance(he_ct, np.ndarray) and he_ct.ndim > 1:
+        he_ct = he_ct[0]
+    real8 = [
+        np.asarray(engine.decrode(he_ct[i], sk, is_real=True), dtype=np.float64).ravel()
+        for i in range(8)
+    ]
+    he_mat = decode_layer_output_to_matrix(real8)
+    poly_mat = _as_seq_hidden(poly_ln2)
+    orig_mat = _as_seq_hidden(orig_ln2)
+    he_logits = _pooler_classifier_logits(he_mat, model)
+    poly_logits = _pooler_classifier_logits(poly_mat, model)
+    orig_enc_logits = _pooler_classifier_logits(orig_mat, model)
+    keys = {}
+    for k in ("input_ids", "token_type_ids", "attention_mask"):
+        if k in batch_cpu:
+            keys[k] = batch_cpu[k]
+    with __import__("torch").no_grad():
+        full = model(**keys).logits
+    full_logits = np.asarray(full.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+    label = None
+    for lk in ("labels", "label"):
+        if lk in batch_cpu:
+            lab = batch_cpu[lk]
+            label = int(__import__("torch").as_tensor(lab).reshape(-1)[0].item())
+            break
+
+    def _fmt(name, logits):
+        pred = int(np.argmax(logits))
+        s = ", ".join(f"{v:.6g}" for v in logits)
+        extra = f"  pred={pred}"
+        if label is not None:
+            extra += f"  label={label}  {'OK' if pred == label else 'MISS'}"
+        print(f"  {name:16s} logits=[{s}]{extra}", flush=True)
+
+    print(
+        f"plain BertPooler+classifier on L{last_layer} ln2 (CLS) "
+        f"+ full orig forward:",
+        flush=True,
+    )
+    _fmt("HE ln2", he_logits)
+    _fmt("poly ln2", poly_logits)
+    _fmt("orig enc ln2", orig_enc_logits)
+    _fmt("orig full", full_logits)
+
+
 def _load_chain_entry_cts(
     path: str,
     *,
@@ -422,6 +503,48 @@ def _save_chain_exit_cts(
     os.replace(tmp, path)
 
 
+def _poly_scheme_from_args(args) -> list[int]:
+    from gelu_poly import gelu_level_allowed
+    from cost import NUM_LAYERS, SCHEME_LEN, validate_scheme
+
+    if args.scheme:
+        import ast
+        import json
+
+        raw = str(args.scheme).strip()
+        try:
+            scheme = json.loads(raw)
+        except json.JSONDecodeError:
+            scheme = ast.literal_eval(raw)
+        scheme = [int(x) for x in scheme]
+        if len(scheme) != SCHEME_LEN:
+            raise ValueError(
+                f"--scheme length {len(scheme)} != {SCHEME_LEN}"
+            )
+        validate_scheme(scheme, args.dataset)
+        for li in range(NUM_LAYERS):
+            g = scheme[li * 4 + 2]
+            if not gelu_level_allowed(li, g):
+                raise ValueError(
+                    f"--scheme L{li} gelu level={g} not allowed"
+                )
+        print(f"  scheme from --scheme ({SCHEME_LEN}-d)", flush=True)
+        return scheme
+    sm_lv = int(args.softmax_level) if args.softmax == "poly" else 1
+    ln_lv = int(args.ln_level) if args.ln == "poly" else 1
+    ge_lv = int(args.gelu_level) if args.gelu == "cheb" else 1
+    scheme = []
+    for li in range(NUM_LAYERS):
+        g_lv = ge_lv if gelu_level_allowed(li, ge_lv) else 1
+        scheme.extend([sm_lv, ln_lv, g_lv, ln_lv])
+    print(
+        f"  scheme from CLI levels sm/ln/gelu="
+        f"{sm_lv}/{ln_lv}/{ge_lv}",
+        flush=True,
+    )
+    return scheme
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="mrpc")
@@ -445,6 +568,18 @@ def main() -> int:
         action="store_true",
         help="stop chain after first layer that fails --check vs tol",
     )
+    ap.add_argument(
+        "--min-corr",
+        type=float,
+        default=None,
+        help="stop after a layer if any --check vs poly has corr below this",
+    )
+    ap.add_argument(
+        "--plain-head",
+        action="store_true",
+        help="after last layer: decrypt ln2, run plaintext BertPooler+classifier "
+        "on HE / poly / orig encoder hidden; also print full orig logits",
+    )
     ap.add_argument("--gelu", choices=("thor", "cheb"), default="cheb")
     ap.add_argument("--gelu-level", type=int, default=1)
     ap.add_argument("--ln", choices=("thor", "poly"), default="poly")
@@ -460,9 +595,10 @@ def main() -> int:
     ap.add_argument(
         "--bootstrap",
         choices=("plan", "plan_mock", "plan_bypass_mock", "thor_fixed"),
-        default="plan_mock",
-        help="plan / plan_mock / plan_bypass_mock / thor_fixed "
-        "(THOR fixed sites + gelu_f2, all real bts)",
+        default="plan",
+        help="plan=bts_ops placements + real CKKS bootstrap (default); "
+        "plan_mock=same placements, decrypt→encodecrypt; "
+        "plan_bypass_mock / thor_fixed as named",
     )
     ap.add_argument(
         "--mock-events",
@@ -663,6 +799,8 @@ def main() -> int:
                 f"gap between {a} and {b}"
             )
 
+    scheme = _poly_scheme_from_args(args)
+
     os.chdir(_THOR_ROOT)
     paths = _thor_paths(args.dataset)
     overlay_by_layer: dict[int, str] = {}
@@ -683,9 +821,15 @@ def main() -> int:
             layer_ff_paths[li] = os.path.join(d, "ff.pkl")
             layer_att_paths[li] = os.path.join(d, "att.pkl")
         else:
-            layer_ff_paths[li] = encoded_layer_pkl(args.dataset, "ff", li)
+            layer_ff_paths[li] = encoded_layer_pkl(
+                args.dataset, "ff", li, gelu_level=scheme[li * 4 + 2]
+            )
             layer_att_paths[li] = encoded_layer_pkl(args.dataset, "att", li)
-    _require_assets(paths, layers=[li for li in layers if li not in overlay_by_layer])
+    _require_assets(
+        paths,
+        layers=[li for li in layers if li not in overlay_by_layer],
+        gelu_levels={li: scheme[li * 4 + 2] for li in layers},
+    )
     for li in layers:
         for kind, p in (
             ("ff", layer_ff_paths[li]),
@@ -894,44 +1038,7 @@ def main() -> int:
         optimize_bootstrap,
         remaining_to_level_calc,
     )
-    from gelu_poly import gelu_level_allowed
-    from cost import NUM_LAYERS, SCHEME_LEN, validate_scheme
     bts_hook = BootstrapHook(engine, mode="always")
-    if args.scheme:
-        import ast
-        import json
-
-        raw = str(args.scheme).strip()
-        try:
-            scheme = json.loads(raw)
-        except json.JSONDecodeError:
-            scheme = ast.literal_eval(raw)
-        scheme = [int(x) for x in scheme]
-        if len(scheme) != SCHEME_LEN:
-            raise ValueError(
-                f"--scheme length {len(scheme)} != {SCHEME_LEN}"
-            )
-        validate_scheme(scheme, args.dataset)
-        for li in range(NUM_LAYERS):
-            g = scheme[li * 4 + 2]
-            if not gelu_level_allowed(li, g):
-                raise ValueError(
-                    f"--scheme L{li} gelu level={g} not allowed"
-                )
-        print(f"  scheme from --scheme ({SCHEME_LEN}-d)", flush=True)
-    else:
-        sm_lv = int(args.softmax_level) if args.softmax == "poly" else 1
-        ln_lv = int(args.ln_level) if args.ln == "poly" else 1
-        ge_lv = int(args.gelu_level) if args.gelu == "cheb" else 1
-        scheme = []
-        for li in range(NUM_LAYERS):
-            g_lv = ge_lv if gelu_level_allowed(li, ge_lv) else 1
-            scheme.extend([sm_lv, ln_lv, g_lv, ln_lv])
-        print(
-            f"  scheme from CLI levels sm/ln/gelu="
-            f"{sm_lv}/{ln_lv}/{ge_lv}",
-            flush=True,
-        )
     # L0 入口：HE rem = num_levels − level_calc = initial_rem（8real 加密后再 pack）。
     plan_initial_rem = DEFAULT_L0_ENTRY_REMAINING
     thor_enc_level = remaining_to_level_calc(
@@ -1047,6 +1154,9 @@ def main() -> int:
         install_eager_attention_poly_patch,
     )
 
+    orig_refs_all = _plain_layer_refs(
+        model_plain, batch_cpu, batch_cpu["attention_mask"], device
+    )
     install_eager_attention_poly_patch()
     apply_polynomial_scheme(model_plain, list(scheme), args.dataset)
     entry_slots = None
@@ -1094,8 +1204,12 @@ def main() -> int:
             model_plain, batch_cpu, batch_cpu["attention_mask"], device
         )
     last_layer = layers[-1]
+    finished_last = False
     poly_refs_by_layer = {
         int(li): poly_refs_all[int(li)] for li in layers
+    }
+    orig_refs_by_layer = {
+        int(li): orig_refs_all[int(li)] for li in layers
     }
     embed_ids = {
         k: v for k, v in batch.items() if k in ("input_ids", "token_type_ids")
@@ -1105,7 +1219,14 @@ def main() -> int:
     sample_key_valid = np.asarray(
         attention_mask.detach().cpu().numpy()
     ).reshape(-1)
-    del poly_refs_all, model_plain, emb_model, batch, batch_cpu
+    plain_head_batch = None
+    if args.plain_head:
+        plain_head_batch = {
+            k: v.detach().cpu() if torch.is_tensor(v) else v
+            for k, v in batch_cpu.items()
+            if k in ("input_ids", "token_type_ids", "attention_mask", "labels", "label")
+        }
+    del poly_refs_all, orig_refs_all, model_plain, emb_model, batch, batch_cpu
     _gc_cuda()
     print(
         "  compare refs = poly_model_inference "
@@ -1690,66 +1811,22 @@ def main() -> int:
                 if write_header:
                     w.writeheader()
                 w.writerow(row)
-        print(f"score L{li} vs poly (same scheme):", flush=True)
         li_bad = False
-        for name in args.check:
-            he = he_vars[name]
-            plain_arr = pref[name_map.get(name, name)]
-            d = _he_vs_plain_diag(
-                engine,
-                sk,
-                he,
-                plain_arr,
-                name=name,
-                task=args.dataset,
-                layer_idx=li,
-                rest_div=float(args.rest_div),
-            )
-            status = "OK" if d.abs_err_ls < args.tol else "BAD"
-            if d.abs_err_ls >= args.tol:
-                li_bad = True
-                layer_ok = False
+        corr_fail = None
+        for ref_kind, ref_map in (
+            ("poly", poly_refs_by_layer),
+            ("orig", orig_refs_by_layer),
+        ):
+            pref_cmp = ref_map[int(li)]
             print(
-                f"  [{status}] L{li}.{name}: max|err|={d.abs_err_ls:.3e}  "
-                f"corr={d.corr:.4f}  ls_gain={d.ls_gain:.4g}  tol={args.tol}",
+                f"score L{li} vs {ref_kind}"
+                f"{' (same scheme)' if ref_kind == 'poly' else ' (finetuned BERT)'}:",
                 flush=True,
             )
-            if args.metrics_csv:
-                import csv
-
-                mpath = os.path.abspath(args.metrics_csv)
-                os.makedirs(os.path.dirname(mpath) or ".", exist_ok=True)
-                row = {
-                    "run_bootstrap": args.bootstrap,
-                    "dataset": args.dataset,
-                    "sample": int(args.sample),
-                    "layer": int(li),
-                    "checkpoint": name,
-                    "max_abs_plain": d.max_abs_plain,
-                    "max_abs_he": d.max_abs_he,
-                    "abs_err_g1": d.abs_err_g1,
-                    "rel_max_g1": d.rel_max_g1,
-                    "rel_mean_g1": d.rel_mean_g1,
-                    "abs_err_ls": d.abs_err_ls,
-                    "rel_max_ls": d.rel_max_ls,
-                    "rel_mean_ls": d.rel_mean_ls,
-                    "rel_err_g1": d.rel_max_g1,
-                    "rel_err_ls": d.rel_max_ls,
-                    "rmse_g1": d.rmse_g1,
-                    "corr": d.corr,
-                    "ls_gain": d.ls_gain,
-                    "load_in": args.load_in or "",
-                }
-                write_header = not os.path.isfile(mpath)
-                with open(mpath, "a", newline="", encoding="utf-8") as mf:
-                    w = csv.DictWriter(mf, fieldnames=list(row.keys()))
-                    if write_header:
-                        w.writeheader()
-                    w.writerow(row)
-            if args.error_audit_csv:
-                import csv
-
-                audit = he_plain_dense_error_stats(
+            for name in args.check:
+                he = he_vars[name]
+                plain_arr = pref_cmp[name_map.get(name, name)]
+                d = _he_vs_plain_diag(
                     engine,
                     sk,
                     he,
@@ -1758,24 +1835,105 @@ def main() -> int:
                     task=args.dataset,
                     layer_idx=li,
                     rest_div=float(args.rest_div),
+                    gelu_level=scheme[li * 4 + 2],
                 )
-                apath = os.path.abspath(args.error_audit_csv)
-                os.makedirs(os.path.dirname(apath) or ".", exist_ok=True)
-                row = {
-                    "run_bootstrap": args.bootstrap,
-                    "dataset": args.dataset,
-                    "sample": int(args.sample),
-                    "layer": int(li),
-                    "checkpoint": name,
-                    **audit._asdict(),
-                    "load_in": args.load_in or "",
-                }
-                write_header = not os.path.isfile(apath)
-                with open(apath, "a", newline="", encoding="utf-8") as af:
-                    w = csv.DictWriter(af, fieldnames=list(row.keys()))
-                    if write_header:
-                        w.writeheader()
-                    w.writerow(row)
+                status = "OK" if d.abs_err_ls < args.tol else "BAD"
+                if ref_kind == "poly" and d.abs_err_ls >= args.tol:
+                    li_bad = True
+                    layer_ok = False
+                if (
+                    ref_kind == "poly"
+                    and args.min_corr is not None
+                    and not (d.corr >= float(args.min_corr))
+                    and corr_fail is None
+                ):
+                    corr_fail = (name, d)
+                print(
+                    f"  [{status}] L{li}.{name} vs {ref_kind}: "
+                    f"max|err|={d.abs_err_ls:.3e}  "
+                    f"corr={d.corr:.4f}  ls_gain={d.ls_gain:.4g}  "
+                    f"tol={args.tol}",
+                    flush=True,
+                )
+                if args.metrics_csv:
+                    import csv
+
+                    mpath = os.path.abspath(args.metrics_csv)
+                    os.makedirs(os.path.dirname(mpath) or ".", exist_ok=True)
+                    row = {
+                        "run_bootstrap": args.bootstrap,
+                        "dataset": args.dataset,
+                        "sample": int(args.sample),
+                        "layer": int(li),
+                        "checkpoint": name,
+                        "ref": ref_kind,
+                        "max_abs_plain": d.max_abs_plain,
+                        "max_abs_he": d.max_abs_he,
+                        "abs_err_g1": d.abs_err_g1,
+                        "rel_max_g1": d.rel_max_g1,
+                        "rel_mean_g1": d.rel_mean_g1,
+                        "abs_err_ls": d.abs_err_ls,
+                        "rel_max_ls": d.rel_max_ls,
+                        "rel_mean_ls": d.rel_mean_ls,
+                        "rel_err_g1": d.rel_max_g1,
+                        "rel_err_ls": d.rel_max_ls,
+                        "rmse_g1": d.rmse_g1,
+                        "corr": d.corr,
+                        "ls_gain": d.ls_gain,
+                        "load_in": args.load_in or "",
+                    }
+                    write_header = not os.path.isfile(mpath)
+                    with open(mpath, "a", newline="", encoding="utf-8") as mf:
+                        w = csv.DictWriter(mf, fieldnames=list(row.keys()))
+                        if write_header:
+                            w.writeheader()
+                        w.writerow(row)
+                if args.error_audit_csv:
+                    import csv
+
+                    audit = he_plain_dense_error_stats(
+                        engine,
+                        sk,
+                        he,
+                        plain_arr,
+                        name=name,
+                        task=args.dataset,
+                        layer_idx=li,
+                        rest_div=float(args.rest_div),
+                    )
+                    apath = os.path.abspath(args.error_audit_csv)
+                    os.makedirs(os.path.dirname(apath) or ".", exist_ok=True)
+                    row = {
+                        "run_bootstrap": args.bootstrap,
+                        "dataset": args.dataset,
+                        "sample": int(args.sample),
+                        "layer": int(li),
+                        "checkpoint": name,
+                        "ref": ref_kind,
+                        **audit._asdict(),
+                        "load_in": args.load_in or "",
+                    }
+                    write_header = not os.path.isfile(apath)
+                    with open(apath, "a", newline="", encoding="utf-8") as af:
+                        w = csv.DictWriter(af, fieldnames=list(row.keys()))
+                        if write_header:
+                            w.writeheader()
+                        w.writerow(row)
+        if corr_fail is not None:
+            name, d = corr_fail
+            print(
+                f"STOP corr: first fail L{li}.{name} vs poly  "
+                f"corr={d.corr:.4f} < min_corr={args.min_corr:g}  "
+                f"max|plain|={d.max_abs_plain:.4g} max|he|={d.max_abs_he:.4g}  "
+                f"max|err|={d.abs_err_ls:.3e}",
+                flush=True,
+            )
+            he_vars_last = he_vars
+            _release_he_module_weights(att)
+            _release_he_module_weights(ff)
+            del att, ff
+            _gc_cuda()
+            break
         if li_bad and args.stop_on_bad:
             print(f"STOP on L{li} accuracy fail (--stop-on-bad)", flush=True)
             he_vars_last = he_vars
@@ -1786,6 +1944,7 @@ def main() -> int:
             break
         if li == last_layer:
             he_vars_last = he_vars
+            finished_last = True
         else:
             del he_vars
         _release_he_module_weights(att)
@@ -1832,6 +1991,35 @@ def main() -> int:
     )
 
     print("PASS" if ok else "FAIL")
+    if args.plain_head:
+        if not finished_last:
+            print(
+                "  [plain-head] skipped: chain did not finish the last "
+                f"requested layer L{last_layer} (corr/stop)",
+                flush=True,
+            )
+        elif plain_head_batch is None:
+            print("  [plain-head] skipped: no stashed sample batch", flush=True)
+        else:
+            print("  [plain-head] reload finetuned BERT (CPU pooler+cls) ...", flush=True)
+            model_head = AutoModelForSequenceClassification.from_pretrained(
+                local_model, local_files_only=True
+            )
+            model_head.eval()
+            model_head.to(torch.device("cpu"))
+            pref_poly = poly_refs_by_layer[int(last_layer)]
+            pref_orig = orig_refs_by_layer[int(last_layer)]
+            _report_plain_head(
+                engine=engine,
+                sk=sk,
+                he_ln2=he_vars_last["ln2_out"],
+                poly_ln2=pref_poly[name_map.get("ln2_out", "ln2_out")],
+                orig_ln2=pref_orig[name_map.get("ln2_out", "ln2_out")],
+                model=model_head,
+                batch_cpu=plain_head_batch,
+                last_layer=int(last_layer),
+            )
+            del model_head
     # Always save exit CTs when asked (even on BAD) so multi-seg diagnose can resume.
     if args.save_out:
         ct0 = x[0]

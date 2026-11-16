@@ -7,7 +7,8 @@
 
 评估集：进化搜索默认使用全部校验集（calib）；可用 --eval-samples N 抽样子集加速。
         Pareto 解最终分别在全部校验集与全部验证集上汇报，写出两个 CSV。
-输出 CSV：精简列（无 task/rank_hint/oor_*）；非有限 KL 搜索期不入 archive。
+输出 CSV：精简列（无 task/rank_hint/oor_pct/n_eval_used）；写 oor_count。
+非有限 KL 搜索期不入 archive（OOR 只要 KL 有限仍保留）。
 """
 from __future__ import annotations
 
@@ -23,7 +24,9 @@ from cost import (
     NUM_LAYERS,
     SCHEME_LEN,
     compute_f_cost,
+    compute_f_cost_many,
     compute_scheme_cost,
+    default_bts_workers,
     f_cost_label,
 )
 from evolution_infer import (
@@ -41,8 +44,8 @@ from poly_model_inference import (
     fmt_metric_delta,
 )
 # ===================== 配置区 =====================
-# TASK_NAMES = ["rte" ,"sst2"]
-TASK_NAMES = ["cola", "qnli", "mnli"]
+#TASK_NAMES = ["mrpc","rte","sst2", "cola", "qnli", "mnli"]
+TASK_NAMES = ["mrpc","rte","sst2"]
 POLY_LEVELS = (0, 1)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 
@@ -58,6 +61,8 @@ EVAL_SAMPLE_SIZE: int | None = None  # None = 全部校验集
 SEARCH_EVAL_SPLIT = "calib"
 
 PROGRESS_EVERY = 10
+# DualRail DP 并行进程数；0 = 全部 CPU。与 evolution_score 同默认，便于对照。
+BTS_COST_WORKERS = 32
 # ==================================================
 
 
@@ -124,8 +129,8 @@ def init_population_strategy(
     rng: random.Random, allowed_table: list[tuple[int, ...]], n: int
 ) -> list[list[int]]:
     population: list[list[int]] = []
-    n_all_high = n * 3 // 10
-    n_all_low = n * 3 // 10
+    n_all_high = n * 2 // 10
+    n_all_low = n * 2 // 10
 
     for _ in range(n_all_high):
         population.append([max(levels) for levels in allowed_table])
@@ -148,6 +153,7 @@ class Individual:
     f1_delta: float | None = None
     output_kl: float = 0.0
     flips_pct: float = 0.0
+    oor_count: int = 0
     rank: int = field(default=0, compare=False)
     crowding: float = field(default=0.0, compare=False)
 
@@ -180,6 +186,49 @@ def dominates(a: Individual, b: Individual, *, cost_mode: str) -> bool:
     return kl_better or cost_better
 
 
+def apply_scheme_metrics(ind: Individual, metrics) -> Individual:
+    """写入推理指标；不改 f_cost（由 DP 批量赋值，与 evolution_score 同路径）。"""
+    ind.f_output_kl = metrics.output_kl
+    ind.accuracy_delta = metrics.accuracy_delta
+    ind.loss_delta = metrics.loss_delta
+    ind.f1_delta = metrics.f1_delta
+    ind.output_kl = metrics.output_kl
+    ind.flips_pct = metrics.flips_pct
+    ind.oor_count = int(metrics.oor_count)
+    if not math.isfinite(ind.f_output_kl):
+        ind.f_output_kl = math.inf
+        ind.output_kl = math.inf
+    return ind
+
+
+def evaluate_kl_only(
+    ind: Individual,
+    scheme_eval: SchemeEvaluator,
+) -> Individual:
+    metrics = scheme_eval.evaluate_for_scheme(ind.scheme)
+    return apply_scheme_metrics(ind, metrics)
+
+
+def assign_f_costs(
+    inds: list[Individual],
+    task_name: str,
+    *,
+    cost_mode: str,
+    workers: int,
+) -> None:
+    """批量 DualRail DP（cost-only + 进程池 + 共享 memo），数值与逐个 compute_f_cost 相同。"""
+    if not inds:
+        return
+    costs = compute_f_cost_many(
+        task_name,
+        [ind.scheme for ind in inds],
+        cost_mode=cost_mode,
+        workers=workers,
+    )
+    for ind, cost in zip(inds, costs):
+        ind.f_cost = int(cost)
+
+
 def evaluate_individual(
     ind: Individual,
     task_name: str,
@@ -187,18 +236,8 @@ def evaluate_individual(
     *,
     cost_mode: str,
 ) -> Individual:
-    metrics = scheme_eval.evaluate_for_scheme(ind.scheme)
-    ind.f_output_kl = metrics.output_kl
+    evaluate_kl_only(ind, scheme_eval)
     ind.f_cost = compute_f_cost(task_name, ind.scheme, cost_mode=cost_mode)
-    ind.total_depth = int(compute_scheme_cost(task_name, ind.scheme))
-    ind.accuracy_delta = metrics.accuracy_delta
-    ind.loss_delta = metrics.loss_delta
-    ind.f1_delta = metrics.f1_delta
-    ind.output_kl = metrics.output_kl
-    # NaN/Inf 不能参与支配：与任意有限 KL 均不可比，否则会混进 archive
-    if not math.isfinite(ind.f_output_kl):
-        ind.f_output_kl = math.inf
-        ind.output_kl = math.inf
     return ind
 
 
@@ -358,6 +397,8 @@ class Archive:
                 loss_delta=ind.loss_delta,
                 output_kl=ind.output_kl,
                 f1_delta=ind.f1_delta,
+                flips_pct=ind.flips_pct,
+                oor_count=int(ind.oor_count),
             )
         )
         self._truncate()
@@ -420,19 +461,27 @@ def run_evolution(
     num_generations: int = NUM_GENERATIONS,
     cost_mode: str = "depth",
     seed: int = RANDOM_SEED,
+    workers: int | None = None,
 ) -> tuple[list[Individual], Archive]:
     rng = random.Random(seed)
     allowed_table = build_allowed_levels_table()
+    n_workers = default_bts_workers() if not workers else int(workers)
 
     population = [
         Individual(scheme=scheme)
         for scheme in init_population_strategy(rng, allowed_table, population_size)
     ]
-    print(f"  初始种群评估（{population_size} 个体 × 推理）...")
+    print(
+        f"  初始种群评估（{population_size} 个体 × 推理；"
+        f"bts_workers={n_workers}）..."
+    )
     for i, ind in enumerate(population, start=1):
-        evaluate_individual(ind, task_name, scheme_eval, cost_mode=cost_mode)
+        evaluate_kl_only(ind, scheme_eval)
         if i % max(1, population_size // 5) == 0 or i == population_size:
             print(f"    已评估 {i}/{population_size}")
+    assign_f_costs(
+        population, task_name, cost_mode=cost_mode, workers=n_workers
+    )
 
     archive = Archive(cost_mode=cost_mode)
     archive.extend(population)
@@ -450,8 +499,11 @@ def run_evolution(
             child_scheme = crossover(rng, p1.scheme, p2.scheme)
             child_scheme = mutate(rng, child_scheme, allowed_table)
             child = Individual(scheme=child_scheme)
-            evaluate_individual(child, task_name, scheme_eval, cost_mode=cost_mode)
+            evaluate_kl_only(child, scheme_eval)
             offspring.append(child)
+        assign_f_costs(
+            offspring, task_name, cost_mode=cost_mode, workers=n_workers
+        )
 
         population = environmental_selection(
             population + offspring,
@@ -479,8 +531,8 @@ def format_scheme(scheme: list[int]) -> str:
 
 def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
     """
-    写出 Pareto CSV。非有限 KL 在搜索期已禁止入 archive，故不再写
-    oor_count / oor_pct / n_eval_used；也不写 task、rank_hint。
+    写出 Pareto CSV。非有限 KL 搜索期不入 archive；OOR 保留并写 oor_count。
+    不写 task、rank_hint、oor_pct、n_eval_used。
     f_output_kl 与汇报后的 output_kl 一致，只保留 output_kl。
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -491,6 +543,7 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
         "accuracy_delta",
         "loss_delta",
         "output_kl",
+        "oor_count",
         "flips_pct",
     ]
     if mrpc:
@@ -500,12 +553,17 @@ def save_pareto_csv(task_name: str, archive: Archive, path: str) -> None:
         writer = csv.writer(f)
         writer.writerow(header)
         for ind in archive.sorted_items():
+            depth = int(ind.total_depth)
+            if depth <= 0:
+                depth = int(compute_scheme_cost(task_name, ind.scheme))
+                ind.total_depth = depth
             row = [
                 ind.f_cost,
-                ind.total_depth,
+                depth,
                 fmt_metric_delta(ind.accuracy_delta),
                 f"{ind.loss_delta:.8f}",
                 f"{ind.output_kl:.8f}",
+                int(ind.oor_count),
                 fmt_flips_pct(ind.flips_pct),
             ]
             if mrpc:
@@ -558,6 +616,12 @@ def main() -> None:
         help="bts=DualRail DP 总次数（默认）；depth=ceil(深度和/除数)",
     )
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=BTS_COST_WORKERS,
+        help="bts DP 进程数；0=全部 CPU。与 evolution_score 相同（GPU 不能加速 DP）。",
+    )
     args = parser.parse_args()
 
     eval_samples: int | None = None if args.eval_full else args.eval_samples
@@ -571,7 +635,8 @@ def main() -> None:
         f"device={device}, pop={args.pop}, gens={args.gens}, seed={args.seed}, "
         f"search_split={SEARCH_EVAL_SPLIT}, "
         f"eval={'full' if eval_samples is None else eval_samples}, "
-        f"cost_mode={args.cost_mode}"
+        f"cost_mode={args.cost_mode}, "
+        f"bts_workers={args.workers or default_bts_workers()}"
     )
     print(
         f"  calib indices: seed={args.calib_seed} "
@@ -609,6 +674,7 @@ def main() -> None:
             num_generations=args.gens,
             cost_mode=args.cost_mode,
             seed=args.seed,
+            workers=args.workers or default_bts_workers(),
         )
         search_elapsed_s = time.perf_counter() - t0
         task_timings.append((task_name, search_elapsed_s))
