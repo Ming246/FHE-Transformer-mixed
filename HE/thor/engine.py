@@ -147,6 +147,19 @@ ROT_DELTAS: list[int] = [
     8640,
     8896,
     10672,
+    # Pooler CLS-broadcast / classifier rot-sum（head_he_ct，encoder 不用）
+    32,
+    64,
+    128,
+    1024,
+    16384,
+    -16,
+    -32,
+    -64,
+    -128,
+    -256,
+    -512,
+    -1024,
 ]
 
 DEFAULT_KEYS0 = os.path.abspath(

@@ -25,6 +25,9 @@ Usage::
 
   # depth/poly debug only (decrypt→reencrypt, not real CKKS bootstrap):
   #   --bootstrap plan_mock
+
+  # after last encoder layer, HE pooler+classifier (logits, not in bts_plan):
+  #   --he-head --he-head-c 5
 """
 from __future__ import annotations
 
@@ -579,6 +582,18 @@ def main() -> int:
         action="store_true",
         help="after last layer: decrypt ln2, run plaintext BertPooler+classifier "
         "on HE / poly / orig encoder hidden; also print full orig logits",
+    )
+    ap.add_argument(
+        "--he-head",
+        action="store_true",
+        help="after last encoder layer: DualRail8 bts + HE pooler tanh + classifier "
+        "(logits CTs; bts not in bts_plan, THOR sites)",
+    )
+    ap.add_argument(
+        "--he-head-c",
+        type=float,
+        default=5.0,
+        help="pooler tanh scale C for p2(p1(z/C)); default 5 (nolinear fit)",
     )
     ap.add_argument("--gelu", choices=("thor", "cheb"), default="cheb")
     ap.add_argument("--gelu-level", type=int, default=1)
@@ -2020,6 +2035,77 @@ def main() -> int:
                 last_layer=int(last_layer),
             )
             del model_head
+    if args.he_head:
+        if not finished_last:
+            print(
+                "  [he-head] skipped: chain did not finish the last "
+                f"requested layer L{last_layer}",
+                flush=True,
+            )
+        else:
+            from head_he_ct import HeBertHead, decrypt_logits_slot0
+
+            print("  [he-head] pooler + classifier on L11 DualRail ln2 ...", flush=True)
+            t_head = time.time()
+            he_ln2 = he_vars_last["ln2_out"]
+            if isinstance(he_ln2, np.ndarray) and he_ln2.ndim > 1:
+                he_ln2 = he_ln2[0]
+            packs8 = [he_ln2[i] for i in range(8)]
+            head = HeBertHead(
+                evaluator,
+                dataset=args.dataset,
+                encoded_dir=paths["encoded_dir"],
+                device=int(devices[0]),
+                tanh_C=float(args.he_head_c),
+            )
+            logits_ct = head.forward(packs8)
+            he_logits = decrypt_logits_slot0(engine, sk, logits_ct)
+            he_pred = int(np.argmax(he_logits))
+            print(
+                f"  [he-head] HE logits={he_logits.tolist()} pred={he_pred} "
+                f"({time.time() - t_head:.1f}s)",
+                flush=True,
+            )
+            if args.plain_head and plain_head_batch is not None:
+                from research_unified_entry_slots import (
+                    decode_layer_output_to_matrix,
+                )
+                from tanh_poly import TanhPolyEvaluator
+
+                real8 = [
+                    np.asarray(
+                        engine.decrode(packs8[i], sk, is_real=True),
+                        dtype=np.float64,
+                    ).ravel()
+                    for i in range(8)
+                ]
+                he_mat = decode_layer_output_to_matrix(real8)
+                model_h = AutoModelForSequenceClassification.from_pretrained(
+                    local_model, local_files_only=True
+                )
+                model_h.eval()
+                xt = torch.as_tensor(he_mat, dtype=torch.float32).unsqueeze(0)
+                with torch.no_grad():
+                    dense = model_h.bert.pooler.dense(xt[:, 0])
+                    pooled_poly = TanhPolyEvaluator(C=float(args.he_head_c))(dense)
+                    poly_logits = (
+                        model_h.classifier(pooled_poly).detach().cpu().numpy().reshape(-1)
+                    )
+                    pooled_th = torch.tanh(dense)
+                    orig_logits = (
+                        model_h.classifier(pooled_th).detach().cpu().numpy().reshape(-1)
+                    )
+                dpoly = he_logits - np.asarray(poly_logits, dtype=np.float64)
+                print(
+                    f"  [he-head] vs poly-tanh(C={args.he_head_c:g}) "
+                    f"logits={poly_logits.tolist()} abs_diff={np.abs(dpoly).tolist()}",
+                    flush=True,
+                )
+                print(
+                    f"  [he-head] vs exact-tanh logits={orig_logits.tolist()}",
+                    flush=True,
+                )
+                del model_h
     # Always save exit CTs when asked (even on BAD) so multi-seg diagnose can resume.
     if args.save_out:
         ct0 = x[0]

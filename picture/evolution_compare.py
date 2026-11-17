@@ -39,7 +39,7 @@ import numpy as np
 
 # ===================== 配置区 =====================
 #TASK_NAMES = ("mrpc", "rte", "sst2", "cola","qnli","mnli")
-TASK_NAMES = ("mrpc")
+TASK_NAMES = ("mrpc", "rte", "sst2", "cola","qnli","mnli")
 EVAL_SPLITS = ("calib", "validation")
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
