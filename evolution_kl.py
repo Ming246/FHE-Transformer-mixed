@@ -45,7 +45,7 @@ from poly_model_inference import (
 )
 # ===================== 配置区 =====================
 #TASK_NAMES = ["mrpc","rte","sst2", "cola", "qnli", "mnli"]
-TASK_NAMES = ["mrpc","rte","sst2"]
+TASK_NAMES = ["mrpc"]
 POLY_LEVELS = (0, 1)
 OUTPUT_DIR = "./results/evolution_kl_results/"
 

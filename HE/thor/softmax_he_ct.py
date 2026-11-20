@@ -447,61 +447,6 @@ def he_asor_ct(
     return an.ciphertext, an.delta, en
 
 
-def _refresh_dualrail8(engine, packs, *, max_level_calc: int | None = None):
-    """
-    Bootstrap 8 real Softmax packs；``×1/2`` before bs cancels ``2·Re/Im`` unpack
-    so the post-score DualRail 2× convention is preserved.
-
-    Gate on ``level_calc`` only (see ``he_asor_ct`` — ``ct.level`` can lie).
-    """
-    packs = list(packs)
-    if max_level_calc is None:
-        max_level_calc = int(engine.num_levels) - 5
-    if max(int(ct.level_calc) for ct in packs) <= max_level_calc:
-        return packs
-    print(
-        f"  [softmax_he_ct] DualRail refresh packs "
-        f"level_calc={max(int(ct.level_calc) for ct in packs)} "
-        f"thresh={max_level_calc}",
-        flush=True,
-    )
-    out = list(packs)
-    try:
-        from bts_decrypt_probe import bts_probe_label
-    except ImportError:
-        from .bts_decrypt_probe import bts_probe_label  # type: ignore
-    try:
-        from bts_prescale import bootstrap_prescaled, dualrail_unpack_scale
-    except ImportError:
-        from .bts_prescale import bootstrap_prescaled, dualrail_unpack_scale  # type: ignore
-    try:
-        from bts_site_pack_probe import active_collector
-    except ImportError:
-        from .bts_site_pack_probe import active_collector  # type: ignore
-    coll = active_collector(engine)
-    pre8 = list(out) if coll is not None else None
-    s = dualrail_unpack_scale()
-    with bts_probe_label(engine, "softmax_force_refresh_packs"):
-        for i in range(4):
-            temp = engine.cc_add(out[i], engine.imult(out[i + 4]))
-            temp = bootstrap_prescaled(engine, temp, postscale=False)
-            conj = engine.conjugate(temp)
-            out[i] = engine.cc_add(temp, conj)
-            out[i + 4] = engine.imult(engine.cc_sub(conj, temp))
-            # fused ×(½·INV); 耗尽时不能在 bs 前浮点 mult_scalar
-            out[i] = engine.mult_scalar(out[i], s)
-            out[i + 4] = engine.mult_scalar(out[i + 4], s)
-    if coll is not None and pre8 is not None:
-        coll.record_ct_sequence(
-            "bypass.softmax_force_refresh_packs",
-            "real_pack",
-            "real_pack_8",
-            pre8,
-            out,
-        )
-    return out
-
-
 def update_inv_D_fixed(
     engine,
     exp_u,
@@ -931,7 +876,6 @@ def he_softmax_poly(
         level=int(engine.num_levels) - int(sigma_exp.level),
     )
     _probe_rem(rem_probe, "softmax_sigma_enc_one", engine, sigma_exp)
-    rec_n = len(getattr(bts_hook, "records", []) or [])
     inv_d, d_delta, en = he_asor_ct(
         engine,
         enc_one,
@@ -947,41 +891,6 @@ def he_softmax_poly(
         inv_d = bts_hook.refresh(inv_ev, inv_d)
     if _chain is not None:
         _chain.touch("softmax_inv_d_sigma", inv_d)
-    # σ-aSOR spine 刷了 an/bn 时，AUX 上的 exp packs 一并恢复
-    new_recs = getattr(bts_hook, "records", [])[rec_n:]
-    if os.environ.get("THOR_SKIP_EXP_AUX") == "1":
-        new_recs = []
-    if any(
-        "softmax_asor_sigma_i" in str(getattr(r, "event_name", ""))
-        and int(getattr(r, "ct_count", 0) or 0) > 0
-        for r in new_recs
-    ):
-        try:
-            from bts_decrypt_probe import bts_probe_label
-        except ImportError:
-            from .bts_decrypt_probe import bts_probe_label  # type: ignore
-        try:
-            from bts_prescale import bootstrap_prescaled
-        except ImportError:
-            from .bts_prescale import bootstrap_prescaled  # type: ignore
-        try:
-            from bts_site_pack_probe import active_collector
-        except ImportError:
-            from .bts_site_pack_probe import active_collector  # type: ignore
-        coll = active_collector(engine)
-        pre_exp = list(exp_u) if coll is not None else None
-        ev = f"{bts_prefix}.bypass.softmax_exp_aux_after_sigma"
-        with bts_probe_label(engine, ev):
-            for i in range(8):
-                exp_u[i] = bootstrap_prescaled(engine, exp_u[i], postscale=True)
-        if coll is not None and pre_exp is not None:
-            coll.record_ct_sequence(
-                ev,
-                "direct",
-                "direct_8",
-                pre_exp,
-                list(exp_u),
-            )
 
     # n2 Σy² rounds (δ2=2 → 1; δ2=4 → 2), last marked final_inv.
     for r in range(n2):

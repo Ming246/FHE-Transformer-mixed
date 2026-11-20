@@ -1473,11 +1473,6 @@ def main() -> int:
         help="allowed |HE rem − DP rem| at probe/boot sites (plan/plan_mock; default 0)",
     )
     ap.add_argument(
-        "--no-rem-guard",
-        action="store_true",
-        help="disable fail-fast rem_trace checks (plan/plan_mock)",
-    )
-    ap.add_argument(
         "--input",
         choices=("auto", "embedding", "plain-hidden"),
         default="auto",
@@ -1811,20 +1806,16 @@ def main() -> int:
         )
         from rem_guard import RemGuard, write_rem_trace
 
-        rem_guard = None
-        if not args.no_rem_guard:
-            rem_guard = RemGuard.from_bootstrap_result(
-                plan_result,
-                layer_idx=layer_idx,
-                tol=int(args.rem_tol),
-            )
-            bts_hook.rem_guard = rem_guard
-            trace_path = f"/tmp/l{layer_idx}_rem_trace.tsv"
-            write_rem_trace(plan_result, trace_path, layer_idx=layer_idx)
-            print(rem_guard.dump_layer_trace(), flush=True)
-            print(f"  rem_trace written → {trace_path}", flush=True)
-        else:
-            rem_guard = None
+        rem_guard = RemGuard.from_bootstrap_result(
+            plan_result,
+            layer_idx=layer_idx,
+            tol=int(args.rem_tol),
+        )
+        bts_hook.rem_guard = rem_guard
+        trace_path = f"/tmp/l{layer_idx}_rem_trace.tsv"
+        write_rem_trace(plan_result, trace_path, layer_idx=layer_idx)
+        print(rem_guard.dump_layer_trace(), flush=True)
+        print(f"  rem_trace written → {trace_path}", flush=True)
     else:
         rem_guard = None
 

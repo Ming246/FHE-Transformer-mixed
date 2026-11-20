@@ -685,11 +685,6 @@ def main() -> int:
         help="allowed |HE rem − DP rem| at probe/boot sites (plan/plan_mock; default 0)",
     )
     ap.add_argument(
-        "--no-rem-guard",
-        action="store_true",
-        help="disable fail-fast rem_trace checks (plan/plan_mock)",
-    )
-    ap.add_argument(
         "--rest-div",
         type=float,
         default=1.0,
@@ -754,8 +749,11 @@ def main() -> int:
         "--save-decoded-dir",
         type=str,
         default=None,
-        help="after each layer: save ln2_out as 8 decrypted slot vectors "
-        "plus level_calc/rem (L{n}_ln2_slots.npz) for later re-encrypt",
+        help="after a layer whose poly --check corrs are all > 0.7 "
+        "(rem_guard already passed to reach here): save ln2_out as 8 "
+        "decrypted slot vectors plus level_calc/rem "
+        "(L{n}_ln2_slots.npz) for later re-encrypt. A poly corr <= 0.7 "
+        "stops the chain and does not save that layer.",
     )
     ap.add_argument(
         "--mag-probe",
@@ -1125,9 +1123,7 @@ def main() -> int:
             flush=True,
         )
 
-    rem_guard_enabled = (
-        args.bootstrap in _plan_modes and not args.no_rem_guard
-    )
+    rem_guard_enabled = args.bootstrap in _plan_modes
     from mag_probe import ExpInvStop, MagBoom
     if rem_guard_enabled:
         from rem_guard import RemGuard, RemMismatchError, write_rem_trace
@@ -1747,6 +1743,7 @@ def main() -> int:
                 flush=True,
             )
         pref = poly_refs_by_layer[int(li)]
+        slot_payload = None
         if args.layer_matrix_csv or args.save_decoded_dir:
             from research_unified_entry_slots import (
                 decode_layer_output_to_matrix,
@@ -1765,10 +1762,7 @@ def main() -> int:
             rem = int(engine.num_levels) - lc
             raw_levels = [getattr(he_ct[i], "level", None) for i in range(8)]
             if args.save_decoded_dir:
-                ddir = os.path.abspath(args.save_decoded_dir)
-                os.makedirs(ddir, exist_ok=True)
-                slot_path = os.path.join(ddir, f"L{int(li)}_ln2_slots.npz")
-                payload = {
+                slot_payload = {
                     "packs": np.stack(real8, axis=0),
                     "level_calc": np.int64(lc),
                     "level_calc_packs": np.asarray(level_calcs, dtype=np.int64),
@@ -1777,13 +1771,7 @@ def main() -> int:
                     "layer": np.int64(li),
                 }
                 if all(v is not None for v in raw_levels):
-                    payload["level"] = np.asarray(raw_levels, dtype=np.int64)
-                np.savez(slot_path, **payload)
-                print(
-                    f"  saved L{li} ln2 slots {tuple(payload['packs'].shape)} "
-                    f"level_calc={lc} rem={rem} → {slot_path}",
-                    flush=True,
-                )
+                    slot_payload["level"] = np.asarray(raw_levels, dtype=np.int64)
         if args.layer_matrix_csv:
             he_mat = decode_layer_output_to_matrix(real8)
             ref_mat = np.asarray(pref["ln2_out"], dtype=np.float64).squeeze()
@@ -1828,6 +1816,7 @@ def main() -> int:
                 w.writerow(row)
         li_bad = False
         corr_fail = None
+        poly_corr_low = None
         for ref_kind, ref_map in (
             ("poly", poly_refs_by_layer),
             ("orig", orig_refs_by_layer),
@@ -1856,6 +1845,8 @@ def main() -> int:
                 if ref_kind == "poly" and d.abs_err_ls >= args.tol:
                     li_bad = True
                     layer_ok = False
+                if ref_kind == "poly" and not (d.corr > 0.7) and poly_corr_low is None:
+                    poly_corr_low = (name, float(d.corr))
                 if (
                     ref_kind == "poly"
                     and args.min_corr is not None
@@ -1934,6 +1925,30 @@ def main() -> int:
                         if write_header:
                             w.writeheader()
                         w.writerow(row)
+        if slot_payload is not None and poly_corr_low is None:
+            ddir = os.path.abspath(args.save_decoded_dir)
+            os.makedirs(ddir, exist_ok=True)
+            slot_path = os.path.join(ddir, f"L{int(li)}_ln2_slots.npz")
+            np.savez(slot_path, **slot_payload)
+            print(
+                f"  saved L{li} ln2 slots {tuple(slot_payload['packs'].shape)} "
+                f"level_calc={int(slot_payload['level_calc'])} "
+                f"rem={int(slot_payload['rem'])} → {slot_path}",
+                flush=True,
+            )
+        if poly_corr_low is not None:
+            name, corr = poly_corr_low
+            print(
+                f"STOP corr: L{li}.{name} vs poly corr={corr:.4f} <= 0.7",
+                flush=True,
+            )
+            layer_ok = False
+            he_vars_last = he_vars
+            _release_he_module_weights(att)
+            _release_he_module_weights(ff)
+            del att, ff
+            _gc_cuda()
+            break
         if corr_fail is not None:
             name, d = corr_fail
             print(

@@ -361,6 +361,9 @@ class Event:
     ct_peak: int | None = None
     align_depth: int = 0  # 旧固定对齐（已弃用）
     save_slot: int | None = None
+    # 旁路在 body 烧了这么多层时记下，而不是记事件出口。
+    # LN 分子在 sum_x 的 cm_mult（depth 1）停住；方差主路还要再烧 1 层。
+    save_slot_depth: int | None = None
     entry_save_slot: int | None = None
     join_slot: int | None = None
     join_offset: int = 0  # 会合前主路先烧的 depth（如 Σy² mask）
@@ -418,6 +421,14 @@ class Event:
         else:
             if self.save_slot is not None and not (0 <= self.save_slot < N_SLOTS):
                 raise ValueError(f"save_slot 非法：{self.save_slot}")
+            if self.save_slot_depth is not None:
+                if self.save_slot is None:
+                    raise ValueError(f"save_slot_depth 需要 save_slot：{self.name}")
+                if not (0 <= int(self.save_slot_depth) <= int(self.depth)):
+                    raise ValueError(
+                        f"save_slot_depth 超出 body：{self.name} "
+                        f"{self.save_slot_depth} > depth {self.depth}"
+                    )
             if self.entry_save_slot is not None and not (
                 0 <= self.entry_save_slot < N_SLOTS
             ):
@@ -1014,6 +1025,7 @@ def _ev(
     cost_ct: int | None = None,
     companion_boot: bool = False,
     save_slot: int | None = None,
+    save_slot_depth: int | None = None,
     entry_save_slot: int | None = None,
     join_slot: int | None = None,
     join_offset: int = 0,
@@ -1046,6 +1058,7 @@ def _ev(
         cost_ct=cost_ct,
         companion_boot=companion_boot,
         save_slot=save_slot,
+        save_slot_depth=save_slot_depth,
         entry_save_slot=entry_save_slot,
         join_slot=join_slot,
         join_offset=join_offset,
@@ -1485,7 +1498,7 @@ def _append_layernorm_events(
       ``*_scale``：8 real 普通打包 → DualRail 刷（代价 4、落地 budget−1）
         → cm_mult(mask_scale) 8→8, d=1
       ``*_var``：段首 DualRail 刷 enc_l×8（代价 4、落地 budget−1）
-        → variance 8→1；numerator 旁路由 HE 对齐（不进 DP）, d=2
+        → variance 主路 d=2；分子在 sum_x 的 cm_mult 停住（d=1）并写入 SIDE
       ``*_enc_one``：段首直接刷 variance×1（代价 1、落地 budget）→ +enc_one 1→2, d=0
       ``*_invsqrt_{i}``：段首 DualRail 打包刷 (an,bn)（代价 1、落地 budget−1）
         → 一轮 inv√ 2→2, d=2
@@ -1524,12 +1537,13 @@ def _append_layernorm_events(
             CT_LN_VAR_SPINE,
             layer_idx,
             kind,
-            # 段首刷 8×enc_l（普通打包）；出口 variance 主路 1；numerator→SIDE
+            # 段首刷 8×enc_l。方差主路 d=2；分子只到 sum_x 的 cm_mult（d=1）。
             plain_ct=hr,
             layout="real",
             dualrail_depth=DUALRAIL_UNPACK_DEPTH,
             atomic=True,
             save_slot=SLOT_SIDE,
+            save_slot_depth=1,
         )
     )
     events.append(
@@ -2135,6 +2149,7 @@ def _transition_event(
         if add >= 10**9:
             return add, r, mid, _slots_tuple(sl), mid_pm
 
+    body_start = int(r)
     a, r, m, st = _consume_depth_pick(r, body_d, ev, budget, sl)
     add += a
     mid += m
@@ -2145,7 +2160,10 @@ def _transition_event(
     if ev.join_slot is not None and sl[ev.join_slot] != SLOT_UNSET:
         sl[ev.join_slot] = r
     if ev.save_slot is not None:
-        sl[ev.save_slot] = r
+        if ev.save_slot_depth is not None and add < 10**9:
+            sl[ev.save_slot] = body_start - int(ev.save_slot_depth)
+        else:
+            sl[ev.save_slot] = r
     if ev.clear_slot is not None:
         sl[ev.clear_slot] = SLOT_UNSET
 

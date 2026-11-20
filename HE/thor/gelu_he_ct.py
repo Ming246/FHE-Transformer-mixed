@@ -495,55 +495,6 @@ def gelu_poly_ct(engine, x, params: GeluHeParams, *, reactive_bts: bool = False)
     return _ct_mul(engine, x_phys, half_plus)
 
 
-def _refresh_dualrail_pack(
-    engine, x: np.ndarray, *, target_level: int | None = None
-) -> np.ndarray:
-    """
-    Bootstrap DualRail (2, 8) like THOR FF:
-    pack re+i·im → bootstrap → unpack → ×1/2（bs 后乘，避免耗尽跳过 half）。
-
-    ``target_level`` optional discard after bts; default leave at land (≈15).
-    Do not hardcode 21 (old QKV W encode level).
-    """
-    if x.shape != (2, 8):
-        raise ValueError(f"expected (2, 8), got {x.shape}")
-    out = np.full((2, 8), None, dtype=object)
-    try:
-        from bts_decrypt_probe import bts_probe_label
-    except ImportError:
-        from .bts_decrypt_probe import bts_probe_label  # type: ignore
-    try:
-        from bts_prescale import bootstrap_prescaled, dualrail_unpack_scale
-    except ImportError:
-        from .bts_prescale import bootstrap_prescaled, dualrail_unpack_scale  # type: ignore
-    try:
-        from bts_site_pack_probe import active_collector
-    except ImportError:
-        from .bts_site_pack_probe import active_collector  # type: ignore
-    coll = active_collector(engine)
-    pre_ff = np.array(x, copy=True) if coll is not None else None
-    s = dualrail_unpack_scale()
-    with bts_probe_label(engine, "gelu_force_refresh_ff"):
-        for i in range(8):
-            temp = engine.cc_add(x[0, i], engine.imult(x[1, i]))
-            temp = bootstrap_prescaled(engine, temp, postscale=False)
-            if target_level is not None and int(temp.level_calc) < int(target_level):
-                temp = engine.level_up(temp, int(target_level))
-            conj = engine.conjugate(temp)
-            out[0, i] = engine.mult_scalar(engine.cc_add(temp, conj), s)
-            out[1, i] = engine.mult_scalar(
-                engine.imult(engine.cc_sub(conj, temp)), s
-            )
-    if coll is not None and pre_ff is not None:
-        coll.record_dualrail_ff(
-            "bypass.gelu_force_refresh_ff",
-            "real_pack",
-            pre_ff,
-            out,
-        )
-    return out
-
-
 def he_gelu_cheb(
     engine,
     x: np.ndarray,

@@ -15,7 +15,6 @@ COMMON=(
   --check sftmx_in att_context ln1_out ln2_out
   --tol 1.0 --rest-div 1
   --layers 0
-  --no-rem-guard
 )
 
 echo "==== L0 mock chain ===="
