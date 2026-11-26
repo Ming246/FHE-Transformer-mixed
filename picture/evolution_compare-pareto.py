@@ -1,5 +1,5 @@
 """
-对比进化搜索 Pareto（默认同时画 ΣS₁ 与 KL search）：
+对比进化搜索 Pareto（默认同时画 ΣS 与 KL search）：
 
   校验集 / 验证集 各两张图（共 4 张）：
     1) Output KL Pareto（上行 log，下行线性 + 下包络）
@@ -10,7 +10,7 @@
 旧 CSV 无 ``f_cost`` 时回退 ``total_depth``；``--x-col total_depth`` 可强制画深度。
 
 数据：
-  - evolution_results/sensitive_scores_1/{task}_pareto_{calib|validation}.csv
+  - evolution_results/{task}_pareto_{calib|validation}.csv
   - evolution_kl_results/{task}_pareto_kl_{calib|validation}.csv
 
 输出（默认写入 picture/）：
@@ -38,13 +38,14 @@ TASK_NAMES = ("mrpc", "rte", "sst2", "cola","qnli","mnli")
 EVAL_SPLITS = ("calib", "validation")
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PLAIN = os.path.join(_REPO_ROOT, "Plain")
+if _PLAIN not in sys.path:
+    sys.path.insert(0, _PLAIN)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 _PIC_DIR = os.path.dirname(os.path.abspath(__file__))
 
-SCORE1_PARETO_DIR = os.path.join(
-    _REPO_ROOT, "results", "evolution_results", "sensitive_scores_1"
-)
+SCORE_PARETO_DIR = os.path.join(_REPO_ROOT, "results", "evolution_results")
 KL_PARETO_DIR = os.path.join(_REPO_ROOT, "results", "evolution_kl_results")
 
 SCORE_FILE_PATTERN = "{task}_pareto_{split}.csv"
@@ -61,9 +62,9 @@ X_LABELS = {
 
 METHODS: tuple[dict[str, Any], ...] = (
     {
-        "key": "score1",
+        "key": "score",
         "label": r"$\Sigma S_1$ filtered",
-        "dir": SCORE1_PARETO_DIR,
+        "dir": SCORE_PARETO_DIR,
         "pattern": SCORE_FILE_PATTERN,
         "color": "#2563eb",
         "marker": "o",
@@ -595,7 +596,7 @@ def default_output_path(kind: str, split: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Pareto 与准确率/翻转率图（默认同时画 ΣS₁ 与 KL search）"
+        description="Pareto 与准确率/翻转率图（默认同时画 ΣS 与 KL search）"
     )
     parser.add_argument("--tasks", nargs="+", default=list(TASK_NAMES))
     parser.add_argument(
@@ -605,14 +606,14 @@ def main() -> None:
         default=list(EVAL_SPLITS),
         help="评估集：默认同时画 calib 与 validation",
     )
-    parser.add_argument("--score1-dir", default=SCORE1_PARETO_DIR)
+    parser.add_argument("--score-dir", default=SCORE_PARETO_DIR)
     parser.add_argument("--kl-dir", default=KL_PARETO_DIR)
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=("score1", "kl"),
-        default=["score1", "kl"],
-        help="要画的曲线；默认 score1 + kl。只要其一：--methods score1",
+        choices=("score", "kl"),
+        default=["score", "kl"],
+        help="要画的曲线；默认 score + kl。只要其一：--methods score",
     )
     parser.add_argument(
         "--x-col",
@@ -638,7 +639,7 @@ def main() -> None:
     args = parser.parse_args()
 
     method_dirs = {
-        "score1": args.score1_dir,
+        "score": args.score_dir,
         "kl": args.kl_dir,
     }
     methods = tuple(m for m in METHODS if m["key"] in args.methods)

@@ -2,7 +2,7 @@
 全 low / 全 high 方案在各任务验证集（默认）上的对照评估。
 
 指标：Output KL、准确率 / Δacc、翻转率、F1（MRPC）、bts（f_cost）、乘法深度和。
-方案由 ``HE.thor.bts_ops.scheme_all(0|1)`` 生成（GeLU 非法档自动回退 high）。
+方案由 ``HE/bts_ops.scheme_all(0|1)`` 生成（GeLU 非法档自动回退 high）。
 
 输出（默认 ``picture/evol_low_high.json``），供后续 ``evolution_compare.py`` 作基线点：
 
@@ -36,16 +36,22 @@ from typing import Any
 
 _PIC_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_PIC_DIR, ".."))
+_PLAIN = os.path.join(_REPO_ROOT, "Plain")
+_HE = os.path.join(_REPO_ROOT, "HE")
+if _PLAIN not in sys.path:
+    sys.path.insert(0, _PLAIN)
+if _HE not in sys.path:
+    sys.path.append(_HE)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from bts_ops import scheme_all  # noqa: E402
 from cost import (  # noqa: E402
     compute_f_cost,
     compute_scheme_cost,
     f_cost_label,
 )
 from evolution_infer import SchemeEvaluator, format_elapsed  # noqa: E402
-from HE.thor.bts_ops import scheme_all  # noqa: E402
 from poly_model_inference import CALIB_INDICES_DIR, CALIB_SEED  # noqa: E402
 
 # ===================== 配置区 =====================

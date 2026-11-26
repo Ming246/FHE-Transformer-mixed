@@ -54,5 +54,5 @@
 
 1. Mid：`exp_u`/`inv_d` 解密是否缺 CKKS scale、`align_bypass` 语义、或 `exp_2u` slot 布局与 decode 不匹配（行和 1/16）。
 2. Exit：plain `plain_dualrail_softmax_exit` 哪一步引入 **16×**（vs HE 128 解密）。
-3. 沿 `smoke_thor_repro` / context 路径：exit 后 `rescale(α)`、`gain`、`thor_context_to_mainline_packs` 是否补上 mid 缺的因子。
+3. 沿 `bert._forward_layer` / context 路径：exit 后 `rescale(α)`、`gain`、`thor_context_to_mainline_packs` 是否补上 mid 缺的因子。
 4. 同一输入上补跑 HE×2 vs plain÷8 与逐 micro-event 解密探针。

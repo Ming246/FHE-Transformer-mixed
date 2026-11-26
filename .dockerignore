@@ -1,0 +1,17 @@
+.git
+**/.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+
+glue_datasets
+finetuned_weight
+finetuned_infer
+bert_weight
+results
+thirdparty
+tmp_trainer
+
+HE/encoded_models
+HE/keys
+HE/liberate/**/build

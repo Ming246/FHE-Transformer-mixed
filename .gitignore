@@ -39,6 +39,8 @@ encoded_models_new/
 **/encoded_models*/
 **/encoded_models_new/
 HE/cache/
+HE/keys/
+HE/liberate/
 *.pkl
 *.pickle
 
@@ -69,9 +71,6 @@ thirdparty/
 # ---- Experiment outputs / logs / plots ----
 results/
 demo/results/
-nolinear/gelu/
-nolinear/sigma_out/
-nolinear/variance_out/
 .eval_tmp/
 tmp/
 *.log
@@ -98,6 +97,21 @@ tmp/
 *.bz2
 *.xz
 *.whl
+
+# ---- Production nonlinear params (Plain/HE runtime; not weights) ----
+# GeLU high: C∈{40,80,160}; low: per-layer direct. Softmax σ / LN variance /
+# pooler tanh coeffs. Keep fit reports, unused C*, and tanh_*_err dumps ignored.
+!nolinear/gelu/
+!nolinear/gelu/gelu_direct_layer_coeffs.json
+!nolinear/gelu/gelu_chebyshev_coeffs_C40.json
+!nolinear/gelu/gelu_chebyshev_coeffs_C80.json
+!nolinear/gelu/gelu_chebyshev_coeffs_C160.json
+!nolinear/sigma_out/
+!nolinear/sigma_out/*_sigma.json
+!nolinear/variance_out/
+!nolinear/variance_out/*_variance.json
+!nolinear/tanh_out/
+!nolinear/tanh_out/tanh_fit_C5_d15_15.json
 
 # ---- Text dumps / console captures (keep source as .py / .md / .cuh) ----
 *.txt

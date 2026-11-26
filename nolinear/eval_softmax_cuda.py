@@ -45,6 +45,9 @@ from transformers import (
 )
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PLAIN = os.path.join(_REPO_ROOT, "Plain")
+if _PLAIN not in sys.path:
+    sys.path.insert(0, _PLAIN)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

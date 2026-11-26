@@ -14,7 +14,7 @@
 |------|------|
 | `cost.py` | `compute_scheme_cost` = 深度和；`compute_scheme_bts` / `compute_f_cost(mode=bts)` = DualRail DP 总 bts（budget=14） |
 | `evolution_*.py` | 默认 `--cost-mode bts`；`--cost-mode depth` 仍可用 |
-| 求解器 | `HE/thor/bts_ops.optimize_bootstrap`（与 `plan_mock` + rem_guard 同一套） |
+| 求解器 | `HE/bts_ops.optimize_bootstrap`（与密文推理的 rem_guard 同一套） |
 
 ---
 
@@ -121,25 +121,9 @@ FF: 实8→复打包+旋转(64) → dense1 → (2,8) → [打包 bootstrap×8]
 | C | 微事件 + Softmax pathway + fork/join（唯一正式路径；A/B 已删除） |
 | D | `run_phase_d_audit()` 自洽检查 |
 
-### 路线 B（选定）：HE 驱动 Plan（反推）
+### 计划与验收
 
-**原则**：以真实 Liberate HE 前向为唯一深度真值；`bts_ops` DP 只消费测量结果，不再手写 `DEPTH_*` 常量去「猜」HE 会烧多少。
-
-| 步骤 | 工具 |
-|------|------|
-| 1. 单层 HE 剖面 | `smoke_thor_repro --bootstrap hardcode --probe-levels --depth-profile-out /tmp/L{n}.json` |
-| 2. 合并多层 | `python3 HE/thor/he_depth_profile.py merge /tmp/L0.json /tmp/L1.json -o merged.json` |
-| 3. 生成 overrides | `he_depth_profile.build_depth_overrides()` → `{event_suffix: Δrem}` |
-| 4. 重跑 DP | `optimize_bootstrap(task, scheme, depth_overrides=...)` |
-| 5. 验收 | `plan_mock` + `rem_guard`；`simulate` 不得出现无 placement 的 reactive boot |
-
-实现：`HE/thor/he_depth_profile.py`（`DepthProfileRecorder` 挂 `BootstrapHook.refresh` + `LevelProbe`）。
-
-**注意**：
-
-- 剖面用 **`hardcode`**（反应式 HE boot），避免错误 plan 扭曲测量。
-- 每层 / 每种 LN2 入口（`ln2_prep_s0` vs `join_resid_ff`）须 **分别剖面** 后再 merge。
-- 禁止再靠 `_inject_*` / `_align_*` 事后补 placement；那些是路线 A 遗留，路线 B 稳定后应删除。
+计划由 `bts_ops.optimize_bootstrap` 生成。密文推理只走真实 bootstrap，`rem_guard` 用 `level_calc` 对照 `rem_trace`。深度剖面、`plan_mock` 和解密探针已从 `HE` 去掉。
 
 **线性复数打包（8→4）**：THOR 用虚部塞另一半实数据以减半 CT。本仓库 **后续只用实数线性**，不做该减半；因所有方案共用同一线性，相对 bts 比较本质不变，但绝对 CT 数按「实数路径」计。
 
@@ -250,7 +234,7 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 
 ## 相关结果与搜索脚本（只读参考）
 
-- `results/evolution_results/sensitive_scores_*/` — ΣS 搜索 Pareto（含 `total_depth`）  
+- `results/evolution_results/` — ΣS 搜索 Pareto（含 `total_depth`）  
 - `results/evolution_kl_results/` — KL 搜索 Pareto  
 - `evolution_score.py` / `evolution_kl.py` — `f_cost` 消费方  
 
@@ -271,7 +255,7 @@ THOR 在 `thirdparty/THOR-main`。本仓库明文近似与 THOR 非线性 **十�
 
 ### 旁路：HE 对齐 vs plan 可行性
 
-- **HE 运行时**：旁路与主路 ct×ct / 会合前，统一 `align_bypass_to_main`（`softmax_he_ct.py`）——旁路比主路更耗尽（rem 更小）则先 bts 旁路再 `level_up`，**不烧主路 rem**。
+- **HE 运行时**：旁路与主路 ct×ct / 会合前，统一 `align_bypass_to_main`（`nonlinear/softmax.py`）——旁路比主路更耗尽（rem 更小）则先 bts 旁路再 `level_up`，**不烧主路 rem**。
 - **plan / DP**：`bts_count` **不计**旁路条数（`join_ct`）；旁路不单独做 bootstrap 放置优化。
 - plan 仍保留 **`save_slot` / `join_slot` / `clear_slot` / `refresh_side`**，用途是 **槽位生命周期 + 会合前可行性**，不是第二张旁路计算图：
   - `save_slot`：主路 CT 停泊（RESID / V / AUX）；
